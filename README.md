@@ -2,7 +2,7 @@
 
 Public installer for the Soroq CLI.
 
-## Install
+## Install on macOS or Linux
 
 ```bash
 curl --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/soroq/install/main/install.sh -sSf | bash
@@ -15,12 +15,32 @@ export PATH="$HOME/.soroq/bin:$PATH"
 soroq --help
 ```
 
+## Install on Windows
+
+Run this in PowerShell:
+
+```powershell
+iwr https://raw.githubusercontent.com/soroq/install/main/install.ps1 -UseBasicParsing | iex
+```
+
+Then open a new PowerShell window and run:
+
+```powershell
+soroq --help
+```
+
 ## What This Installs
 
-The installer detects your OS and CPU, downloads the matching `soroq` CLI archive from this repository's GitHub Releases, verifies `checksums.txt`, and installs the binary to:
+The installer detects your OS and CPU, downloads the matching Soroq CLI archive from this repository's GitHub Releases, verifies `checksums.txt`, and installs the binary to:
 
 ```text
 ~/.soroq/bin/soroq
+```
+
+On Windows, the default path is:
+
+```text
+%USERPROFILE%\.soroq\bin\soroq.exe
 ```
 
 Supported release assets:
@@ -29,6 +49,8 @@ Supported release assets:
 - `soroq_darwin_amd64.tar.gz`
 - `soroq_linux_arm64.tar.gz`
 - `soroq_linux_amd64.tar.gz`
+- `soroq_windows_arm64.zip`
+- `soroq_windows_amd64.zip`
 - `checksums.txt`
 
 ## Options
@@ -43,6 +65,13 @@ Install somewhere else:
 
 ```bash
 SOROQ_INSTALL_DIR=/usr/local/bin sh install.sh
+```
+
+Install somewhere else on Windows:
+
+```powershell
+$env:SOROQ_INSTALL_DIR = "C:\Tools\soroq"
+iwr https://raw.githubusercontent.com/soroq/install/main/install.ps1 -UseBasicParsing | iex
 ```
 
 Use a different release repository:
