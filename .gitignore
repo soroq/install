@@ -1,0 +1,6 @@
+backend/soroq
+dist/
+*.tar.gz
+*.zip
+checksums.txt
+.DS_Store

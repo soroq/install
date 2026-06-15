@@ -1,6 +1,25 @@
-# Soroq CLI Installer
+# Soroq CLI
 
-Public installer for the Soroq CLI.
+Public home for the Soroq CLI source, installers, and binary releases.
+
+## Source
+
+The Go CLI lives in:
+
+```text
+backend/cmd/soroq
+```
+
+Build from source:
+
+```bash
+cd backend
+go test ./cmd/soroq ./internal/...
+go build -o soroq ./cmd/soroq
+./soroq --help
+```
+
+This repository intentionally contains the CLI slice only: the `soroq` command plus the internal Go packages it needs to build Android release/patch artifacts.
 
 ## Install on macOS or Linux
 
@@ -90,4 +109,4 @@ sh install.sh
 
 ## Internal Maintainer Note
 
-This repository is public so users can fetch `install.sh` without GitHub authentication. For a fully tokenless install, publish the CLI release archives and `checksums.txt` to this repository's public Releases.
+Tag a release such as `v0.1.1` to build and publish macOS, Linux, and Windows CLI archives from this public source tree.

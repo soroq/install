@@ -1,0 +1,115 @@
+name: CLI Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            asset: soroq_linux_amd64.tar.gz
+            binary: soroq
+            archive: tar
+          - goos: linux
+            goarch: arm64
+            asset: soroq_linux_arm64.tar.gz
+            binary: soroq
+            archive: tar
+          - goos: darwin
+            goarch: amd64
+            asset: soroq_darwin_amd64.tar.gz
+            binary: soroq
+            archive: tar
+          - goos: darwin
+            goarch: arm64
+            asset: soroq_darwin_arm64.tar.gz
+            binary: soroq
+            archive: tar
+          - goos: windows
+            goarch: amd64
+            asset: soroq_windows_amd64.zip
+            binary: soroq.exe
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            asset: soroq_windows_arm64.zip
+            binary: soroq.exe
+            archive: zip
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Test CLI
+        working-directory: backend
+        run: go test ./cmd/soroq ./internal/...
+
+      - name: Build Soroq CLI
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p "dist/${{ matrix.goos }}-${{ matrix.goarch }}"
+          cd backend
+          go build -trimpath -ldflags="-s -w" -o "../dist/${{ matrix.goos }}-${{ matrix.goarch }}/${{ matrix.binary }}" ./cmd/soroq
+
+      - name: Package tar artifact
+        if: matrix.archive == 'tar'
+        run: tar -C "dist/${{ matrix.goos }}-${{ matrix.goarch }}" -czf "dist/${{ matrix.asset }}" "${{ matrix.binary }}"
+
+      - name: Package zip artifact
+        if: matrix.archive == 'zip'
+        run: |
+          cd "dist/${{ matrix.goos }}-${{ matrix.goarch }}"
+          zip -q "../${{ matrix.asset }}" "${{ matrix.binary }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum soroq_*.tar.gz soroq_*.zip > checksums.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          files: |
+            dist/soroq_*.tar.gz
+            dist/soroq_*.zip
+            dist/checksums.txt
