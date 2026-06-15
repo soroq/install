@@ -1,0 +1,64 @@
+# Soroq CLI Installer
+
+Public installer for the Soroq CLI.
+
+## Install
+
+```bash
+curl --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/soroq/install/main/install.sh -sSf | bash
+```
+
+Then restart your shell or add Soroq to your current session:
+
+```bash
+export PATH="$HOME/.soroq/bin:$PATH"
+soroq --help
+```
+
+## What This Installs
+
+The installer detects your OS and CPU, downloads the matching `soroq` CLI archive from this repository's GitHub Releases, verifies `checksums.txt`, and installs the binary to:
+
+```text
+~/.soroq/bin/soroq
+```
+
+Supported release assets:
+
+- `soroq_darwin_arm64.tar.gz`
+- `soroq_darwin_amd64.tar.gz`
+- `soroq_linux_arm64.tar.gz`
+- `soroq_linux_amd64.tar.gz`
+- `checksums.txt`
+
+## Options
+
+Install a specific version:
+
+```bash
+SOROQ_INSTALL_VERSION=v0.1.16 sh install.sh
+```
+
+Install somewhere else:
+
+```bash
+SOROQ_INSTALL_DIR=/usr/local/bin sh install.sh
+```
+
+Use a different release repository:
+
+```bash
+SOROQ_INSTALL_REPO=soroq/install sh install.sh
+```
+
+Use private release assets when testing from a private repo:
+
+```bash
+SOROQ_INSTALL_REPO=soroq/soroq \
+SOROQ_GITHUB_TOKEN="$(gh auth token)" \
+sh install.sh
+```
+
+## Internal Maintainer Note
+
+This repository is public so users can fetch `install.sh` without GitHub authentication. For a fully tokenless install, publish the CLI release archives and `checksums.txt` to this repository's public Releases.
