@@ -148,6 +148,12 @@ os="$(detect_os)"
 arch="$(detect_arch)"
 asset="soroq_${os}_${arch}.tar.gz"
 
+# Hard-OTA beta: only macOS (darwin) release assets are published and smoke-tested today.
+# Linux/Windows binaries are pending — fail with a clear message instead of a confusing 404.
+if [ "$os" != "darwin" ]; then
+  fail "The Soroq CLI currently ships macOS (darwin arm64/amd64) binaries only for the hard-OTA beta. Linux/Windows are pending. Build from source instead: https://github.com/soroq/install#source"
+fi
+
 if [ "$VERSION" = "latest" ]; then
   base_url="https://github.com/${REPO}/releases/latest/download"
 else
@@ -207,6 +213,15 @@ if ! mv "$tmp_dir/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"; then
 fi
 chmod 0755 "$INSTALL_DIR/$BINARY_NAME"
 success "Installed ${BOLD}${INSTALL_DIR}/${BINARY_NAME}${RESET}"
+
+# soroqctl ships in the same archive and is required by the iOS engine lane
+# (`soroq release/patch ios --engine` delegates to soroqctl). Install it when present.
+if [ -x "$tmp_dir/soroqctl" ]; then
+  if mv "$tmp_dir/soroqctl" "$INSTALL_DIR/soroqctl"; then
+    chmod 0755 "$INSTALL_DIR/soroqctl"
+    success "Installed ${BOLD}${INSTALL_DIR}/soroqctl${RESET}"
+  fi
+fi
 
 step "Checking installation"
 if ! "$INSTALL_DIR/$BINARY_NAME" --help >/dev/null 2>&1; then
