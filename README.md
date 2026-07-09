@@ -1,83 +1,77 @@
 # Soroq CLI
 
-Public home for the Soroq CLI source, installers, and binary releases.
+Public home for the Soroq CLI **installers and signed binary releases**.
 
-## Source
+> **Source-build status.** This repo currently distributes released binaries. A full
+> **build-from-source** path for the current CLI is **pending**: the CLI links private
+> control-plane packages, so a clean public CLI module has not been split out yet. The
+> `backend/` tree here is an older slice and does **not** build the current tested CLI — do
+> not rely on it. Use the binary installer below.
 
-The Go CLI lives in:
+Hard-OTA is an experimental tier. No App Store / Play **production** approval is claimed, no
+Shorebird parity, and no arbitrary-Dart/Flutter parity. iOS hard-OTA is device-only.
 
-```text
-backend/cmd/soroq
-```
+## Supported platforms
 
-Build from source:
+| Platform | Status |
+|---|---|
+| macOS arm64 / amd64 | **Supported** (smoke-tested) |
+| Linux amd64 / arm64 | **Supported** (smoke-tested in a container) |
+| Windows | **Pending** (builds, not runtime-smoked; no published installer yet) |
 
-```bash
-cd backend
-go test ./cmd/soroq ./internal/...
-go build -o soroq ./cmd/soroq
-./soroq --help
-```
-
-This repository intentionally contains the CLI slice only: the `soroq` command plus the internal Go packages it needs to build Android release/patch artifacts.
-
-## Install on macOS or Linux
+## Install (macOS or Linux)
 
 ```bash
 curl --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/soroq/install/main/install.sh -sSf | bash
 ```
 
-Then restart your shell or add Soroq to your current session:
+Then add Soroq to your current shell (the installer also prints your profile file):
 
 ```bash
 export PATH="$HOME/.soroq/bin:$PATH"
-soroq --help
+soroq version   # -> soroq v0.2.1
 ```
 
-## Install on Windows
+The installer detects your OS/CPU, downloads the matching archive from this repo's GitHub
+Releases, verifies `checksums.txt`, and installs both `soroq` and `soroqctl` to
+`~/.soroq/bin/`. `soroqctl` is required by the iOS engine lane (`soroq release/patch ios --engine`).
 
-Run this in PowerShell:
+macOS Gatekeeper (only if a download is quarantined):
 
-```powershell
-iwr https://raw.githubusercontent.com/soroq/install/main/install.ps1 -UseBasicParsing | iex
+```bash
+xattr -dr com.apple.quarantine "$HOME/.soroq/bin/soroq" "$HOME/.soroq/bin/soroqctl"
 ```
 
-Then open a new PowerShell window and run:
+### Next steps
 
-```powershell
-soroq --help
+```bash
+soroq frontend install soroq-flutter-frontend-f74781f6-6903c161 --api https://api.soroq.dev
+soroq toolchain doctor
 ```
 
-## What This Installs
+See the docs: <https://soroq.dev/getting-started>.
 
-The installer detects your OS and CPU, downloads the matching Soroq CLI archive from this repository's GitHub Releases, verifies `checksums.txt`, and installs the binary to:
+## Windows (pending)
 
-```text
-~/.soroq/bin/soroq
-```
+A native Windows installer is not published yet. `soroq.exe` builds, but it has not been
+runtime-smoke-tested, so it is not offered as supported. Track status on this repo.
 
-On Windows, the default path is:
-
-```text
-%USERPROFILE%\.soroq\bin\soroq.exe
-```
-
-Supported release assets:
+## Published release assets
 
 - `soroq_darwin_arm64.tar.gz`
 - `soroq_darwin_amd64.tar.gz`
-- `soroq_linux_arm64.tar.gz`
 - `soroq_linux_amd64.tar.gz`
-- `soroq_windows_arm64.zip`
-- `soroq_windows_amd64.zip`
+- `soroq_linux_arm64.tar.gz`
 - `checksums.txt`
+
+Each archive contains `soroq` + `soroqctl`, no secrets, no local paths, no private keys.
 
 ## Options
 
-Install a specific version:
+Pin a version:
 
 ```bash
-SOROQ_INSTALL_VERSION=v0.1.16 sh install.sh
+SOROQ_INSTALL_VERSION=v0.2.1 sh install.sh
 ```
 
 Install somewhere else:
@@ -86,27 +80,8 @@ Install somewhere else:
 SOROQ_INSTALL_DIR=/usr/local/bin sh install.sh
 ```
 
-Install somewhere else on Windows:
+## Maintainer note
 
-```powershell
-$env:SOROQ_INSTALL_DIR = "C:\Tools\soroq"
-iwr https://raw.githubusercontent.com/soroq/install/main/install.ps1 -UseBasicParsing | iex
-```
-
-Use a different release repository:
-
-```bash
-SOROQ_INSTALL_REPO=soroq/install sh install.sh
-```
-
-Use private release assets when testing from a private repo:
-
-```bash
-SOROQ_INSTALL_REPO=soroq/soroq \
-SOROQ_GITHUB_TOKEN="$(gh auth token)" \
-sh install.sh
-```
-
-## Internal Maintainer Note
-
-Tag a release such as `v0.1.1` to build and publish macOS, Linux, and Windows CLI archives from this public source tree.
+Release binaries are built from the main Soroq repository and uploaded to this repo's Releases;
+the in-repo `cli-release` workflow is disabled (it rebuilt from this repo's stale source and
+clobbered uploads). Re-enabling automated builds is gated on splitting a clean public CLI module.

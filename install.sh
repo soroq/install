@@ -32,7 +32,7 @@ say() {
 banner() {
   say ""
   say "${BOLD}${BLUE}Soroq CLI Installer${RESET}"
-  say "${DIM}Fast Android OTA release tooling, installed globally.${RESET}"
+  say "${DIM}Soroq hard-OTA release tooling (Android + iOS), installed globally.${RESET}"
   say ""
 }
 
@@ -148,11 +148,13 @@ os="$(detect_os)"
 arch="$(detect_arch)"
 asset="soroq_${os}_${arch}.tar.gz"
 
-# Hard-OTA beta: only macOS (darwin) release assets are published and smoke-tested today.
-# Linux/Windows binaries are pending — fail with a clear message instead of a confusing 404.
-if [ "$os" != "darwin" ]; then
-  fail "The Soroq CLI currently ships macOS (darwin arm64/amd64) binaries only for the hard-OTA beta. Linux/Windows are pending. Build from source instead: https://github.com/soroq/install#source"
-fi
+# Hard-OTA beta: macOS (darwin) and Linux release assets are published and smoke-tested.
+# Windows is pending (a native installer is not published yet) — fail clearly instead of a
+# confusing 404 for any other OS.
+case "$os" in
+  darwin | linux) : ;;
+  *) fail "The Soroq CLI ships macOS (darwin) and Linux binaries for the hard-OTA beta. '$os' is not supported yet (Windows is pending). See https://github.com/soroq/install for current status." ;;
+esac
 
 if [ "$VERSION" = "latest" ]; then
   base_url="https://github.com/${REPO}/releases/latest/download"
@@ -252,4 +254,4 @@ case ":$PATH:" in
 esac
 
 say ""
-say "${DIM}Tip: run 'soroq init' inside a Flutter app to prepare Android OTA release tooling.${RESET}"
+say "${DIM}Next: soroq frontend install soroq-flutter-frontend-f74781f6-6903c161 --api https://api.soroq.dev  then  soroq toolchain doctor${RESET}"

@@ -8,6 +8,15 @@ $ErrorActionPreference = "Stop"
 $BinaryName = "soroq.exe"
 $Token = if ($env:SOROQ_GITHUB_TOKEN) { $env:SOROQ_GITHUB_TOKEN } else { $env:GITHUB_TOKEN }
 
+# Windows is pending for the Soroq hard-OTA beta: no Windows release asset is published yet
+# (soroq.exe builds but has not been runtime-smoke-tested). Fail clearly instead of 404ing.
+if (-not $env:SOROQ_INSTALL_ALLOW_WINDOWS) {
+    Write-Host ""
+    Write-Host "Soroq CLI: a native Windows installer is not published yet (Windows is pending for the hard-OTA beta)."
+    Write-Host "Supported today: macOS and Linux. Track Windows status: https://github.com/soroq/install"
+    exit 1
+}
+
 function Supports-Color {
     if ($env:NO_COLOR) { return $false }
     return $Host.Name -ne "Default Host" -or $env:WT_SESSION -or $env:TERM_PROGRAM
