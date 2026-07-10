@@ -70,6 +70,11 @@ func main() {
 		exitIfErr(runManifestKeyringPublic(os.Args[2:]))
 	case "verify-engine-bundle":
 		exitIfErr(runVerifyEngineBundleCmd(os.Args[2:]))
+	case "-h", "--help", "help":
+		// Explicit help exits 0 consistently on every platform (a bare invocation still
+		// exits nonzero as a usage error). Keeps CI harnesses simple + cross-platform.
+		usage()
+		os.Exit(0)
 	default:
 		usage()
 		os.Exit(2)
