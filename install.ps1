@@ -89,7 +89,12 @@ Say ""
 
 $Arch = Detect-Arch
 $Asset = "soroq_windows_$Arch.zip"
-if ($Version -eq "latest") {
+# SOROQ_INSTALL_BASE_URL overrides the release download base (scheme+host+path). It exists for
+# offline/CI verification against a local file:// or http://127.0.0.1 server; unset in normal use,
+# so default behavior (public GitHub Releases) is unchanged.
+if ($env:SOROQ_INSTALL_BASE_URL) {
+    $BaseUrl = $env:SOROQ_INSTALL_BASE_URL.TrimEnd("/")
+} elseif ($Version -eq "latest") {
     $BaseUrl = "https://github.com/$Repo/releases/latest/download"
 } else {
     $BaseUrl = "https://github.com/$Repo/releases/download/$Version"

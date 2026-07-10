@@ -1,0 +1,205 @@
+name: Release
+
+# Signed, reproducible release of the PUBLIC Soroq CLI on a v* tag.
+#   * Cross-compiles soroq + soroqctl for darwin/arm64, darwin/amd64, linux/amd64, linux/arm64,
+#     windows/amd64 (CGO_ENABLED=0, -trimpath, -ldflags -X main.buildVersion=<tag>).
+#   * Packages unix as .tar.gz, windows as .zip (each archive carries BOTH binaries).
+#   * Emits checksums.txt, a release-manifest.json, an SBOM (syft), and build-provenance attestations.
+#   * macOS + Linux are uploaded as SUPPORTED; the windows zip is uploaded but labeled
+#     PENDING/EXPERIMENTAL (not advertised by install.sh; install.ps1 stays gated).
+#
+# NOTE: this workflow has not been executed by GitHub Actions (tag pushes / Actions runs cannot be
+# triggered locally). It is authored to be correct-by-construction.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            asset: soroq_darwin_arm64.tar.gz
+            archive: tar
+          - goos: darwin
+            goarch: amd64
+            asset: soroq_darwin_amd64.tar.gz
+            archive: tar
+          - goos: linux
+            goarch: amd64
+            asset: soroq_linux_amd64.tar.gz
+            archive: tar
+          - goos: linux
+            goarch: arm64
+            asset: soroq_linux_arm64.tar.gz
+            archive: tar
+          - goos: windows
+            goarch: amd64
+            asset: soroq_windows_amd64.zip
+            archive: zip
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Build soroq + soroqctl
+        working-directory: backend
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          stage="${RUNNER_TEMP}/stage"
+          mkdir -p "$stage"
+          ext=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then ext=".exe"; fi
+          go build -trimpath -ldflags "-X main.buildVersion=${tag}" -o "${stage}/soroq${ext}" ./cmd/soroq
+          go build -trimpath -ldflags "-X main.buildVersion=${tag}" -o "${stage}/soroqctl${ext}" ./cmd/soroqctl
+          echo "STAGE=${stage}" >> "$GITHUB_ENV"
+
+      - name: Package archive (both binaries)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "${{ matrix.archive }}" = "tar" ]; then
+            tar -C "${STAGE}" -czf "dist/${{ matrix.asset }}" soroq soroqctl
+          else
+            ( cd "${STAGE}" && zip -q -X "${GITHUB_WORKSPACE}/dist/${{ matrix.asset }}" soroq.exe soroqctl.exe )
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: assemble + publish release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute checksums.txt
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Format: "<sha256>  soroq_<os>_<arch>.<ext>" (two spaces), matching install.sh/install.ps1.
+          sha256sum soroq_*.tar.gz soroq_*.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Pin SBOM/reproducibility timestamp to the commit
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: Generate SBOM (syft, backend module)
+        uses: anchore/sbom-action@v0
+        with:
+          path: backend
+          format: spdx-json
+          output-file: dist/soroq-sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Build release-manifest.json
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          assets_json="[]"
+          for f in soroq_*.tar.gz soroq_*.zip checksums.txt soroq-sbom.spdx.json; do
+            [ -f "$f" ] || continue
+            sha="$(sha256sum "$f" | awk '{print $1}')"
+            assets_json="$(jq --arg name "$f" --arg sha "$sha" '. + [{"name":$name,"sha256":$sha}]' <<<"$assets_json")"
+          done
+          jq -n \
+            --arg version "$TAG" \
+            --arg tag "$TAG" \
+            --arg revision "$REVISION" \
+            --arg built_at "$TAG" \
+            --argjson assets "$assets_json" \
+            '{version:$version, tag:$tag, git_revision:$revision, built_at:$built_at, assets:$assets}' \
+            > release-manifest.json
+          cat release-manifest.json
+
+      - name: Attest build provenance for the release archives
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            dist/soroq_*.tar.gz
+            dist/soroq_*.zip
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Soroq CLI ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/soroq_darwin_arm64.tar.gz
+            dist/soroq_darwin_amd64.tar.gz
+            dist/soroq_linux_amd64.tar.gz
+            dist/soroq_linux_arm64.tar.gz
+            dist/soroq_windows_amd64.zip
+            dist/checksums.txt
+            dist/release-manifest.json
+            dist/soroq-sbom.spdx.json
+          body: |
+            ## Soroq CLI ${{ github.ref_name }}
+
+            Public Soroq CLI (`soroq` + `soroqctl`). Each archive contains both binaries; verify
+            with `checksums.txt`, and build provenance is attested for every archive.
+
+            ### Supported (smoke-tested)
+            - `soroq_darwin_arm64.tar.gz` — macOS (Apple Silicon)
+            - `soroq_darwin_amd64.tar.gz` — macOS (Intel)
+            - `soroq_linux_amd64.tar.gz` — Linux amd64 (natively CI-validated)
+            - `soroq_linux_arm64.tar.gz` — Linux arm64
+
+            Install (macOS or Linux):
+            ```
+            curl --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/soroq/install/main/install.sh -sSf | bash
+            ```
+
+            ### Windows — PENDING / EXPERIMENTAL (not supported yet)
+            - `soroq_windows_amd64.zip` is published for evaluation ONLY. Windows is **pending** for
+              the hard-OTA beta: `install.sh` does not offer it and `install.ps1` stays gated behind
+              `SOROQ_INSTALL_ALLOW_WINDOWS=1`. Do not treat this asset as a supported release. See
+              `docs/windows-acceptance.md` for the gates Windows must pass before it is called supported.
+
+            ### Honest boundaries
+            Hard-OTA is an experimental tier. No App Store / Play **production** approval is claimed,
+            no Shorebird parity, and no arbitrary-Dart/Flutter parity. iOS hard-OTA is device-only.
+
+            Artifacts: `checksums.txt`, `release-manifest.json` (per-asset sha256 + git revision),
+            `soroq-sbom.spdx.json` (syft SBOM of the backend module).

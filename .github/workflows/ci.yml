@@ -1,0 +1,324 @@
+name: CI
+
+# Correct-by-construction CI for the PUBLIC Soroq CLI.
+#   * ubuntu-latest (native amd64) is the SUPPORTED gate: build + test + public-boundary asserts.
+#   * windows-latest is INFORMATIONAL (Windows is pending for the hard-OTA beta). It runs real,
+#     non-interactive checks (each a hard gate WITHIN the job) but does NOT gate the supported
+#     macOS/Linux path: the job is continue-on-error and NOTHING `needs:` it. Branch protection
+#     must NOT list the windows job as a required check.
+#
+# NOTE: this workflow has not been executed by GitHub Actions from this change (Actions runs
+# cannot be triggered locally). It is authored to be correct-by-construction; each step is a
+# discrete, legible gate.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux (supported, native amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Build soroq + soroqctl
+        working-directory: backend
+        run: go build ./cmd/soroq ./cmd/soroqctl
+
+      - name: Unit tests
+        working-directory: backend
+        run: go test ./...
+
+      - name: Forbidden-import scan (public build must not ship internal/api|store|artifacts)
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          if grep -rnE 'soroq/backend/internal/(api|store|artifacts)"' --include='*.go' .; then
+            echo "FATAL: a shipped .go file imports a forbidden private package (internal/api|store|artifacts)." >&2
+            exit 1
+          fi
+          echo "OK: no forbidden private imports in the public CLI source."
+
+      - name: Assert 'soroq --help' lists the expected public commands
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          go build -o /tmp/soroq ./cmd/soroq
+          help="$(/tmp/soroq --help 2>&1)"
+          echo "$help"
+          for cmd in frontend toolchain login release patch rollback; do
+            echo "$help" | grep -qE "^[[:space:]]*${cmd}[[:space:]]" \
+              || { echo "FATAL: soroq --help did not list expected command: $cmd" >&2; exit 1; }
+          done
+          echo "OK: soroq --help lists frontend/toolchain/login/release/patch/rollback."
+
+      - name: Assert 'soroq frontend publish' is operator-only (blocked in public CLI)
+        working-directory: backend
+        run: |
+          set -uo pipefail
+          go build -o /tmp/soroq ./cmd/soroq
+          out="$(/tmp/soroq frontend publish 2>&1)"
+          code=$?
+          echo "$out"
+          echo "exit=$code"
+          echo "$out" | grep -q "is an operator-only command and is not built into the public CLI" \
+            || { echo "FATAL: expected operator-only error from 'soroq frontend publish'." >&2; exit 1; }
+          [ "$code" -ne 0 ] || { echo "FATAL: 'soroq frontend publish' must exit non-zero." >&2; exit 1; }
+          echo "OK: operator-only command is blocked in the public build."
+
+  windows:
+    name: windows (informational)
+    runs-on: windows-latest
+    # Informational only: Windows is PENDING. Keeps every step below as a hard gate (so a real
+    # failure is a visible red X in the step list) while NOT gating the supported linux/macOS path.
+    continue-on-error: true
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Build soroq.exe + soroqctl.exe
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = Join-Path $env:RUNNER_TEMP "bin"
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          Push-Location backend
+          go build -o (Join-Path $bin "soroq.exe") ./cmd/soroq
+          if ($LASTEXITCODE -ne 0) { throw "go build soroq failed" }
+          go build -o (Join-Path $bin "soroqctl.exe") ./cmd/soroqctl
+          if ($LASTEXITCODE -ne 0) { throw "go build soroqctl failed" }
+          Pop-Location
+          "SOROQ_BIN=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: soroq.exe version
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = & (Join-Path $env:SOROQ_BIN "soroq.exe") version
+          if ($LASTEXITCODE -ne 0) { throw "soroq.exe version exited $LASTEXITCODE" }
+          Write-Host $out
+          if ($out -notmatch '^soroq ') { throw "unexpected version output: $out" }
+
+      - name: soroqctl.exe usage
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = & (Join-Path $env:SOROQ_BIN "soroqctl.exe") 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'usage: soroqctl') { throw "soroqctl.exe did not print usage" }
+
+      - name: soroq.exe frontend --help / toolchain --help
+        run: |
+          $ErrorActionPreference = "Stop"
+          $fe = & (Join-Path $env:SOROQ_BIN "soroq.exe") frontend --help 2>&1 | Out-String
+          Write-Host $fe
+          if ($fe -notmatch 'usage: soroq frontend') { throw "frontend --help missing usage" }
+          $tc = & (Join-Path $env:SOROQ_BIN "soroq.exe") toolchain --help 2>&1 | Out-String
+          Write-Host $tc
+          if ($tc -notmatch 'usage: soroq toolchain') { throw "toolchain --help missing usage" }
+
+      - name: Checksum-verify unit (build archive + checksums.txt, verify sha256)
+        run: |
+          $ErrorActionPreference = "Stop"
+          $work = Join-Path $env:RUNNER_TEMP "cksum"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Copy-Item (Join-Path $env:SOROQ_BIN "soroq.exe") $work
+          Copy-Item (Join-Path $env:SOROQ_BIN "soroqctl.exe") $work
+          $zip = Join-Path $work "soroq_windows_amd64.zip"
+          Compress-Archive -Path (Join-Path $work "soroq.exe"),(Join-Path $work "soroqctl.exe") -DestinationPath $zip -Force
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          # checksums.txt format: "<sha256>  soroq_<os>_<arch>.zip" (two spaces).
+          "$sha  soroq_windows_amd64.zip" | Out-File -FilePath (Join-Path $work "checksums.txt") -Encoding ascii -NoNewline
+          $line = Get-Content (Join-Path $work "checksums.txt") | Where-Object { $_ -match "  soroq_windows_amd64.zip$" } | Select-Object -First 1
+          if (-not $line) { throw "checksums.txt did not contain the expected asset entry" }
+          $expected = ($line -split "\s+")[0]
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw "checksum mismatch: $expected != $actual" }
+          Write-Host "OK checksum verify: $actual"
+
+      - name: Build local test HTTP stub (Go, stdlib only, outside backend/)
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stub = Join-Path $env:RUNNER_TEMP "stub"
+          New-Item -ItemType Directory -Force -Path $stub | Out-Null
+          Copy-Item ".github/scripts/authstub.go" (Join-Path $stub "authstub.go")
+          Push-Location $stub
+          go mod init soroqteststub | Out-Null
+          go build -o (Join-Path $stub "authstub.exe") .
+          if ($LASTEXITCODE -ne 0) { throw "stub build failed" }
+          Pop-Location
+          "SOROQ_STUB=$(Join-Path $stub 'authstub.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: install.ps1 dry test against a local HTTP server (no prod)
+        run: |
+          $ErrorActionPreference = "Stop"
+          $srv = Join-Path $env:RUNNER_TEMP "srvroot"
+          New-Item -ItemType Directory -Force -Path $srv | Out-Null
+          # Assemble the release archive + checksums the installer will fetch from the local server.
+          Copy-Item (Join-Path $env:SOROQ_BIN "soroq.exe") $srv
+          Copy-Item (Join-Path $env:SOROQ_BIN "soroqctl.exe") $srv
+          $zip = Join-Path $srv "soroq_windows_amd64.zip"
+          Compress-Archive -Path (Join-Path $srv "soroq.exe"),(Join-Path $srv "soroqctl.exe") -DestinationPath $zip -Force
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          "$sha  soroq_windows_amd64.zip" | Out-File -FilePath (Join-Path $srv "checksums.txt") -Encoding ascii -NoNewline
+          Remove-Item (Join-Path $srv "soroq.exe"),(Join-Path $srv "soroqctl.exe")
+          $portfile = Join-Path $env:RUNNER_TEMP "port_install.txt"
+          $env:STUB_ROOT = $srv; $env:STUB_PORTFILE = $portfile
+          $proc = Start-Process -FilePath $env:SOROQ_STUB -PassThru -WindowStyle Hidden
+          try {
+            $addr = $null
+            foreach ($i in 1..50) { if (Test-Path $portfile) { $addr = (Get-Content $portfile -Raw).Trim(); break }; Start-Sleep -Milliseconds 200 }
+            if (-not $addr) { throw "stub did not report its address" }
+            $installDir = Join-Path $env:RUNNER_TEMP "install_ok"
+            $env:SOROQ_INSTALL_ALLOW_WINDOWS = "1"
+            $env:SOROQ_INSTALL_BASE_URL = "http://$addr"
+            $env:SOROQ_INSTALL_DIR = $installDir
+            & .\install.ps1
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited $LASTEXITCODE" }
+            $exe = Join-Path $installDir "soroq.exe"
+            if (-not (Test-Path $exe)) { throw "installer did not place soroq.exe" }
+            & $exe version | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "installed soroq.exe did not run" }
+            Write-Host "OK install.ps1 dry test"
+          } finally { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+
+      - name: install.ps1 into a path with spaces
+        run: |
+          $ErrorActionPreference = "Stop"
+          $srv = Join-Path $env:RUNNER_TEMP "srvroot"
+          $portfile = Join-Path $env:RUNNER_TEMP "port_spaces.txt"
+          $env:STUB_ROOT = $srv; $env:STUB_PORTFILE = $portfile
+          $proc = Start-Process -FilePath $env:SOROQ_STUB -PassThru -WindowStyle Hidden
+          try {
+            $addr = $null
+            foreach ($i in 1..50) { if (Test-Path $portfile) { $addr = (Get-Content $portfile -Raw).Trim(); break }; Start-Sleep -Milliseconds 200 }
+            if (-not $addr) { throw "stub did not report its address" }
+            $installDir = Join-Path $env:RUNNER_TEMP "Program Dir With Spaces\soroq bin"
+            $env:SOROQ_INSTALL_ALLOW_WINDOWS = "1"
+            $env:SOROQ_INSTALL_BASE_URL = "http://$addr"
+            $env:SOROQ_INSTALL_DIR = $installDir
+            & .\install.ps1
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 (spaces) exited $LASTEXITCODE" }
+            $exe = Join-Path $installDir "soroq.exe"
+            if (-not (Test-Path -LiteralPath $exe)) { throw "installer did not place soroq.exe in a spaced path" }
+            & $exe version | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "installed soroq.exe (spaces) did not run" }
+            Write-Host "OK spaced-path install"
+          } finally { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+
+      - name: Interrupted-install test (truncated archive must fail without corrupting prior install)
+        run: |
+          $ErrorActionPreference = "Stop"
+          # A known-good install to a stable dir first.
+          $srv = Join-Path $env:RUNNER_TEMP "srvroot"
+          $portfile = Join-Path $env:RUNNER_TEMP "port_good.txt"
+          $env:STUB_ROOT = $srv; $env:STUB_PORTFILE = $portfile
+          $proc = Start-Process -FilePath $env:SOROQ_STUB -PassThru -WindowStyle Hidden
+          $installDir = Join-Path $env:RUNNER_TEMP "install_prior"
+          try {
+            $addr = $null
+            foreach ($i in 1..50) { if (Test-Path $portfile) { $addr = (Get-Content $portfile -Raw).Trim(); break }; Start-Sleep -Milliseconds 200 }
+            if (-not $addr) { throw "stub did not report its address" }
+            $env:SOROQ_INSTALL_ALLOW_WINDOWS = "1"; $env:SOROQ_INSTALL_BASE_URL = "http://$addr"; $env:SOROQ_INSTALL_DIR = $installDir
+            & .\install.ps1
+            if ($LASTEXITCODE -ne 0) { throw "prior good install failed" }
+          } finally { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          $priorExe = Join-Path $installDir "soroq.exe"
+          $priorHash = (Get-FileHash -Algorithm SHA256 $priorExe).Hash
+
+          # Now serve a TRUNCATED archive (simulated interrupted download) with the ORIGINAL checksums.txt.
+          $bad = Join-Path $env:RUNNER_TEMP "srvbad"
+          New-Item -ItemType Directory -Force -Path $bad | Out-Null
+          Copy-Item (Join-Path $srv "checksums.txt") $bad
+          $goodZip = Join-Path $srv "soroq_windows_amd64.zip"
+          $bytes = [System.IO.File]::ReadAllBytes($goodZip)
+          $half = [int]($bytes.Length / 2)
+          $trunc = New-Object byte[] $half
+          [Array]::Copy($bytes, $trunc, $half)
+          [System.IO.File]::WriteAllBytes((Join-Path $bad "soroq_windows_amd64.zip"), $trunc)
+          $portfile2 = Join-Path $env:RUNNER_TEMP "port_bad.txt"
+          $env:STUB_ROOT = $bad; $env:STUB_PORTFILE = $portfile2
+          $proc2 = Start-Process -FilePath $env:SOROQ_STUB -PassThru -WindowStyle Hidden
+          try {
+            $addr2 = $null
+            foreach ($i in 1..50) { if (Test-Path $portfile2) { $addr2 = (Get-Content $portfile2 -Raw).Trim(); break }; Start-Sleep -Milliseconds 200 }
+            if (-not $addr2) { throw "bad stub did not report its address" }
+            $env:SOROQ_INSTALL_ALLOW_WINDOWS = "1"; $env:SOROQ_INSTALL_BASE_URL = "http://$addr2"; $env:SOROQ_INSTALL_DIR = $installDir
+            $global:LASTEXITCODE = 0
+            & .\install.ps1
+            $code = $LASTEXITCODE
+            if ($code -eq 0) { throw "install.ps1 must FAIL on a truncated archive (got exit 0)" }
+            Write-Host "OK installer failed cleanly on truncated archive (exit $code)"
+          } finally { Stop-Process -Id $proc2.Id -Force -ErrorAction SilentlyContinue }
+          # Prior install must be intact (installer stages in temp; only copies after verify).
+          $afterHash = (Get-FileHash -Algorithm SHA256 $priorExe).Hash
+          if ($priorHash -ne $afterHash) { throw "prior install was corrupted by a failed install" }
+          & $priorExe version | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "prior install no longer runs after a failed install" }
+          Write-Host "OK prior install intact after interrupted install"
+
+      - name: Loopback-callback protocol test (soroq login round-trip vs local auth stub)
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName System.Web
+          $portfile = Join-Path $env:RUNNER_TEMP "port_auth.txt"
+          Remove-Item Env:STUB_ROOT -ErrorAction SilentlyContinue
+          $env:STUB_PORTFILE = $portfile
+          $proc = Start-Process -FilePath $env:SOROQ_STUB -PassThru -WindowStyle Hidden
+          try {
+            $addr = $null
+            foreach ($i in 1..50) { if (Test-Path $portfile) { $addr = (Get-Content $portfile -Raw).Trim(); break }; Start-Sleep -Milliseconds 200 }
+            if (-not $addr) { throw "auth stub did not report its address" }
+            $base = "http://$addr"
+            $config = Join-Path $env:RUNNER_TEMP "login_config.json"
+            $errFile = Join-Path $env:RUNNER_TEMP "login_err.txt"
+            $outFile = Join-Path $env:RUNNER_TEMP "login_out.txt"
+            # Start soroq login with the loopback listener; --no-open prints the login URL to stderr.
+            $login = Start-Process -FilePath (Join-Path $env:SOROQ_BIN "soroq.exe") -PassThru -NoNewWindow `
+              -ArgumentList @("login","--no-open","--hosted-surface",$base,"--api",$base,"--config",$config,"--callback-timeout","60s","--json") `
+              -RedirectStandardError $errFile -RedirectStandardOutput $outFile
+            # Parse the printed hosted-login URL, extract redirect_uri (loopback callback) + state.
+            $loginUrl = $null
+            foreach ($i in 1..100) {
+              if (Test-Path $errFile) {
+                $line = (Get-Content $errFile -ErrorAction SilentlyContinue | Where-Object { $_ -match '^https?://' } | Select-Object -First 1)
+                if ($line) { $loginUrl = $line.Trim(); break }
+              }
+              Start-Sleep -Milliseconds 200
+            }
+            if (-not $loginUrl) { throw "soroq login did not print a loopback login URL" }
+            $uri = [System.Uri]$loginUrl
+            $q = [System.Web.HttpUtility]::ParseQueryString($uri.Query)
+            $redirect = $q["redirect_uri"]; $state = $q["state"]
+            if (-not $redirect -or -not $state) { throw "login URL missing redirect_uri/state" }
+            # Act as the browser: hit the loopback callback with a one-time code + matching state.
+            $cb = "$redirect`?code=test-code-123&state=$([System.Uri]::EscapeDataString($state))"
+            Invoke-WebRequest -Uri $cb -UseBasicParsing | Out-Null
+            if (-not $login.WaitForExit(60000)) { $login.Kill(); throw "soroq login did not complete after callback" }
+            if ($login.ExitCode -ne 0) { Write-Host (Get-Content $errFile -Raw); throw "soroq login exited $($login.ExitCode)" }
+            $out = Get-Content $outFile -Raw
+            Write-Host $out
+            if (-not (Test-Path $config)) { throw "login did not write a config" }
+            $cfg = Get-Content $config -Raw
+            if ($cfg -notmatch 'cli_token') { throw "config did not record a cli_token credential" }
+            if ($cfg -notmatch 'test-cli-token-abc123') { throw "config did not persist the exchanged token (Windows file fallback)" }
+            Write-Host "OK loopback callback round-trip: login exchanged code -> token via local stub"
+          } finally { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
