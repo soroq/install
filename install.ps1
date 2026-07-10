@@ -55,7 +55,7 @@ function Fail([string]$Text) {
     Write-Host ""
     Write-Host "$(Paint Bold 'What to try next')"
     Write-Host "  - Run PowerShell as a normal user unless installing to a protected directory."
-    Write-Host "  - Pin a version: `$env:SOROQ_INSTALL_VERSION='v0.1.0'; .\install.ps1"
+    Write-Host "  - Pin a version: `$env:SOROQ_INSTALL_VERSION='<version>'; .\install.ps1   (e.g. v0.2.1)"
     Write-Host "  - Change install path: `$env:SOROQ_INSTALL_DIR='C:\Tools\soroq'; .\install.ps1"
     Write-Host "  - Private repo? set SOROQ_GITHUB_TOKEN to a GitHub token that can read $Repo"
     exit 1

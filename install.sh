@@ -59,7 +59,7 @@ fail() {
   say "${BOLD}What to try next${RESET}" >&2
   say "  - Re-run with verbose curl output: curl -fsSL <install-url> -o install.sh && sh install.sh" >&2
   say "  - Private repo? set SOROQ_GITHUB_TOKEN to a GitHub token that can read ${REPO}" >&2
-  say "  - Pin a version: SOROQ_INSTALL_VERSION=v0.1.16 sh install.sh" >&2
+  say "  - Pin a version: SOROQ_INSTALL_VERSION=<version> sh install.sh   (e.g. v0.2.1)" >&2
   say "  - Change install path: SOROQ_INSTALL_DIR=/usr/local/bin sh install.sh" >&2
   exit 1
 }
