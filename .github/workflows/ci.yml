@@ -64,19 +64,24 @@ jobs:
           done
           echo "OK: soroq --help lists frontend/toolchain/login/release/patch/rollback."
 
-      - name: Assert 'soroq frontend publish' is operator-only (blocked in public CLI)
+      - name: Assert operator-only publish commands are blocked in the public CLI
         working-directory: backend
         run: |
           set -uo pipefail
           go build -o /tmp/soroq ./cmd/soroq
-          out="$(/tmp/soroq frontend publish 2>&1)"
-          code=$?
-          echo "$out"
-          echo "exit=$code"
-          echo "$out" | grep -q "is an operator-only command and is not built into the public CLI" \
-            || { echo "FATAL: expected operator-only error from 'soroq frontend publish'." >&2; exit 1; }
-          [ "$code" -ne 0 ] || { echo "FATAL: 'soroq frontend publish' must exit non-zero." >&2; exit 1; }
-          echo "OK: operator-only command is blocked in the public build."
+          # Both commands intentionally exit non-zero; disable -e around the capture so the
+          # step doesn't terminate before we read $? (GitHub's default shell is `bash -eo pipefail`).
+          for sub in frontend toolchain; do
+            set +e
+            out="$(/tmp/soroq "$sub" publish 2>&1)"
+            code=$?
+            set -e
+            echo "[$sub publish] exit=$code :: $out"
+            echo "$out" | grep -q "is an operator-only command and is not built into the public CLI" \
+              || { echo "FATAL: expected operator-only error from 'soroq $sub publish'." >&2; exit 1; }
+            [ "$code" -ne 0 ] || { echo "FATAL: 'soroq $sub publish' must exit non-zero." >&2; exit 1; }
+          done
+          echo "OK: frontend/toolchain publish are operator-only and blocked in the public build."
 
   windows:
     name: windows (informational)
@@ -118,12 +123,15 @@ jobs:
           Write-Host $out
           if ($out -notmatch '^soroq ') { throw "unexpected version output: $out" }
 
-      - name: soroqctl.exe usage
+      - name: soroqctl.exe --help
         run: |
           $ErrorActionPreference = "Stop"
-          $out = & (Join-Path $env:SOROQ_BIN "soroqctl.exe") 2>&1 | Out-String
+          # --help prints usage and exits 0 on every platform (bare invocation exits non-zero as
+          # a usage error); use --help so the external exit code does not fail the pwsh step.
+          $out = & (Join-Path $env:SOROQ_BIN "soroqctl.exe") --help 2>&1 | Out-String
           Write-Host $out
-          if ($out -notmatch 'usage: soroqctl') { throw "soroqctl.exe did not print usage" }
+          if ($LASTEXITCODE -ne 0) { throw "soroqctl.exe --help exit $LASTEXITCODE" }
+          if ($out -notmatch 'usage: soroqctl') { throw "soroqctl.exe --help did not print usage" }
 
       - name: soroq.exe frontend --help / toolchain --help
         run: |

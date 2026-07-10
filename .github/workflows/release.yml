@@ -136,6 +136,8 @@ jobs:
           REVISION: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # Real RFC3339 timestamp derived from the release COMMIT (deterministic; not the tag name).
+          built_at="$(git -C "$GITHUB_WORKSPACE" show -s --format=%cI "$REVISION")"
           assets_json="[]"
           for f in soroq_*.tar.gz soroq_*.zip checksums.txt soroq-sbom.spdx.json; do
             [ -f "$f" ] || continue
@@ -146,7 +148,7 @@ jobs:
             --arg version "$TAG" \
             --arg tag "$TAG" \
             --arg revision "$REVISION" \
-            --arg built_at "$TAG" \
+            --arg built_at "$built_at" \
             --argjson assets "$assets_json" \
             '{version:$version, tag:$tag, git_revision:$revision, built_at:$built_at, assets:$assets}' \
             > release-manifest.json
@@ -164,6 +166,9 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: Soroq CLI ${{ github.ref_name }}
+          # RC / prerelease tags (…-rc.N, -beta, -alpha) publish as prereleases and are NOT marked latest.
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          make_latest: ${{ (contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha')) && 'false' || 'true' }}
           fail_on_unmatched_files: true
           files: |
             dist/soroq_darwin_arm64.tar.gz

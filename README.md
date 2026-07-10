@@ -97,6 +97,10 @@ SOROQ_INSTALL_DIR=/usr/local/bin sh install.sh
 
 ## Maintainer note
 
-Release binaries are built from the main Soroq repository and uploaded to this repo's Releases;
-the in-repo `cli-release` workflow is disabled (it rebuilt from this repo's stale source and
-clobbered uploads). Re-enabling automated builds is gated on splitting a clean public CLI module.
+The public CLI module has been split out: `backend/` is a deterministic export of the client-side
+CLI from the main Soroq repo (`scripts/export-public-cli.sh`), enforced by a drift-check CI in the
+main repo. Releases are automated here by `.github/workflows/release.yml` (on `v*` tags): it builds
+the macOS + Linux archives (and an experimental Windows candidate) from `backend/`, and emits
+`checksums.txt`, `release-manifest.json`, an SBOM, and build-provenance attestations. `-rc`/`-beta`/
+`-alpha` tags publish as prereleases and are not marked latest. `.github/workflows/ci.yml` gates
+pushes/PRs (native Linux build+test+scans; informational Windows checks).
