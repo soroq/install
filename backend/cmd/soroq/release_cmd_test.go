@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -39,10 +40,24 @@ func TestInspectAndroidArtifactReadsBundledMetadata(t *testing.T) {
 	}
 }
 
+func TestResolveReleaseArchPrefersArm64ForMultiABIAPK(t *testing.T) {
+	arch, err := resolveReleaseArchForArtifact(
+		"apk",
+		[]string{"armeabi-v7a", "arm64-v8a", "x86_64"},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("resolveReleaseArchForArtifact() error = %v", err)
+	}
+	if arch != "arm64-v8a" {
+		t.Fatalf("expected arm64-v8a, got %q", arch)
+	}
+}
+
 func TestRunReleaseAndroidRegistersRelease(t *testing.T) {
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
-	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), "app_id: com.example.app\nchannel: stable\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
 
 	artifactPath := filepath.Join(t.TempDir(), "app-release.apk")
 	writeArtifactZip(t, artifactPath, map[string][]byte{
@@ -50,25 +65,51 @@ func TestRunReleaseAndroidRegistersRelease(t *testing.T) {
 		"lib/arm64-v8a/libapp.so":                         []byte("app"),
 	})
 
-	var captured domain.CreateReleaseRequest
+	var (
+		captured         domain.CreateReleaseRequest
+		uploadedArtifact []byte
+	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/releases" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
-			t.Fatalf("Decode() error = %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(domain.Release{
-			ID:        captured.ID,
-			AppID:     captured.AppID,
-			RuntimeID: captured.RuntimeID,
-			Version:   captured.Version,
-			Platform:  captured.Platform,
-			Arch:      captured.Arch,
-			Channel:   captured.Channel,
-		}); err != nil {
-			t.Fatalf("Encode() error = %v", err)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
+			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+				t.Fatalf("Decode() error = %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(domain.Release{
+				ID:        captured.ID,
+				AppID:     captured.AppID,
+				RuntimeID: captured.RuntimeID,
+				Version:   captured.Version,
+				Platform:  captured.Platform,
+				Arch:      captured.Arch,
+				Channel:   captured.Channel,
+			}); err != nil {
+				t.Fatalf("Encode() error = %v", err)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases/release-1/artifact":
+			if got := r.Header.Get("Content-Type"); got != "application/vnd.android.package-archive" {
+				t.Fatalf("expected APK content type, got %q", got)
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(artifact) error = %v", err)
+			}
+			uploadedArtifact = body
+			if r.URL.Query().Get("filename") != "app-release.apk" {
+				t.Fatalf("expected artifact filename query, got %q", r.URL.RawQuery)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(domain.ReleaseArtifact{
+				ReleaseID: "release-1",
+				FileName:  "app-release.apk",
+				SizeBytes: uint64(len(body)),
+				SHA256:    "test-sha",
+			}); err != nil {
+				t.Fatalf("Encode(artifact response) error = %v", err)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 	}))
 	defer server.Close()
@@ -100,25 +141,144 @@ func TestRunReleaseAndroidRegistersRelease(t *testing.T) {
 	if captured.Arch != "arm64-v8a" {
 		t.Fatalf("expected inferred arch, got %q", captured.Arch)
 	}
+	sourceBytes, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("ReadFile(artifact) error = %v", err)
+	}
+	if !bytes.Equal(uploadedArtifact, sourceBytes) {
+		t.Fatalf("expected uploaded release artifact bytes to match source")
+	}
 	if !strings.Contains(stdout, "Registered Android release release-1") {
 		t.Fatalf("expected registration output, got %q", stdout)
 	}
+	if !strings.Contains(stdout, "uploaded_artifact_bytes: ") {
+		t.Fatalf("expected hosted release artifact output, got %q", stdout)
+	}
 }
 
-func TestRunReleaseAndroidDefaultsToNewestArtifactAndRecordsState(t *testing.T) {
+func TestRunReleaseAndroidRejectsVersionOverrideMismatch(t *testing.T) {
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
-	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), "app_id: com.example.app\nchannel: stable\n")
-	releaseCandidatesDir := filepath.Join(projectDir, "release-candidates")
-	if err := os.MkdirAll(releaseCandidatesDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-	artifactPath := filepath.Join(releaseCandidatesDir, "app-play-release.aab")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
+
+	artifactPath := filepath.Join(t.TempDir(), "app-release.apk")
 	writeArtifactZip(t, artifactPath, map[string][]byte{
-		"base/assets/flutter_assets/soroq/soroq_metadata.json": []byte(testBundledMetadataJSON("com.example.app", "play-internal", "runtime-1", "1.2.3+45")),
-		"base/lib/arm64-v8a/libapp.so":                         []byte("app-arm64"),
-		"base/lib/x86_64/libapp.so":                            []byte("app-x64"),
+		"assets/flutter_assets/soroq/soroq_metadata.json": []byte(testBundledMetadataJSON("com.example.app", "stable", "runtime-1", "1.2.3+45")),
+		"lib/arm64-v8a/libapp.so":                         []byte("app"),
 	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("release mismatch should fail before HTTP request, got %s %s", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+
+	err := runReleaseAndroid([]string{
+		"--project-dir", projectDir,
+		"--artifact", artifactPath,
+		"--api", server.URL,
+		"--release-id", "release-1",
+		"--version", "1.2.3+46",
+	})
+	if err == nil {
+		t.Fatalf("expected version override mismatch error")
+	}
+	if !strings.Contains(err.Error(), `--version "1.2.3+46" does not match bundled artifact version "1.2.3+45"`) {
+		t.Fatalf("expected bundled version mismatch guidance, got %v", err)
+	}
+}
+
+func TestRunReleaseIOSRegistersConfigBaseline(t *testing.T) {
+	projectDir := t.TempDir()
+	writeFile(t, filepath.Join(projectDir, "pubspec.yaml"), "name: demo\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
+
+	var captured domain.CreateReleaseRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
+			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+				t.Fatalf("Decode() error = %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(domain.Release{
+				ID:                   captured.ID,
+				AppID:                captured.AppID,
+				RuntimeID:            captured.RuntimeID,
+				Version:              captured.Version,
+				Platform:             captured.Platform,
+				Arch:                 captured.Arch,
+				Channel:              captured.Channel,
+				ManifestSigningKeyID: captured.ManifestSigningKeyID,
+			}); err != nil {
+				t.Fatalf("Encode() error = %v", err)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	stdout := captureStdout(t, func() {
+		err := runReleaseIOS([]string{
+			"--project-dir", projectDir,
+			"--api", server.URL,
+			"--release-id", "ios-release-1",
+			"--version", "1.2.3+45",
+			"--runtime-id", "ios-runtime-1",
+			"--manifest-key-id", "prod-primary",
+		})
+		if err != nil {
+			t.Fatalf("runReleaseIOS() error = %v", err)
+		}
+	})
+
+	if captured.ID != "ios-release-1" {
+		t.Fatalf("expected release id, got %q", captured.ID)
+	}
+	if captured.Platform != "ios" {
+		t.Fatalf("expected platform ios, got %q", captured.Platform)
+	}
+	if captured.Arch != "arm64" {
+		t.Fatalf("expected default arch arm64, got %q", captured.Arch)
+	}
+	if captured.RuntimeID != "ios-runtime-1" {
+		t.Fatalf("expected runtime id, got %q", captured.RuntimeID)
+	}
+	if captured.ManifestSigningKeyID != "prod-primary" {
+		t.Fatalf("expected manifest key id, got %q", captured.ManifestSigningKeyID)
+	}
+	for _, expected := range []string{
+		"Registered iOS config baseline ios-release-1",
+		"ios_support: config_ota_only",
+		"submit:",                 // names the App Store/TestFlight submission step
+		"TestFlight/App Store",    // what to submit to
+		"soroq patch ios --config-file config.json",
+		"soroq patch config --release-id ios-release-1",
+		"does not enable iOS Dart-code OTA",
+	} {
+		if !strings.Contains(stdout, expected) {
+			t.Fatalf("expected %q in output, got %q", expected, stdout)
+		}
+	}
+	state, err := loadProjectCLIState(projectDir)
+	if err != nil {
+		t.Fatalf("loadProjectCLIState() error = %v", err)
+	}
+	if state.LastIOSRelease == nil {
+		t.Fatalf("expected last iOS release state")
+	}
+	if state.LastIOSRelease.ReleaseID != "ios-release-1" {
+		t.Fatalf("expected iOS release id in state, got %+v", state.LastIOSRelease)
+	}
+	if state.LastIOSRelease.RuntimeID != "ios-runtime-1" {
+		t.Fatalf("expected iOS runtime id in state, got %+v", state.LastIOSRelease)
+	}
+}
+
+func TestRunReleaseIOSInfersVersionAndRuntimeID(t *testing.T) {
+	projectDir := t.TempDir()
+	writeFile(t, filepath.Join(projectDir, "pubspec.yaml"), "name: demo\nversion: 1.2.3+45\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
 
 	var captured domain.CreateReleaseRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -130,16 +290,102 @@ func TestRunReleaseAndroidDefaultsToNewestArtifactAndRecordsState(t *testing.T) 
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(domain.Release{
-			ID:                   captured.ID,
-			AppID:                captured.AppID,
-			RuntimeID:            captured.RuntimeID,
-			Version:              captured.Version,
-			Platform:             captured.Platform,
-			Arch:                 captured.Arch,
-			Channel:              captured.Channel,
-			ManifestSigningKeyID: captured.ManifestSigningKeyID,
+			ID:        captured.ID,
+			AppID:     captured.AppID,
+			RuntimeID: captured.RuntimeID,
+			Version:   captured.Version,
+			Platform:  captured.Platform,
+			Arch:      captured.Arch,
+			Channel:   captured.Channel,
 		}); err != nil {
 			t.Fatalf("Encode() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	if err := runReleaseIOS([]string{"--project-dir", projectDir, "--api", server.URL}); err != nil {
+		t.Fatalf("runReleaseIOS() error = %v", err)
+	}
+	if captured.Version != "1.2.3+45" {
+		t.Fatalf("expected inferred version, got %q", captured.Version)
+	}
+	if captured.RuntimeID != defaultIOSConfigRuntimeID("com.example.app", "stable") {
+		t.Fatalf("expected default iOS config runtime id, got %q", captured.RuntimeID)
+	}
+	if captured.Platform != "ios" {
+		t.Fatalf("expected platform ios, got %q", captured.Platform)
+	}
+}
+
+func TestRunReleaseIOSRequiresVersionWhenPubspecHasNone(t *testing.T) {
+	projectDir := t.TempDir()
+	writeFile(t, filepath.Join(projectDir, "pubspec.yaml"), "name: demo\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
+
+	err := runReleaseIOS([]string{"--project-dir", projectDir})
+	if err == nil || !strings.Contains(err.Error(), "could not infer iOS release version") {
+		t.Fatalf("expected version inference requirement, got %v", err)
+	}
+}
+
+func TestRunReleaseAndroidDefaultsToNewestArtifactAndRecordsState(t *testing.T) {
+	projectDir := t.TempDir()
+	writeSoroqFlutterPubspec(t, projectDir)
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
+	releaseCandidatesDir := filepath.Join(projectDir, "release-candidates")
+	if err := os.MkdirAll(releaseCandidatesDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	artifactPath := filepath.Join(releaseCandidatesDir, "app-play-release.aab")
+	writeArtifactZip(t, artifactPath, map[string][]byte{
+		"base/assets/flutter_assets/soroq/soroq_metadata.json": []byte(testBundledMetadataJSON("com.example.app", "play-internal", "runtime-1", "1.2.3+45")),
+		"base/lib/arm64-v8a/libapp.so":                         []byte("app-arm64"),
+		"base/lib/x86_64/libapp.so":                            []byte("app-x64"),
+	})
+
+	var (
+		captured         domain.CreateReleaseRequest
+		uploadedArtifact []byte
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
+			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+				t.Fatalf("Decode() error = %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(domain.Release{
+				ID:                   captured.ID,
+				AppID:                captured.AppID,
+				RuntimeID:            captured.RuntimeID,
+				Version:              captured.Version,
+				Platform:             captured.Platform,
+				Arch:                 captured.Arch,
+				Channel:              captured.Channel,
+				ManifestSigningKeyID: captured.ManifestSigningKeyID,
+			}); err != nil {
+				t.Fatalf("Encode() error = %v", err)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases/release-1/artifact":
+			if got := r.Header.Get("Content-Type"); got != "application/vnd.android.aab" {
+				t.Fatalf("expected AAB content type, got %q", got)
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(artifact) error = %v", err)
+			}
+			uploadedArtifact = body
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(domain.ReleaseArtifact{
+				ReleaseID: "release-1",
+				FileName:  "app-play-release.aab",
+				SizeBytes: uint64(len(body)),
+				SHA256:    "test-sha",
+			}); err != nil {
+				t.Fatalf("Encode(artifact response) error = %v", err)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 	}))
 	defer server.Close()
@@ -168,6 +414,19 @@ func TestRunReleaseAndroidDefaultsToNewestArtifactAndRecordsState(t *testing.T) 
 	if !strings.Contains(stdout, "artifact: "+artifactPath) {
 		t.Fatalf("expected discovered artifact in stdout, got %q", stdout)
 	}
+	if !strings.Contains(stdout, "release_artifact: "+filepath.Join(projectDir, ".soroq", "releases", "release-1")) {
+		t.Fatalf("expected immutable release artifact path in stdout, got %q", stdout)
+	}
+	if !strings.Contains(stdout, "next: send release_artifact to testers or upload it to Play Store") {
+		t.Fatalf("expected release next-step guidance, got %q", stdout)
+	}
+	sourceBytes, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("ReadFile(source artifact) error = %v", err)
+	}
+	if !bytes.Equal(uploadedArtifact, sourceBytes) {
+		t.Fatalf("expected uploaded artifact bytes to match source")
+	}
 	state, err := loadProjectCLIState(projectDir)
 	if err != nil {
 		t.Fatalf("loadProjectCLIState() error = %v", err)
@@ -184,10 +443,6 @@ func TestRunReleaseAndroidDefaultsToNewestArtifactAndRecordsState(t *testing.T) 
 	expectedReleaseDir := filepath.Join(projectDir, ".soroq", "releases", "release-1") + string(filepath.Separator)
 	if !strings.HasPrefix(state.LastAndroidRelease.ArtifactPath, expectedReleaseDir) {
 		t.Fatalf("expected stashed artifact under %s, got %+v", expectedReleaseDir, state.LastAndroidRelease)
-	}
-	sourceBytes, err := os.ReadFile(artifactPath)
-	if err != nil {
-		t.Fatalf("ReadFile(source artifact) error = %v", err)
 	}
 	stashedBytes, err := os.ReadFile(state.LastAndroidRelease.ArtifactPath)
 	if err != nil {
@@ -285,10 +540,10 @@ func TestRunReleaseStatusPrintsRelease(t *testing.T) {
 	}
 }
 
-func TestRunReleaseAndroidRequiresArchForMultiABI(t *testing.T) {
+func TestRunReleaseAndroidDefaultsMultiABIAPKToArm64(t *testing.T) {
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
-	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), "app_id: com.example.app\nchannel: stable\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
 
 	artifactPath := filepath.Join(t.TempDir(), "app-release.apk")
 	writeArtifactZip(t, artifactPath, map[string][]byte{
@@ -297,22 +552,57 @@ func TestRunReleaseAndroidRequiresArchForMultiABI(t *testing.T) {
 		"lib/x86_64/libapp.so":                            []byte("app"),
 	})
 
-	err := runReleaseAndroid([]string{
+	var captured domain.CreateReleaseRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
+			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+				t.Fatalf("Decode(release) error = %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(domain.Release{
+				ID:        captured.ID,
+				AppID:     captured.AppID,
+				RuntimeID: captured.RuntimeID,
+				Version:   captured.Version,
+				Platform:  captured.Platform,
+				Arch:      captured.Arch,
+				Channel:   captured.Channel,
+			}); err != nil {
+				t.Fatalf("Encode(release) error = %v", err)
+			}
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/artifact"):
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(domain.ReleaseArtifact{
+				ReleaseID: captured.ID,
+				FileName:  "app-release.apk",
+				SizeBytes: 1,
+				SHA256:    "sha",
+			}); err != nil {
+				t.Fatalf("Encode(artifact) error = %v", err)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	if err := runReleaseAndroid([]string{
 		"--project-dir", projectDir,
 		"--artifact", artifactPath,
-	})
-	if err == nil {
-		t.Fatalf("expected error for multi-ABI artifact without --arch")
+		"--api", server.URL,
+	}); err != nil {
+		t.Fatalf("runReleaseAndroid() error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "pass --arch explicitly") {
-		t.Fatalf("expected explicit arch guidance, got %v", err)
+	if captured.Arch != "arm64-v8a" {
+		t.Fatalf("expected arm64-v8a default, got %q", captured.Arch)
 	}
 }
 
 func TestRunReleaseAndroidSuggestsAppCreateWhenAppUnknown(t *testing.T) {
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
-	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), "app_id: com.example.app\nchannel: stable\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
 
 	artifactPath := filepath.Join(t.TempDir(), "app-release.apk")
 	writeArtifactZip(t, artifactPath, map[string][]byte{

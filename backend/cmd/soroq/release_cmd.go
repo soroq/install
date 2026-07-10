@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -19,8 +20,15 @@ import (
 )
 
 type releaseAndroidSummary struct {
+	ProjectDir      string                      `json:"project_dir"`
+	Snapshot        *androidrelease.Snapshot    `json:"snapshot"`
+	Request         domain.CreateReleaseRequest `json:"request"`
+	Response        domain.Release              `json:"response"`
+	ReleaseArtifact *domain.ReleaseArtifact     `json:"release_artifact,omitempty"`
+}
+
+type releaseIOSSummary struct {
 	ProjectDir string                      `json:"project_dir"`
-	Snapshot   *androidrelease.Snapshot    `json:"snapshot"`
 	Request    domain.CreateReleaseRequest `json:"request"`
 	Response   domain.Release              `json:"response"`
 }
@@ -40,6 +48,21 @@ func runRelease(args []string) error {
 	switch args[0] {
 	case "android":
 		return runReleaseAndroid(args[1:])
+	case "ios":
+		// `release ios --build --toolchain <ios-r3>` = build the app + app.dill (config-lane
+		// leg); `release ios --engine ...` = register the ENGINE-lane baseline (delegates to
+		// soroqctl). Only --engine routes to the delegate — --toolchain belongs to --build.
+		// `release ios --engine --build` = UNIFIED fresh-dev path: generate scaffold + build
+		// app.dill + register baseline in one command.
+		if releaseIOSEngineRequested(args[1:]) {
+			if hasFlag(args[1:], "build") {
+				return runReleaseIOSEngineBuild(args[1:])
+			}
+			return runEngineLaneDelegate("release", stripEngineRoutingFlag(args[1:]))
+		}
+		return runReleaseIOS(args[1:])
+	case "ios-engine":
+		return runEngineLaneDelegate("release", args[1:])
 	case "list":
 		return runReleaseList(args[1:])
 	case "status":
@@ -48,29 +71,20 @@ func runRelease(args []string) error {
 		releaseUsage()
 		return nil
 	default:
-		printUnknownSubcommand(os.Stderr, "release", args[0], []string{"android", "list", "status"})
+		releaseUsage()
 		return errAlreadyPrinted
 	}
 }
 
 func releaseUsage() {
-	printCommandUsage(os.Stdout,
-		"Soroq Releases",
-		"Register Android baselines with the hosted control plane.",
-		"soroq release <platform> [flags]",
-		[]usageSection{{
-			Title: "Platforms",
-			Rows: []usageRow{
-				{Name: "android", Description: "Register a built Android APK/AAB as a Soroq release."},
-				{Name: "list", Description: "List registered releases in the control plane."},
-				{Name: "status", Description: "Inspect a registered release in the control plane."},
-			},
-		}},
-		[]string{
-			"soroq release android --artifact build/app/outputs/bundle/release/app-release.aab",
-			"soroq release list --app-id com.example.app",
-		},
-	)
+	fmt.Fprintln(os.Stdout, `usage: soroq release <platform> [flags]
+
+platforms:
+  android  register a built Android APK/AAB as a Soroq release
+  ios      register an App Store/TestFlight iOS baseline for config OTA
+  ios-engine  register an experimental engine-lane baseline (Dart-code OTA; delegates to soroqctl)
+  list     list registered releases in the control plane
+  status   inspect a registered release in the control plane`)
 }
 
 func runReleaseList(args []string) error {
@@ -80,7 +94,7 @@ func runReleaseList(args []string) error {
 	appID := fs.String("app-id", "", "optional app id filter")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq release list [--api https://soroq-control-plane.fly.dev] [--app-id com.example.app] [--json]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq release list [--api https://api.soroq.dev] [--app-id com.example.app] [--json]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -131,7 +145,7 @@ func runReleaseStatus(args []string) error {
 	releaseID := fs.String("release-id", "", "release id to inspect")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq release status --release-id release-123 [--api https://soroq-control-plane.fly.dev] [--json]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq release status --release-id release-123 [--api https://api.soroq.dev] [--json]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -173,20 +187,26 @@ func runReleaseAndroid(args []string) error {
 	artifactPath := fs.String("artifact", "", "path to Android APK or AAB")
 	buildBeforeDiscover := fs.Bool("build", true, "run flutter build before discovering the Android artifact when --artifact is omitted")
 	buildArtifactType := fs.String("artifact-type", "aab", "artifact type to build when --artifact is omitted: aab or apk")
+	toolchainVersion := fs.String("toolchain", "", "resolve the Android engine from the cached toolchain at ~/.soroq/toolchains/<version>/android (installed by `soroq toolchain install`); replaces the local repo engine checkout. Consistent with `release ios-engine --toolchain`.")
 	releaseID := fs.String("release-id", "", "release id override")
 	version := fs.String("version", "", "release version override")
 	arch := fs.String("arch", "", "ABI override when the artifact contains multiple ABIs")
 	channel := fs.String("channel", "", "channel override (defaults to soroq.yaml)")
 	manifestKeyID := fs.String("manifest-key-id", "", "optional manifest signing key id for this release")
+	uploadArtifact := fs.Bool("upload-artifact", true, "upload the APK/AAB to the control plane so future patch commands can run from hosted release state")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	verbose := fs.Bool("verbose", false, "stream raw flutter build output (default: quiet; summarized + logged to .soroq/logs)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq release android [--artifact build/app/outputs/bundle/release/app-release.aab] [--build=false] [--artifact-type aab|apk] [--project-dir .] [--api https://soroq-control-plane.fly.dev] [--release-id my-release] [--version 1.2.3+45] [--arch arm64-v8a] [--channel stable] [--manifest-key-id prod-primary] [--json] [-- <flutter build flags>]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq release android [--artifact build/app/outputs/bundle/release/app-release.aab] [--build=false] [--artifact-type aab|apk] [--toolchain <version>] [--project-dir .] [--api https://api.soroq.dev] [--release-id my-release] [--version 1.2.3+45] [--arch arm64-v8a] [--channel stable] [--manifest-key-id prod-primary] [--upload-artifact=true] [--json] [--verbose] [-- <flutter build flags>]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
+	}
+	if *verbose {
+		cliVerboseRequested = true
 	}
 	flutterBuildArgs := fs.Args()
 
@@ -202,7 +222,7 @@ func runReleaseAndroid(args []string) error {
 		return errors.New("Flutter build passthrough args require automatic build; omit --artifact and keep --build=true")
 	}
 	if resolvedArtifactPath == "" && *buildBeforeDiscover {
-		if err := runFlutterAndroidReleaseBuild(status.ProjectDir, *buildArtifactType, flutterBuildArgs); err != nil {
+		if err := runFlutterAndroidReleaseBuild(status.ProjectDir, *buildArtifactType, strings.TrimSpace(*toolchainVersion), flutterBuildArgs); err != nil {
 			return err
 		}
 	}
@@ -280,15 +300,25 @@ func runReleaseAndroid(args []string) error {
 		}
 		release = existing
 	}
+	var releaseArtifact *domain.ReleaseArtifact
+	if *uploadArtifact {
+		artifact, err := uploadReleaseArtifact(strings.TrimRight(*apiBase, "/"), release.ID, snapshot.Artifact.Path)
+		if err != nil {
+			return err
+		}
+		releaseArtifact = &artifact
+	}
 	if err := rememberAndroidRelease(status.ProjectDir, *apiBase, snapshot, release, resolvedManifestKeyID); err != nil {
 		return err
 	}
+	releaseArtifactPath := projectReleaseArtifactPath(status.ProjectDir, release.ID, snapshot.Artifact.Path)
 
 	summary := releaseAndroidSummary{
-		ProjectDir: status.ProjectDir,
-		Snapshot:   snapshot,
-		Request:    req,
-		Response:   release,
+		ProjectDir:      status.ProjectDir,
+		Snapshot:        snapshot,
+		Request:         req,
+		Response:        release,
+		ReleaseArtifact: releaseArtifact,
 	}
 	if *jsonOut {
 		encoder := json.NewEncoder(os.Stdout)
@@ -303,8 +333,202 @@ func runReleaseAndroid(args []string) error {
 	fmt.Fprintf(os.Stdout, "channel: %s\n", release.Channel)
 	fmt.Fprintf(os.Stdout, "arch: %s\n", release.Arch)
 	fmt.Fprintf(os.Stdout, "artifact: %s\n", snapshot.Artifact.Path)
+	fmt.Fprintf(os.Stdout, "release_artifact: %s\n", releaseArtifactPath)
+	if releaseArtifact != nil {
+		fmt.Fprintf(os.Stdout, "uploaded_artifact_bytes: %d\n", releaseArtifact.SizeBytes)
+		fmt.Fprintf(os.Stdout, "uploaded_artifact_sha256: %s\n", releaseArtifact.SHA256)
+	}
 	fmt.Fprintf(os.Stdout, "bundled metadata: %s\n", snapshot.Artifact.BundledMetadataZipPath)
+	fmt.Fprintf(os.Stdout, "next: send release_artifact to testers or upload it to Play Store; after Dart changes run `soroq patch android --artifact-type %s`.\n", androidArtifactTypeForCommand(snapshot.Artifact.Path))
 	return nil
+}
+
+func runReleaseIOS(args []string) error {
+	fs := flag.NewFlagSet("release ios", flag.ContinueOnError)
+	fs.SetOutput(os.Stdout)
+	projectDir := fs.String("project-dir", ".", "Flutter app directory")
+	apiBase := fs.String("api", defaultAPIBase(), "control plane base URL")
+	releaseID := fs.String("release-id", "", "release id override")
+	version := fs.String("version", "", "App Store/TestFlight version, such as 1.2.3+45")
+	runtimeID := fs.String("runtime-id", "", "iOS runtime compatibility id for this shipped baseline")
+	arch := fs.String("arch", "arm64", "iOS architecture label for the shipped baseline")
+	channel := fs.String("channel", "", "channel override (defaults to soroq.yaml)")
+	manifestKeyID := fs.String("manifest-key-id", "", "optional manifest signing key id for this release")
+	build := fs.Bool("build", false, "build the iOS app (.app + app.dill) from the cached Soroq toolchain via flutter build ios --local-engine before/without config registration; requires --toolchain. Analog of `release android --build`.")
+	toolchainVersion := fs.String("toolchain", "", "resolve the iOS engine from the cached toolchain at ~/.soroq/toolchains/<version>/ios (installed by `soroq toolchain install`); required with --build. Consistent with `patch ios-engine --toolchain`.")
+	verbose := fs.Bool("verbose", false, "stream raw flutter build output (default: quiet; summarized + logged to .soroq/logs)")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stdout, `usage: soroq release ios [--project-dir .] [--api https://api.soroq.dev] [--release-id my-ios-release] [--version 1.2.3+45] [--runtime-id ios-config-runtime] [--arch arm64] [--channel stable] [--manifest-key-id prod-primary] [--build --toolchain <version>] [--verbose] [--json] [-- <flutter build flags>]`)
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if *verbose {
+		cliVerboseRequested = true
+	}
+	flutterBuildArgs := fs.Args()
+
+	status, err := inspectProject(*projectDir)
+	if err != nil {
+		return err
+	}
+
+	// Build leg (T030): build the iOS app from the HOSTED Soroq toolchain (no engine source checkout) and
+	// emit app.dill for the ios-engine patch lane. Decoupled from the config-lane control-plane
+	// registration below so a fresh dev can produce app.dill without a control-plane round-trip.
+	if *build {
+		return runFlutterIOSReleaseBuild(status.ProjectDir, strings.TrimSpace(*toolchainVersion), flutterBuildArgs)
+	}
+	if len(flutterBuildArgs) > 0 {
+		return errors.New("release ios does not build or upload an IPA without --build; remove passthrough build arguments or pass --build --toolchain <version>")
+	}
+	projectConfig, err := resolveIOSReleaseProjectConfig(status, *channel)
+	if err != nil {
+		return err
+	}
+
+	resolvedVersion := strings.TrimSpace(*version)
+	if resolvedVersion == "" {
+		resolvedVersion, err = inferFlutterProjectVersion(status.PubspecPath)
+		if err != nil {
+			return fmt.Errorf("could not infer iOS release version from pubspec.yaml; pass --version: %w", err)
+		}
+	}
+	resolvedRuntimeID := strings.TrimSpace(*runtimeID)
+	if resolvedRuntimeID == "" {
+		resolvedRuntimeID = defaultIOSConfigRuntimeID(projectConfig.AppID, projectConfig.Channel)
+	}
+	resolvedArch := strings.TrimSpace(*arch)
+	if resolvedArch == "" {
+		return errors.New("--arch must not be empty")
+	}
+	resolvedReleaseID := strings.TrimSpace(*releaseID)
+	if resolvedReleaseID == "" {
+		resolvedReleaseID = defaultReleaseID(projectConfig.AppID, resolvedVersion, "ios-"+resolvedArch)
+	}
+
+	req := domain.CreateReleaseRequest{
+		ID:                   resolvedReleaseID,
+		AppID:                projectConfig.AppID,
+		RuntimeID:            resolvedRuntimeID,
+		Version:              resolvedVersion,
+		Platform:             "ios",
+		Arch:                 resolvedArch,
+		Channel:              projectConfig.Channel,
+		ManifestSigningKeyID: strings.TrimSpace(*manifestKeyID),
+	}
+
+	release, err := postJSONDecode[domain.Release](strings.TrimRight(*apiBase, "/")+"/v1/releases", req)
+	if err != nil {
+		if strings.Contains(err.Error(), "unknown app") {
+			return addAppCreateHint(err, projectConfig.AppID)
+		}
+		existing, statusErr := getJSONDecode[domain.Release](strings.TrimRight(*apiBase, "/") + "/v1/releases/" + url.PathEscape(resolvedReleaseID))
+		if statusErr != nil || !releaseMatchesRequest(existing, req) {
+			return addAppCreateHint(err, projectConfig.AppID)
+		}
+		release = existing
+	}
+	if err := rememberIOSRelease(status.ProjectDir, *apiBase, release, strings.TrimSpace(*manifestKeyID)); err != nil {
+		return err
+	}
+
+	summary := releaseIOSSummary{
+		ProjectDir: status.ProjectDir,
+		Request:    req,
+		Response:   release,
+	}
+	if *jsonOut {
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(summary)
+	}
+
+	fmt.Fprintf(os.Stdout, "Registered iOS config baseline %s\n", release.ID)
+	fmt.Fprintf(os.Stdout, "app_id: %s\n", release.AppID)
+	fmt.Fprintf(os.Stdout, "runtime_id: %s\n", release.RuntimeID)
+	fmt.Fprintf(os.Stdout, "version: %s\n", release.Version)
+	fmt.Fprintf(os.Stdout, "channel: %s\n", release.Channel)
+	fmt.Fprintf(os.Stdout, "arch: %s\n", release.Arch)
+	fmt.Fprintln(os.Stdout, "ios_support: config_ota_only")
+	fmt.Fprintf(os.Stdout, "submit: ship this baseline's IPA (version %s) to TestFlight/App Store — build `flutter build ipa`, then upload via Xcode Organizer, Transporter, or `asc builds upload`. Reviewers run the signed bundled baseline; config patches ride OTA on top.\n", release.Version)
+	fmt.Fprintf(os.Stdout, "next: publish signed JSON config with `soroq patch ios --config-file config.json`.\n")
+	fmt.Fprintf(os.Stdout, "explicit: `soroq patch config --release-id %s --config-file config.json` also works.\n", release.ID)
+	fmt.Fprintln(os.Stdout, "note: this does not enable iOS Dart-code OTA, native code patches, dylib downloads, or JIT.")
+	return nil
+}
+
+func inferFlutterProjectVersion(pubspecPath string) (string, error) {
+	bytes, err := os.ReadFile(pubspecPath)
+	if err != nil {
+		return "", err
+	}
+	version := strings.TrimSpace(parseTopLevelYaml(bytes)["version"])
+	if version == "" {
+		return "", errors.New("top-level version is missing")
+	}
+	return version, nil
+}
+
+func defaultIOSConfigRuntimeID(appID string, channel string) string {
+	return slugifyReleaseID("ios-config-v1-" + strings.TrimSpace(appID) + "-" + strings.TrimSpace(channel))
+}
+
+func rememberIOSRelease(projectDir string, apiBase string, release domain.Release, manifestKeyID string) error {
+	state, err := loadProjectCLIState(projectDir)
+	if err != nil {
+		return err
+	}
+	state.LastIOSRelease = &iosReleaseState{
+		UpdatedAt:            time.Now().UTC(),
+		APIBase:              strings.TrimRight(apiBase, "/"),
+		AppID:                release.AppID,
+		Channel:              release.Channel,
+		ReleaseID:            release.ID,
+		RuntimeID:            release.RuntimeID,
+		Version:              release.Version,
+		Arch:                 release.Arch,
+		ManifestSigningKeyID: manifestKeyID,
+	}
+	return saveProjectCLIState(projectDir, state)
+}
+
+func resolveIOSReleaseProjectConfig(status projectStatus, channelOverride string) (projectCommandConfig, error) {
+	if !status.HasPubspec {
+		return projectCommandConfig{}, fmt.Errorf("pubspec.yaml not found in %s", status.ProjectDir)
+	}
+	if !status.HasSoroqConfig {
+		return projectCommandConfig{}, fmt.Errorf("soroq.yaml not found in %s; run `soroq init` first", status.ProjectDir)
+	}
+	if strings.TrimSpace(status.AppID) == "" {
+		return projectCommandConfig{}, fmt.Errorf("soroq.yaml at %s is missing app_id", status.SoroqConfigPath)
+	}
+	if !status.AppIDLooksValid {
+		return projectCommandConfig{}, fmt.Errorf("soroq.yaml app_id %q should be a stable Soroq app id using letters, numbers, dots, underscores, or hyphens", status.AppID)
+	}
+	if status.RuntimeIDStrategy != "manifest_trust_v1" || !status.HasManifestTrust {
+		return projectCommandConfig{}, fmt.Errorf("soroq.yaml at %s is missing hosted manifest trust; run `soroq init --force` to refresh it", status.SoroqConfigPath)
+	}
+
+	resolvedChannel := strings.TrimSpace(channelOverride)
+	if resolvedChannel == "" {
+		resolvedChannel = strings.TrimSpace(status.Channel)
+	}
+	if resolvedChannel == "" {
+		return projectCommandConfig{}, fmt.Errorf("soroq.yaml at %s is missing channel", status.SoroqConfigPath)
+	}
+	if !looksLikeChannel(resolvedChannel) {
+		return projectCommandConfig{}, fmt.Errorf("channel %q should be a stable slug such as stable, beta, or production", resolvedChannel)
+	}
+
+	return projectCommandConfig{
+		AppID:   status.AppID,
+		Channel: resolvedChannel,
+	}, nil
 }
 
 func inspectAndroidArtifact(artifactPath string) (*androidrelease.Snapshot, error) {
@@ -313,11 +537,23 @@ func inspectAndroidArtifact(artifactPath string) (*androidrelease.Snapshot, erro
 
 func resolveReleaseVersion(metadata androidrelease.BundledMetadata, override string) (string, error) {
 	override = strings.TrimSpace(override)
+	bundledVersion := bundledReleaseVersion(metadata)
 	if override != "" {
+		if bundledVersion != "" && override != bundledVersion {
+			return "", fmt.Errorf("--version %q does not match bundled artifact version %q; update the app version and rebuild the artifact instead of overriding release metadata", override, bundledVersion)
+		}
 		return override, nil
 	}
+	if bundledVersion != "" {
+		return bundledVersion, nil
+	}
+
+	return "", errors.New("release version could not be inferred from bundled metadata; pass --version explicitly")
+}
+
+func bundledReleaseVersion(metadata androidrelease.BundledMetadata) string {
 	if metadata.App.Version != nil && strings.TrimSpace(*metadata.App.Version) != "" {
-		return strings.TrimSpace(*metadata.App.Version), nil
+		return strings.TrimSpace(*metadata.App.Version)
 	}
 
 	buildName := ""
@@ -330,11 +566,11 @@ func resolveReleaseVersion(metadata androidrelease.BundledMetadata, override str
 	}
 	switch {
 	case buildName != "" && buildNumber != "":
-		return buildName + "+" + buildNumber, nil
+		return buildName + "+" + buildNumber
 	case buildName != "":
-		return buildName, nil
+		return buildName
 	default:
-		return "", errors.New("release version could not be inferred from bundled metadata; pass --version explicitly")
+		return ""
 	}
 }
 
@@ -364,8 +600,19 @@ func resolveReleaseArchForArtifact(artifactType string, abis []string, override 
 		if artifactType == "aab" {
 			return "universal", nil
 		}
-		return "", fmt.Errorf("artifact contains multiple ABIs (%s); pass --arch explicitly", strings.Join(abis, ", "))
+		return preferredAndroidABI(abis), nil
 	}
+}
+
+func preferredAndroidABI(abis []string) string {
+	for _, preferred := range []string{"arm64-v8a", "x86_64", "armeabi-v7a"} {
+		for _, abi := range abis {
+			if abi == preferred {
+				return preferred
+			}
+		}
+	}
+	return abis[0]
 }
 
 func rememberAndroidRelease(projectDir string, apiBase string, snapshot *androidrelease.Snapshot, release domain.Release, manifestKeyID string) error {
@@ -404,6 +651,69 @@ func releaseMatchesRequest(release domain.Release, req domain.CreateReleaseReque
 
 func defaultReleaseID(appID, version, arch string) string {
 	return slugifyReleaseID(fmt.Sprintf("%s-%s-%s", appID, version, arch))
+}
+
+func uploadReleaseArtifact(apiBase string, releaseID string, artifactPath string) (domain.ReleaseArtifact, error) {
+	var zero domain.ReleaseArtifact
+	file, err := os.Open(artifactPath)
+	if err != nil {
+		return zero, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return zero, err
+	}
+
+	artifactURL := strings.TrimRight(apiBase, "/") +
+		"/v1/releases/" +
+		url.PathEscape(releaseID) +
+		"/artifact?filename=" +
+		url.QueryEscape(filepath.Base(filepath.Clean(artifactPath)))
+	req, err := http.NewRequest(http.MethodPost, artifactURL, file)
+	if err != nil {
+		return zero, err
+	}
+	req.ContentLength = info.Size()
+	req.Header.Set("Content-Type", androidArtifactContentType(artifactPath))
+	req.Header.Set("X-Soroq-Artifact-Filename", filepath.Base(filepath.Clean(artifactPath)))
+	if err := applyOperatorHeaders(req); err != nil {
+		return zero, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return zero, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return zero, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(string(respBody))
+		if message == "" {
+			message = resp.Status
+		}
+		return zero, fmt.Errorf("release artifact upload failed: %s", message)
+	}
+	var artifact domain.ReleaseArtifact
+	if err := json.Unmarshal(respBody, &artifact); err != nil {
+		return zero, fmt.Errorf("decode release artifact response: %w", err)
+	}
+	return artifact, nil
+}
+
+func androidArtifactContentType(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".apk":
+		return "application/vnd.android.package-archive"
+	case ".aab":
+		return "application/vnd.android.aab"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 func slugifyReleaseID(raw string) string {
@@ -514,7 +824,14 @@ func getJSONDecode[T any](url string) (T, error) {
 }
 
 func applyOperatorHeaders(req *http.Request) error {
-	creds, err := currentOperatorCredentialsForRequest("")
+	// Scope the credential refresh to the host this request actually targets so a
+	// local/non-prod --api request never refreshes or rewrites the stored prod
+	// credential. req.URL already carries the resolved control-plane base.
+	targetAPIBase := ""
+	if req != nil && req.URL != nil {
+		targetAPIBase = req.URL.Scheme + "://" + req.URL.Host
+	}
+	creds, err := currentOperatorCredentialsForRequest("", targetAPIBase)
 	if err != nil {
 		return err
 	}

@@ -14,7 +14,7 @@ import (
 func TestRunAppCreateUsesSoroqYamlAppID(t *testing.T) {
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
-	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), "app_id: com.example.app\nchannel: stable\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
 
 	var captured domain.CreateAppRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -62,7 +62,7 @@ func TestRunAppCreateSendsOperatorHeadersFromEnvironment(t *testing.T) {
 
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
-	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), "app_id: com.example.app\nchannel: stable\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/apps" {
@@ -128,7 +128,7 @@ func TestRunAppListPrintsApps(t *testing.T) {
 func TestRunAppCreateIfNotExistsFetchesExistingApp(t *testing.T) {
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
-	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), "app_id: com.example.app\nchannel: stable\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
 
 	var postCount int
 	var getCount int
@@ -187,7 +187,7 @@ func TestRunAppCreateIfNotExistsFetchesExistingApp(t *testing.T) {
 func TestRunAppStatusUsesSoroqYamlAppID(t *testing.T) {
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
-	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), "app_id: com.example.app\nchannel: stable\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/apps/com.example.app" {
@@ -224,7 +224,7 @@ func TestRunAppStatusUsesSoroqYamlAppID(t *testing.T) {
 func TestRunAppCreateRejectsMismatchedAppIDOverride(t *testing.T) {
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
-	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), "app_id: com.example.app\nchannel: stable\n")
+	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
 
 	err := runAppCreate([]string{
 		"--project-dir", projectDir,

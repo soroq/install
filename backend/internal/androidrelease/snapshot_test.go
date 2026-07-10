@@ -52,6 +52,22 @@ func TestCaptureSnapshotReadsBundledMetadataAndABIs(t *testing.T) {
 	}
 }
 
+func TestDeriveABIsPrefersLibappOverPackagedRuntimeLibraries(t *testing.T) {
+	snapshot := &Snapshot{
+		NativeLibs: []EntryDigest{
+			{Path: "lib/arm64-v8a/libsoroq_runtime_jni.so", SHA256: "runtime-arm64", SizeBytes: 1},
+			{Path: "lib/armeabi-v7a/libsoroq_runtime_jni.so", SHA256: "runtime-arm", SizeBytes: 1},
+			{Path: "lib/x86_64/libapp.so", SHA256: "app-x64", SizeBytes: 1},
+			{Path: "lib/x86_64/libsoroq_runtime_jni.so", SHA256: "runtime-x64", SizeBytes: 1},
+		},
+	}
+
+	abis := DeriveABIs(snapshot)
+	if len(abis) != 1 || abis[0] != "x86_64" {
+		t.Fatalf("expected libapp ABI only, got %v", abis)
+	}
+}
+
 func TestCompareSnapshotsFlagsRuntimeMismatch(t *testing.T) {
 	base := &Snapshot{
 		SchemaVersion: 1,

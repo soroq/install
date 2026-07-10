@@ -47,29 +47,18 @@ func runApp(args []string) error {
 		appUsage()
 		return nil
 	default:
-		printUnknownSubcommand(os.Stderr, "app", args[0], []string{"create", "list", "status"})
+		appUsage()
 		return errAlreadyPrinted
 	}
 }
 
 func appUsage() {
-	printCommandUsage(os.Stdout,
-		"Soroq Apps",
-		"Register and inspect apps in the hosted control plane.",
-		"soroq app <command> [flags]",
-		[]usageSection{{
-			Title: "Commands",
-			Rows: []usageRow{
-				{Name: "create", Description: "Register a Soroq app in the control plane."},
-				{Name: "list", Description: "List registered Soroq apps."},
-				{Name: "status", Description: "Inspect a registered Soroq app in the control plane."},
-			},
-		}},
-		[]string{
-			"soroq app create --name \"My App\" --app-id com.example.app",
-			"soroq app status --app-id com.example.app",
-		},
-	)
+	fmt.Fprintln(os.Stdout, `usage: soroq app <command> [flags]
+
+commands:
+  create  register a Soroq app in the control plane
+  list    list registered Soroq apps
+  status  inspect a registered Soroq app in the control plane`)
 }
 
 func addAppCreateHint(err error, appID string) error {
@@ -96,7 +85,7 @@ func runAppCreate(args []string) error {
 	ifNotExists := fs.Bool("if-not-exists", false, "succeed when the app is already registered")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq app create --name "My App" [--project-dir .] [--app-id com.example.app] [--api https://soroq-control-plane.fly.dev] [--if-not-exists] [--json]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq app create --name "My App" [--project-dir .] [--app-id com.example.app] [--api https://api.soroq.dev] [--if-not-exists] [--json]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -162,7 +151,7 @@ func runAppStatus(args []string) error {
 	appID := fs.String("app-id", "", "app id override (defaults from soroq.yaml)")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq app status [--project-dir .] [--app-id com.example.app] [--api https://soroq-control-plane.fly.dev] [--json]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq app status [--project-dir .] [--app-id com.example.app] [--api https://api.soroq.dev] [--json]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -202,7 +191,7 @@ func runAppList(args []string) error {
 	apiBase := fs.String("api", defaultAPIBase(), "control plane base URL")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq app list [--api https://soroq-control-plane.fly.dev] [--json]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq app list [--api https://api.soroq.dev] [--json]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

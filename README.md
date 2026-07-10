@@ -1,12 +1,27 @@
 # Soroq CLI
 
-Public home for the Soroq CLI **installers and signed binary releases**.
+Public home for the Soroq CLI **source, installers, and signed binary releases**.
 
-> **Source-build status.** This repo currently distributes released binaries. A full
-> **build-from-source** path for the current CLI is **pending**: the CLI links private
-> control-plane packages, so a clean public CLI module has not been split out yet. The
-> `backend/` tree here is an older slice and does **not** build the current tested CLI — do
-> not rely on it. Use the binary installer below.
+## Build from source
+
+`backend/` is the public Soroq CLI source — the same client-side code shipped in the binary
+releases, exported deterministically from the main repo (operator-only publishing and all
+private control-plane/store/S3 code are excluded). From a clean checkout:
+
+```bash
+cd backend
+make build        # stamps ./VERSION -> ./soroq + ./soroqctl
+./soroq version   # -> soroq v0.2.1
+# or plainly:
+go build ./cmd/soroq
+go build ./cmd/soroqctl
+go test ./...
+```
+
+No private module replacement, private Git dependency, or local path is required. The two
+operator-only commands (`frontend publish`, `toolchain publish`) are intentionally not in this
+build; every normal developer command (install/doctor, login/whoami/logout, init, release,
+patch, rollback, …) is present.
 
 Hard-OTA is an experimental tier. No App Store / Play **production** approval is claimed, no
 Shorebird parity, and no arbitrary-Dart/Flutter parity. iOS hard-OTA is device-only.

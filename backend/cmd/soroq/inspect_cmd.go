@@ -30,26 +30,16 @@ func runInspect(args []string) error {
 		inspectUsage()
 		return nil
 	default:
-		printUnknownSubcommand(os.Stderr, "inspect", args[0], []string{"android"})
+		inspectUsage()
 		return errAlreadyPrinted
 	}
 }
 
 func inspectUsage() {
-	printCommandUsage(os.Stdout,
-		"Soroq Inspect",
-		"Read Soroq metadata from local build artifacts.",
-		"soroq inspect <target> [flags]",
-		[]usageSection{{
-			Title: "Targets",
-			Rows: []usageRow{
-				{Name: "android", Description: "Inspect bundled Soroq metadata in an Android APK/AAB."},
-			},
-		}},
-		[]string{
-			"soroq inspect android --artifact build/app/outputs/bundle/release/app-release.aab",
-		},
-	)
+	fmt.Fprintln(os.Stdout, `usage: soroq inspect <target> [flags]
+
+targets:
+  android  inspect bundled Soroq metadata in an Android APK/AAB`)
 }
 
 func runInspectAndroid(args []string) error {

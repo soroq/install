@@ -317,10 +317,21 @@ func CompareSnapshots(base *Snapshot, candidate *Snapshot) ComparisonReport {
 }
 
 func DeriveABIs(snapshot *Snapshot) []string {
+	libappABIs := deriveABIsForNativeLibrary(snapshot, "libapp.so")
+	if len(libappABIs) > 0 {
+		return libappABIs
+	}
+	return deriveABIsForNativeLibrary(snapshot, "")
+}
+
+func deriveABIsForNativeLibrary(snapshot *Snapshot, libraryName string) []string {
 	seen := make(map[string]struct{})
 	for _, entry := range snapshot.NativeLibs {
 		parts := strings.Split(entry.Path, "/")
 		if len(parts) < 3 || parts[0] != "lib" {
+			continue
+		}
+		if libraryName != "" && filepath.Base(entry.Path) != libraryName {
 			continue
 		}
 		abi := strings.TrimSpace(parts[1])

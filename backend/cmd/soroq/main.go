@@ -2,59 +2,89 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 )
 
-func main() {
-	os.Exit(run(os.Args[1:]))
-}
+// buildVersion is stamped at build time via `-ldflags "-X main.buildVersion=<v>"`.
+var buildVersion = "dev"
 
-func run(args []string) int {
-	if len(args) < 1 {
-		printRootUsage(os.Stderr)
-		return 2
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
 	}
 
 	var err error
-	switch args[0] {
+	switch os.Args[1] {
+	case "version", "-v", "--version":
+		fmt.Printf("soroq %s\n", buildVersion)
+		return
 	case "app":
-		err = runApp(args[1:])
+		err = runApp(os.Args[2:])
+	case "doctor":
+		err = runDoctor(os.Args[2:])
+	case "frontend":
+		err = runFrontend(os.Args[2:])
 	case "init":
-		err = runInit(args[1:])
+		err = runInit(os.Args[2:])
 	case "inspect":
-		err = runInspect(args[1:])
+		err = runInspect(os.Args[2:])
 	case "login":
-		err = runLogin(args[1:])
+		err = runLogin(os.Args[2:])
 	case "logout":
-		err = runLogout(args[1:])
+		err = runLogout(os.Args[2:])
 	case "patch":
-		err = runPatch(args[1:])
+		err = runPatch(os.Args[2:])
+	case "patches":
+		err = runPatch(os.Args[2:])
+	case "preview":
+		err = runPreview(os.Args[2:])
 	case "release":
-		err = runRelease(args[1:])
+		err = runRelease(os.Args[2:])
 	case "rollback":
-		err = runRollback(args[1:])
+		err = runRollback(os.Args[2:])
 	case "status":
-		err = runStatus(args[1:])
+		err = runStatus(os.Args[2:])
+	case "toolchain":
+		err = runToolchain(os.Args[2:])
 	case "whoami":
-		err = runWhoami(args[1:])
+		err = runWhoami(os.Args[2:])
 	case "-h", "--help", "help":
-		printRootUsage(os.Stdout)
-		return 0
+		usage()
+		return
 	default:
-		printUnknownCommand(os.Stderr, args[0])
-		return 2
+		usage()
+		os.Exit(2)
 	}
 
 	if err == nil {
-		return 0
+		return
 	}
 	if errors.Is(err, errAlreadyPrinted) {
-		return 1
+		os.Exit(1)
 	}
-	printFatalError(os.Stderr, err)
-	return 1
+	fmt.Fprintln(os.Stderr, "error:", err)
+	os.Exit(1)
 }
 
 func usage() {
-	printRootUsage(os.Stderr)
+	fmt.Fprintln(os.Stderr, `usage: soroq <command> [flags]
+
+commands:
+  app      register or manage Soroq apps in the control plane
+  doctor   diagnose toolchain, signing, project, and control-plane readiness
+  frontend install, list, or diagnose the Soroq Flutter build frontend
+  init     create a project-level soroq.yaml in a Flutter app
+  inspect  inspect bundled Soroq metadata in local artifacts
+  login    store hosted control-plane operator credentials
+  logout   remove stored hosted control-plane credentials
+  patch    publish hosted Android asset or JSON config patches
+  patches  list, inspect, stage, or promote hosted patches
+  preview  preview hosted Android release and patch state
+  release  register a built release artifact with the control plane
+  rollback roll back a hosted patch by patch id
+  status    inspect whether a Flutter app looks Soroq-ready
+  toolchain publish, install, list, or diagnose hosted build-time engine toolchains
+  whoami    verify the current hosted control-plane operator`)
 }
