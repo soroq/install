@@ -11,7 +11,7 @@ private control-plane/store/S3 code are excluded). From a clean checkout:
 ```bash
 cd backend
 make build        # stamps ./VERSION -> ./soroq + ./soroqctl
-./soroq version   # -> soroq v0.2.1
+./soroq version   # -> soroq v0.2.2
 # or plainly:
 go build ./cmd/soroq
 go build ./cmd/soroqctl
@@ -44,7 +44,7 @@ Then add Soroq to your current shell (the installer also prints your profile fil
 
 ```bash
 export PATH="$HOME/.soroq/bin:$PATH"
-soroq version   # -> soroq v0.2.1
+soroq version   # -> soroq v0.2.2
 ```
 
 The installer detects your OS/CPU, downloads the matching archive from this repo's GitHub
@@ -86,7 +86,7 @@ Each archive contains `soroq` + `soroqctl`, no secrets, no local paths, no priva
 Pin a version:
 
 ```bash
-SOROQ_INSTALL_VERSION=v0.2.1 sh install.sh
+SOROQ_INSTALL_VERSION=v0.2.2 sh install.sh
 ```
 
 Install somewhere else:
