@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"syscall"
 	"time"
 )
 
@@ -17,18 +16,9 @@ import (
 
 // availableBytesFn resolves the bytes available to an unprivileged user on the filesystem backing dir.
 // It is a var so a test can inject a tiny value to exercise the abort path without a real full disk.
+// availableBytesStatfs is defined per-platform: a dep-free syscall.Statfs impl on darwin/linux
+// (preflight_unix.go) and a skip-the-check stub on windows (preflight_windows.go).
 var availableBytesFn = availableBytesStatfs
-
-// availableBytesStatfs returns Bavail*Bsize for the filesystem backing dir (darwin/linux, dep-free
-// syscall). The uint64 casts keep it portable across the two platforms (darwin Bsize is uint32, linux
-// int64); this repo targets macOS + Linux only.
-func availableBytesStatfs(dir string) (int64, error) {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(dir, &st); err != nil {
-		return 0, err
-	}
-	return int64(uint64(st.Bavail) * uint64(st.Bsize)), nil
-}
 
 // requiredPeakBytes is the PEAK on-disk footprint of an install: the downloaded temp archive AND the
 // extracted temp dir coexist (the swap into the version dir happens ONLY after verify passes), so the
