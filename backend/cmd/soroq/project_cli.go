@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,14 +115,16 @@ func runInit(args []string) error {
 	displayName := fs.String("display-name", "", "display name to register in the hosted control plane")
 	name := fs.String("name", "", "alias for --display-name")
 	channel := fs.String("channel", "stable", "default rollout channel")
-	createApp := fs.Bool("create-app", true, "register the app in the hosted control plane during init")
+	createApp := fs.Bool("create-app", false, "register the app in the hosted control plane during init (opt-in; requires `soroq login` + network)")
 	ifNotExists := fs.Bool("if-not-exists", true, "succeed when the hosted app already exists")
 	addDependency := fs.Bool("add-dependency", true, "add soroq_flutter to pubspec.yaml when it is missing")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	force := fs.Bool("force", false, "overwrite an existing soroq.yaml")
+	dryRun := fs.Bool("dry-run", false, "preview every file init would create/modify/skip without writing anything")
+	check := fs.Bool("check", false, "exit non-zero when the project still needs `soroq init` (CI gate); writes nothing")
 	verbose := fs.Bool("verbose", false, "stream raw flutter output (default: quiet; shown on failure)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq init [--app-id com.example.app] [--display-name "My App"] [--channel stable] [--project-dir .] [--api https://api.soroq.dev] [--create-app=false] [--if-not-exists=false] [--add-dependency=false] [--json] [--verbose] [--force]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq init [--app-id com.example.app] [--display-name "My App"] [--channel stable] [--project-dir .] [--api https://api.soroq.dev] [--create-app=false] [--if-not-exists=false] [--add-dependency=false] [--json] [--dry-run] [--check] [--verbose] [--force]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -132,7 +136,7 @@ func runInit(args []string) error {
 		cliVerboseRequested = true
 	}
 
-	resolvedAppID := strings.TrimSpace(*appID)
+	explicitAppID := strings.TrimSpace(*appID)
 	resolvedDisplayName := strings.TrimSpace(*displayName)
 	if resolvedDisplayName == "" {
 		resolvedDisplayName = strings.TrimSpace(*name)
@@ -144,6 +148,18 @@ func runInit(args []string) error {
 	if !looksLikeChannel(resolvedChannel) {
 		return fmt.Errorf("--channel %q should be a stable slug such as stable, beta, or production", resolvedChannel)
 	}
+	// Track which flags the user set EXPLICITLY (channel/app-id default to values, so value alone
+	// cannot signal intent). An explicit value that differs from stored soroq.yaml is a genuine
+	// conflict that still requires --force.
+	appIDFlagSet, channelFlagSet := false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "app-id":
+			appIDFlagSet = true
+		case "channel":
+			channelFlagSet = true
+		}
+	})
 
 	status, err := inspectProject(*projectDir)
 	if err != nil {
@@ -152,51 +168,99 @@ func runInit(args []string) error {
 	if !status.HasPubspec {
 		return fmt.Errorf("pubspec.yaml not found in %s", status.ProjectDir)
 	}
-	if status.HasSoroqConfig && !*force {
-		return fmt.Errorf("soroq.yaml already exists at %s (rerun with --force to overwrite)", status.SoroqConfigPath)
+
+	// Resolve the app id WITHOUT inference when the project is already initialized (reuse the stored
+	// app_id); infer conservatively otherwise. resolveInitAppID never fabricates an id and surfaces
+	// ambiguity (Android namespace fallback / multiple iOS bundle ids) as warnings.
+	resolvedAppID, appIDWarnings, appIDErr := resolveInitAppID(status.ProjectDir, explicitAppID, status)
+
+	// --dry-run and --check are READ-ONLY: they share the plan and never touch disk or the network.
+	if *dryRun || *check {
+		plan := buildInitPlan(status, resolvedAppID, resolvedChannel)
+		if *check {
+			if appIDErr != nil || planNeedsInit(plan) {
+				hint := ""
+				if appIDErr != nil {
+					hint = " --app-id <your.app.id>"
+				}
+				return fmt.Errorf("project is not initialized for Soroq; run `soroq init%s` to set it up", hint)
+			}
+			return nil
+		}
+		printInitPlan(os.Stdout, status, plan, resolvedAppID, appIDWarnings, appIDErr)
+		return nil
 	}
 
-	shouldCreateApp := *createApp || resolvedDisplayName != ""
-	if resolvedAppID == "" {
-		var err error
-		resolvedAppID, err = inferAndroidApplicationID(status.ProjectDir)
-		if err != nil {
-			resolvedAppID, err = inferIOSBundleIdentifier(status.ProjectDir)
-			if err != nil {
-				return fmt.Errorf("could not infer Android applicationId or iOS bundle identifier; pass --app-id explicitly: %w", err)
-			}
-		}
+	// Real init from here on: an unresolvable app id is fatal.
+	if appIDErr != nil {
+		return fmt.Errorf("%w; pass --app-id explicitly", appIDErr)
 	}
 	if !looksLikeSoroqAppID(resolvedAppID) {
 		return fmt.Errorf("--app-id %q should be a stable Soroq app id using letters, numbers, dots, underscores, or hyphens", resolvedAppID)
 	}
-	if shouldCreateApp && resolvedDisplayName == "" {
-		resolvedDisplayName = defaultDisplayNameFromPubspec(pubspecBytesOrNil(status.PubspecPath))
-	}
-	if shouldCreateApp && resolvedDisplayName == "" {
-		return errors.New("--display-name is required when --create-app is used and pubspec.yaml has no top-level name")
-	}
-	trust, err := fetchHostedManifestTrust(strings.TrimRight(*apiBase, "/"))
-	if err != nil {
-		return err
+	// Conservative inference: never silently pick an ambiguous id — warn on stderr (never JSON stdout).
+	for _, warning := range appIDWarnings {
+		fmt.Fprintf(os.Stderr, "soroq: %s\n", warning)
 	}
 
+	// Decide whether we (re)write soroq.yaml. A fresh project or --force writes it; otherwise we keep
+	// the user's soroq.yaml untouched and only run the idempotent additive fixers below.
+	writeConfig := !status.HasSoroqConfig || *force
+	if status.HasSoroqConfig && !*force {
+		var conflicts []string
+		if !soroqConfigConsistent(status) {
+			conflicts = append(conflicts, "its existing content is missing or invalid required fields (app_id/channel/runtime_id_strategy)")
+		}
+		if appIDFlagSet && explicitAppID != strings.TrimSpace(status.AppID) {
+			conflicts = append(conflicts, fmt.Sprintf("--app-id %q differs from the stored app_id %q", explicitAppID, strings.TrimSpace(status.AppID)))
+		}
+		if channelFlagSet && resolvedChannel != strings.TrimSpace(status.Channel) {
+			conflicts = append(conflicts, fmt.Sprintf("--channel %q differs from the stored channel %q", resolvedChannel, strings.TrimSpace(status.Channel)))
+		}
+		if len(conflicts) > 0 {
+			return fmt.Errorf("soroq.yaml at %s already exists and %s; rerun with --force to overwrite it", status.SoroqConfigPath, strings.Join(conflicts, "; "))
+		}
+	}
+
+	// manifest_trust is injected additively by ensureManifestTrust below; capture whether the existing
+	// soroq.yaml lacked it so a clean re-run does not falsely report "nothing to do".
+	manifestTrustInjected := status.HasSoroqConfig && !writeConfig && !status.HasManifestTrust
+
+	var trust hostedManifestTrustResponse
 	var app *domain.App
-	if shouldCreateApp {
-		createdApp, err := createHostedApp(strings.TrimRight(*apiBase, "/"), resolvedAppID, resolvedDisplayName, *ifNotExists)
+	shouldCreateApp := writeConfig && (*createApp || resolvedDisplayName != "")
+	if writeConfig {
+		if shouldCreateApp && resolvedDisplayName == "" {
+			resolvedDisplayName = defaultDisplayNameFromPubspec(pubspecBytesOrNil(status.PubspecPath))
+		}
+		if shouldCreateApp && resolvedDisplayName == "" {
+			return errors.New("--display-name is required when --create-app is used and pubspec.yaml has no top-level name")
+		}
+		trust, err = fetchHostedManifestTrust(strings.TrimRight(*apiBase, "/"))
 		if err != nil {
+			// Fresh/offline user: don't dead-end init on an unreachable control plane. Write a
+			// build-ready soroq.yaml with a locally scaffolded app-owned manifest_trust key
+			// (ensureManifestTrust, below) instead of hosted keys. Re-run `soroq init --force`
+			// once online to adopt hosted trust keys.
+			fmt.Fprintf(os.Stderr, "soroq: could not fetch hosted manifest trust (%v)\n", err)
+			fmt.Fprintln(os.Stderr, "soroq: scaffolding a local app-owned manifest_trust key instead; run `soroq init --force` when online to adopt hosted trust keys.")
+			trust = hostedManifestTrustResponse{RuntimeIDStrategy: "manifest_trust_v1"}
+		}
+		if shouldCreateApp {
+			createdApp, err := createHostedApp(strings.TrimRight(*apiBase, "/"), resolvedAppID, resolvedDisplayName, *ifNotExists)
+			if err != nil {
+				return err
+			}
+			app = &createdApp
+		}
+		content := renderSoroqConfig(resolvedAppID, resolvedChannel, trust)
+		if err := os.WriteFile(status.SoroqConfigPath, []byte(content), 0o644); err != nil {
 			return err
 		}
-		app = &createdApp
 	}
-
-	content := renderSoroqConfig(resolvedAppID, resolvedChannel, trust)
-	if err := os.WriteFile(status.SoroqConfigPath, []byte(content), 0o644); err != nil {
-		return err
-	}
-	// Guarantee a build-ready manifest_trust: validate the block just written (or auto-scaffold an
+	// Guarantee a build-ready manifest_trust: validate the block already present (or auto-scaffold an
 	// app-owned key if hosted trust yielded none), so a fresh init never dead-ends on the fork's
-	// `Expected soroq.yaml to define "manifest_trust"` error. No-op when the hosted keys are valid.
+	// `Expected soroq.yaml to define "manifest_trust"` error. No-op when a valid block exists.
 	if _, err := ensureManifestTrust(status.ProjectDir); err != nil {
 		return err
 	}
@@ -216,24 +280,48 @@ func runInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := generateSoroqBundledMetadata(status.ProjectDir); err != nil {
-		return fmt.Errorf("generate Soroq bundled metadata: %w", err)
+	// Only regenerate the bundled metadata asset when it is missing or stale, so a clean re-run stays a
+	// true no-op (identical bytes are never rewritten).
+	metadataChanged := false
+	if exists, matches := soroqBundledMetadataState(status.ProjectDir); !exists || !matches {
+		if err := generateSoroqBundledMetadata(status.ProjectDir); err != nil {
+			return fmt.Errorf("generate Soroq bundled metadata: %w", err)
+		}
+		metadataChanged = true
 	}
 	androidFixes, err := ensureAndroidProjectDefaults(status.ProjectDir)
 	if err != nil {
 		return err
 	}
 
+	changed := writeConfig || manifestTrustInjected || dependencyAdded || autoUpdateConfigWritten ||
+		pubspecUpdated || metadataChanged || androidFixes.ManifestInternetUpdated || androidFixes.NDKVersionUpdated
+
 	if *jsonOut {
+		runtimeStrategy := trust.RuntimeIDStrategy
+		summaryChannel := resolvedChannel
+		autoUpdateBaseURL := strings.TrimRight(*apiBase, "/")
+		if !writeConfig {
+			// Clean/additive re-run: report the stored config rather than the write-path defaults.
+			if strings.TrimSpace(status.RuntimeIDStrategy) != "" {
+				runtimeStrategy = status.RuntimeIDStrategy
+			}
+			if strings.TrimSpace(status.Channel) != "" {
+				summaryChannel = status.Channel
+			}
+			if strings.TrimSpace(status.AutoUpdateBaseURL) != "" {
+				autoUpdateBaseURL = status.AutoUpdateBaseURL
+			}
+		}
 		summary := initSummary{
 			ProjectDir:                  status.ProjectDir,
 			SoroqConfigPath:             status.SoroqConfigPath,
 			AppID:                       resolvedAppID,
-			Channel:                     resolvedChannel,
-			RuntimeIDStrategy:           trust.RuntimeIDStrategy,
+			Channel:                     summaryChannel,
+			RuntimeIDStrategy:           runtimeStrategy,
 			DependencyAdded:             dependencyAdded,
 			AutoUpdateConfigPath:        filepath.Join(status.ProjectDir, soroqAutoUpdateConfigAsset),
-			AutoUpdateBaseURL:           strings.TrimRight(*apiBase, "/"),
+			AutoUpdateBaseURL:           autoUpdateBaseURL,
 			AutoUpdateConfigWritten:     autoUpdateConfigWritten,
 			PubspecUpdated:              pubspecUpdated,
 			ManifestInternetUpdated:     androidFixes.ManifestInternetUpdated,
@@ -247,7 +335,17 @@ func runInit(args []string) error {
 		return encoder.Encode(summary)
 	}
 
-	fmt.Fprintf(os.Stdout, "Wrote %s\n", status.SoroqConfigPath)
+	if !changed {
+		fmt.Fprintln(os.Stdout, "Already initialized — nothing to do.")
+		return nil
+	}
+
+	if writeConfig {
+		fmt.Fprintf(os.Stdout, "Wrote %s\n", status.SoroqConfigPath)
+	}
+	if manifestTrustInjected {
+		fmt.Fprintf(os.Stdout, "Updated %s with a manifest_trust block\n", status.SoroqConfigPath)
+	}
 	if dependencyAdded {
 		fmt.Fprintln(os.Stdout, "Added soroq_flutter dependency to pubspec.yaml")
 	}
@@ -257,7 +355,9 @@ func runInit(args []string) error {
 	if pubspecUpdated {
 		fmt.Fprintf(os.Stdout, "Updated %s to include Soroq runtime assets\n", status.PubspecPath)
 	}
-	fmt.Fprintf(os.Stdout, "Wrote %s\n", filepath.Join(status.ProjectDir, filepath.FromSlash(soroqBundledMetadataAsset)))
+	if metadataChanged {
+		fmt.Fprintf(os.Stdout, "Wrote %s\n", filepath.Join(status.ProjectDir, filepath.FromSlash(soroqBundledMetadataAsset)))
+	}
 	if androidFixes.ManifestInternetUpdated {
 		fmt.Fprintln(os.Stdout, "Updated AndroidManifest.xml to include android.permission.INTERNET")
 	}
@@ -268,11 +368,242 @@ func runInit(args []string) error {
 		fmt.Fprintf(os.Stdout, "Registered Soroq app %s\n", app.ID)
 		fmt.Fprintf(os.Stdout, "display_name: %s\n", app.DisplayName)
 	}
+	printInitTeaching(os.Stdout)
 	if !status.HasSoroqFlutterDependency {
 		fmt.Fprintln(os.Stdout, "Next step: add soroq_flutter to your pubspec.yaml dependencies.")
 	}
 	fmt.Fprintln(os.Stdout, "Next step: run `soroq release android` or `soroq release ios`.")
 	return nil
+}
+
+// printInitTeaching prints a short, human-only explanation of what init just set up. It is additive to
+// STDOUT and intentionally NOT emitted on the --json path so the machine-readable shape stays stable.
+func printInitTeaching(w io.Writer) {
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "What Soroq set up and why:")
+	fmt.Fprintln(w, "  soroq.yaml      your project's Soroq config — app id, channel, and runtime-id strategy.")
+	fmt.Fprintln(w, "  manifest_trust  the signing trust anchor a device uses to verify Soroq patches are genuine.")
+	fmt.Fprintln(w, "  pubspec assets  bundle soroq.yaml + the Soroq runtime metadata into your app at build time.")
+}
+
+// soroqConfigConsistent reports whether an already-present soroq.yaml has valid, complete top-level
+// config (app_id, channel, runtime_id_strategy). It deliberately does NOT require manifest_trust, which
+// ensureManifestTrust injects additively without overwriting user content.
+func soroqConfigConsistent(status projectStatus) bool {
+	return status.AppIDLooksValid && status.ChannelLooksValid && status.RuntimeIDStrategy == "manifest_trust_v1"
+}
+
+// initPlanAction labels a planned change for the read-only --dry-run/--check preview.
+type initPlanAction string
+
+const (
+	planCreate initPlanAction = "would create"
+	planModify initPlanAction = "would modify"
+	planSkip   initPlanAction = "would skip (already present)"
+)
+
+type initPlanItem struct {
+	Target string         `json:"target"`
+	Action initPlanAction `json:"action"`
+	Detail string         `json:"detail,omitempty"`
+}
+
+func (p initPlanItem) needsWork() bool {
+	return p.Action == planCreate || p.Action == planModify
+}
+
+// planNeedsInit reports whether any planned item still requires a create/modify — i.e. the project is
+// not fully initialized. Shared by --dry-run and --check.
+func planNeedsInit(plan []initPlanItem) bool {
+	for _, item := range plan {
+		if item.needsWork() {
+			return true
+		}
+	}
+	return false
+}
+
+// buildInitPlan computes, using READ-ONLY checks only (os.Stat/ReadFile + pure renderers), what
+// `soroq init` would create/modify/skip for the current project state. It calls NONE of the writer
+// helpers, so it is safe for --dry-run and --check.
+func buildInitPlan(status projectStatus, appID, channel string) []initPlanItem {
+	var plan []initPlanItem
+
+	// soroq.yaml
+	switch {
+	case !status.HasSoroqConfig:
+		detail := fmt.Sprintf("app_id: %s, channel: %s", appIDOrPlaceholder(appID), channel)
+		plan = append(plan, initPlanItem{Target: "soroq.yaml", Action: planCreate, Detail: detail})
+	case soroqConfigConsistent(status):
+		plan = append(plan, initPlanItem{Target: "soroq.yaml", Action: planSkip})
+	default:
+		plan = append(plan, initPlanItem{Target: "soroq.yaml", Action: planModify, Detail: "existing config is incomplete/invalid; refresh needs --force"})
+	}
+
+	// manifest_trust (in soroq.yaml + .soroq/ signing seed)
+	switch {
+	case status.HasManifestTrust:
+		plan = append(plan, initPlanItem{Target: "manifest_trust", Action: planSkip})
+	case !status.HasSoroqConfig:
+		plan = append(plan, initPlanItem{Target: "manifest_trust", Action: planCreate, Detail: "scaffold an app-owned Ed25519 signing key"})
+	default:
+		plan = append(plan, initPlanItem{Target: "manifest_trust", Action: planCreate, Detail: "inject a manifest_trust block (additive)"})
+	}
+
+	// auto-update config
+	if status.HasAutoUpdateConfig {
+		plan = append(plan, initPlanItem{Target: soroqAutoUpdateConfigAsset, Action: planSkip})
+	} else {
+		plan = append(plan, initPlanItem{Target: soroqAutoUpdateConfigAsset, Action: planCreate})
+	}
+
+	// pubspec.yaml Soroq asset entries
+	if missing := pubspecSoroqAssetsMissing(status.PubspecPath); len(missing) == 0 {
+		plan = append(plan, initPlanItem{Target: "pubspec.yaml assets", Action: planSkip})
+	} else {
+		plan = append(plan, initPlanItem{Target: "pubspec.yaml assets", Action: planModify, Detail: "add " + strings.Join(missing, ", ")})
+	}
+
+	// bundled metadata asset
+	switch exists, matches := soroqBundledMetadataState(status.ProjectDir); {
+	case !exists:
+		plan = append(plan, initPlanItem{Target: soroqBundledMetadataAsset, Action: planCreate})
+	case matches:
+		plan = append(plan, initPlanItem{Target: soroqBundledMetadataAsset, Action: planSkip})
+	default:
+		plan = append(plan, initPlanItem{Target: soroqBundledMetadataAsset, Action: planModify, Detail: "regenerate (stale)"})
+	}
+
+	// Android INTERNET permission (only when an AndroidManifest exists)
+	if status.HasAndroidManifest {
+		if status.HasAndroidInternet {
+			plan = append(plan, initPlanItem{Target: "AndroidManifest.xml INTERNET permission", Action: planSkip})
+		} else {
+			plan = append(plan, initPlanItem{Target: "AndroidManifest.xml INTERNET permission", Action: planModify, Detail: "add android.permission.INTERNET"})
+		}
+	}
+
+	// Android Gradle ndkVersion (only when a gradle file already pins one)
+	if status.AndroidNDKVersion != "" {
+		if status.AndroidNDKCompatible {
+			plan = append(plan, initPlanItem{Target: "Android Gradle ndkVersion", Action: planSkip})
+		} else {
+			plan = append(plan, initPlanItem{Target: "Android Gradle ndkVersion", Action: planModify, Detail: "raise to " + soroqAndroidNDKVersion})
+		}
+	}
+
+	// soroq_flutter dependency
+	if status.HasSoroqFlutterDependency {
+		plan = append(plan, initPlanItem{Target: "soroq_flutter dependency", Action: planSkip})
+	} else {
+		plan = append(plan, initPlanItem{Target: "soroq_flutter dependency", Action: planCreate, Detail: "flutter pub add soroq_flutter"})
+	}
+
+	return plan
+}
+
+func appIDOrPlaceholder(appID string) string {
+	if strings.TrimSpace(appID) == "" {
+		return "<pass --app-id>"
+	}
+	return appID
+}
+
+// printInitPlan renders the read-only --dry-run preview. It writes ONLY to w (never to disk).
+func printInitPlan(w io.Writer, status projectStatus, plan []initPlanItem, appID string, warnings []string, appIDErr error) {
+	fmt.Fprintf(w, "Dry run: `soroq init` would apply the following to %s\n", status.ProjectDir)
+	if appIDErr != nil {
+		fmt.Fprintf(w, "  ! app_id could not be inferred (%v); pass --app-id <your.app.id>\n", appIDErr)
+	} else if strings.TrimSpace(appID) != "" && !status.HasSoroqConfig {
+		fmt.Fprintf(w, "  app_id: %s\n", appID)
+	}
+	for _, warning := range warnings {
+		fmt.Fprintf(w, "  ! %s\n", warning)
+	}
+	for _, item := range plan {
+		line := fmt.Sprintf("  %s: %s", item.Action, item.Target)
+		if item.Detail != "" {
+			line += " — " + item.Detail
+		}
+		fmt.Fprintln(w, line)
+	}
+	if planNeedsInit(plan) {
+		fmt.Fprintln(w, "\nRun `soroq init` to apply these changes.")
+	} else {
+		fmt.Fprintln(w, "\nAlready initialized — `soroq init` would make no changes.")
+	}
+	fmt.Fprintln(w, "No files were written (--dry-run).")
+}
+
+// pubspecSoroqAssetsMissing returns which of the three Soroq flutter assets are not yet declared in the
+// pubspec. Read-only.
+func pubspecSoroqAssetsMissing(pubspecPath string) []string {
+	assets := []string{"soroq.yaml", soroqAutoUpdateConfigAsset, soroqBundledMetadataAsset}
+	bytes, err := os.ReadFile(pubspecPath)
+	if err != nil {
+		return assets
+	}
+	text := string(bytes)
+	var missing []string
+	for _, asset := range assets {
+		if !pubspecContainsFlutterAsset(text, asset) {
+			missing = append(missing, asset)
+		}
+	}
+	return missing
+}
+
+// soroqBundledMetadataState reports whether the bundled metadata asset exists and whether its bytes
+// already match what generateSoroqBundledMetadata would write. It reuses the PURE renderers (no disk
+// writes) so it is safe on the read-only --dry-run/--check paths.
+func soroqBundledMetadataState(projectDir string) (exists bool, matches bool) {
+	onDisk, err := os.ReadFile(filepath.Join(projectDir, filepath.FromSlash(soroqBundledMetadataAsset)))
+	if err != nil {
+		return false, false
+	}
+	configBytes, err := os.ReadFile(filepath.Join(projectDir, "soroq.yaml"))
+	if err != nil {
+		return true, false
+	}
+	pubspecBytes, err := os.ReadFile(filepath.Join(projectDir, "pubspec.yaml"))
+	if err != nil {
+		return true, false
+	}
+	metadata, err := buildSoroqBundledMetadata(configBytes, pubspecBytes)
+	if err != nil {
+		return true, false
+	}
+	expected, err := renderSoroqBundledMetadataJSON(metadata)
+	if err != nil {
+		return true, false
+	}
+	return true, bytes.Equal(onDisk, expected)
+}
+
+// resolveInitAppID returns the app id to use for init WITHOUT ever fabricating one. An explicit
+// --app-id wins; an already-initialized project reuses its stored app_id (no inference); otherwise it
+// infers conservatively from Android then iOS, surfacing ambiguity (namespace fallback / multiple iOS
+// bundle ids) as human warnings rather than a silent pick.
+func resolveInitAppID(projectDir, explicitAppID string, status projectStatus) (appID string, warnings []string, err error) {
+	if explicitAppID != "" {
+		return explicitAppID, nil, nil
+	}
+	if status.HasSoroqConfig && strings.TrimSpace(status.AppID) != "" {
+		return strings.TrimSpace(status.AppID), nil, nil
+	}
+	if id, viaNamespace, aerr := inferAndroidApplicationIDDetailed(projectDir); aerr == nil {
+		if viaNamespace {
+			warnings = append(warnings, fmt.Sprintf("inferred app_id %q from the Android `namespace` (no explicit applicationId found) — pass --app-id to override", id))
+		}
+		return id, warnings, nil
+	}
+	if id, candidates, ierr := inferIOSBundleIdentifierDetailed(projectDir); ierr == nil {
+		if len(candidates) > 1 {
+			warnings = append(warnings, fmt.Sprintf("multiple iOS bundle identifiers found (%s); chose %q — pass --app-id to override", strings.Join(candidates, ", "), id))
+		}
+		return id, warnings, nil
+	}
+	return "", nil, errors.New("could not infer Android applicationId or iOS bundle identifier")
 }
 
 type initSummary struct {
@@ -385,6 +716,12 @@ func renderSoroqConfig(appID string, channel string, trust hostedManifestTrustRe
 	fmt.Fprintf(&builder, "app_id: %s\n", strings.TrimSpace(appID))
 	fmt.Fprintf(&builder, "channel: %s\n", strings.TrimSpace(channel))
 	fmt.Fprintf(&builder, "runtime_id_strategy: %s\n", strings.TrimSpace(trust.RuntimeIDStrategy))
+	if len(trust.ManifestTrust.Keys) == 0 {
+		// No hosted keys (offline fallback): leave the manifest_trust block for
+		// ensureManifestTrust to scaffold locally so init still yields a build-ready
+		// soroq.yaml. Emitting an empty block here would trip the "keys is empty" guard.
+		return builder.String()
+	}
 	builder.WriteString("manifest_trust:\n")
 	if trust.ManifestTrust.KeysetVersion != nil {
 		fmt.Fprintf(&builder, "  keyset_version: %d\n", *trust.ManifestTrust.KeysetVersion)
@@ -398,49 +735,76 @@ func renderSoroqConfig(appID string, channel string, trust hostedManifestTrustRe
 }
 
 func inferAndroidApplicationID(projectDir string) (string, error) {
+	id, _, err := inferAndroidApplicationIDDetailed(projectDir)
+	return id, err
+}
+
+// inferAndroidApplicationIDDetailed is inferAndroidApplicationID plus a signal for CONSERVATIVE
+// inference: viaNamespace is true when no literal applicationId was found and the id was taken from the
+// Android `namespace` fallback (an ambiguity worth warning about). Explicit applicationId is preferred
+// within each gradle file, matching the original scan order.
+func inferAndroidApplicationIDDetailed(projectDir string) (id string, viaNamespace bool, err error) {
 	paths := []string{
 		filepath.Join(projectDir, "android", "app", "build.gradle.kts"),
 		filepath.Join(projectDir, "android", "app", "build.gradle"),
 	}
+	applicationIDPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?m)\bapplicationId\s*=\s*"([^"]+)"`),
+		regexp.MustCompile(`(?m)\bapplicationId\s+["']([^"']+)["']`),
+	}
+	namespacePatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?m)\bnamespace\s*=\s*"([^"]+)"`),
+		regexp.MustCompile(`(?m)\bnamespace\s+["']([^"']+)["']`),
+	}
 	for _, path := range paths {
-		bytes, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
+		raw, rerr := os.ReadFile(path)
+		if errors.Is(rerr, os.ErrNotExist) {
 			continue
 		}
-		if err != nil {
-			return "", err
+		if rerr != nil {
+			return "", false, rerr
 		}
-		text := string(bytes)
-		for _, pattern := range []*regexp.Regexp{
-			regexp.MustCompile(`(?m)\bapplicationId\s*=\s*"([^"]+)"`),
-			regexp.MustCompile(`(?m)\bapplicationId\s+["']([^"']+)["']`),
-			regexp.MustCompile(`(?m)\bnamespace\s*=\s*"([^"]+)"`),
-			regexp.MustCompile(`(?m)\bnamespace\s+["']([^"']+)["']`),
-		} {
+		text := string(raw)
+		for _, pattern := range applicationIDPatterns {
 			matches := pattern.FindStringSubmatch(text)
 			if len(matches) == 2 && looksLikeAndroidAppID(matches[1]) {
-				return matches[1], nil
+				return matches[1], false, nil
+			}
+		}
+		for _, pattern := range namespacePatterns {
+			matches := pattern.FindStringSubmatch(text)
+			if len(matches) == 2 && looksLikeAndroidAppID(matches[1]) {
+				return matches[1], true, nil
 			}
 		}
 	}
-	return "", errors.New("android/app/build.gradle(.kts) did not contain a literal applicationId")
+	return "", false, errors.New("android/app/build.gradle(.kts) did not contain a literal applicationId")
 }
 
 func inferIOSBundleIdentifier(projectDir string) (string, error) {
+	id, _, err := inferIOSBundleIdentifierDetailed(projectDir)
+	return id, err
+}
+
+// inferIOSBundleIdentifierDetailed is inferIOSBundleIdentifier plus the full list of distinct non-Tests
+// bundle-id candidates it saw, so CONSERVATIVE inference can warn when more than one exists instead of
+// silently picking the first. id is always candidates[0] on success.
+func inferIOSBundleIdentifierDetailed(projectDir string) (id string, candidates []string, err error) {
 	paths := []string{
 		filepath.Join(projectDir, "ios", "Runner.xcodeproj", "project.pbxproj"),
 	}
 	for _, path := range paths {
-		bytes, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
+		raw, rerr := os.ReadFile(path)
+		if errors.Is(rerr, os.ErrNotExist) {
 			continue
 		}
-		if err != nil {
-			return "", err
+		if rerr != nil {
+			return "", nil, rerr
 		}
-		text := string(bytes)
+		text := string(raw)
 		pattern := regexp.MustCompile(`(?m)\bPRODUCT_BUNDLE_IDENTIFIER\s*=\s*([^;]+);`)
 		matches := pattern.FindAllStringSubmatch(text, -1)
+		seen := map[string]bool{}
 		for _, match := range matches {
 			if len(match) != 2 {
 				continue
@@ -451,12 +815,17 @@ func inferIOSBundleIdentifier(projectDir string) (string, error) {
 				strings.HasSuffix(bundleID, "Tests") {
 				continue
 			}
-			if looksLikeAndroidAppID(bundleID) {
-				return bundleID, nil
+			if !looksLikeAndroidAppID(bundleID) || seen[bundleID] {
+				continue
 			}
+			seen[bundleID] = true
+			candidates = append(candidates, bundleID)
+		}
+		if len(candidates) > 0 {
+			return candidates[0], candidates, nil
 		}
 	}
-	return "", errors.New("ios/Runner.xcodeproj/project.pbxproj did not contain a literal app bundle identifier")
+	return "", nil, errors.New("ios/Runner.xcodeproj/project.pbxproj did not contain a literal app bundle identifier")
 }
 
 func ensureAutoUpdateConfig(projectDir string, apiBase string, force bool) (bool, error) {
@@ -781,10 +1150,74 @@ func runStatus(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Enrich with the last recorded release, sourced from LOCAL data only (soroq.lock toolchain pin
+	// + .soroq/cli-state.json) — no network call, no patch state (patch state is not local; deferred).
+	// When both android + ios are recorded, show the most recently updated one.
+	state, _ := loadProjectCLIState(status.ProjectDir)
+	lock, _ := loadSoroqLock(status.ProjectDir)
+	var relPlatform, relID, relVersion, relChannel, relToolchain string
+	haveRelease := false
+	android := state.LastAndroidRelease
+	ios := state.LastIOSRelease
+	switch {
+	case android != nil && ios != nil:
+		if ios.UpdatedAt.After(android.UpdatedAt) {
+			relPlatform, relID, relVersion, relChannel = "ios", ios.ReleaseID, ios.Version, ios.Channel
+		} else {
+			relPlatform, relID, relVersion, relChannel = "android", android.ReleaseID, android.Version, android.Channel
+		}
+		haveRelease = true
+	case android != nil:
+		relPlatform, relID, relVersion, relChannel = "android", android.ReleaseID, android.Version, android.Channel
+		haveRelease = true
+	case ios != nil:
+		relPlatform, relID, relVersion, relChannel = "ios", ios.ReleaseID, ios.Version, ios.Channel
+		haveRelease = true
+	}
+	if haveRelease {
+		if pin, ok := lock.Platforms[relPlatform]; ok {
+			relToolchain = strings.TrimSpace(pin.ToolchainVersion)
+			if relID == "" {
+				relID = pin.ReleaseID
+			}
+			if relVersion == "" {
+				relVersion = pin.Version
+			}
+		}
+	} else {
+		// No cli-state release recorded, but a committed soroq.lock still pins a toolchain/release.
+		for _, platform := range []string{"android", "ios"} {
+			if pin, ok := lock.Platforms[platform]; ok {
+				relPlatform, relID, relVersion, relToolchain = platform, pin.ReleaseID, pin.Version, strings.TrimSpace(pin.ToolchainVersion)
+				haveRelease = true
+				break
+			}
+		}
+	}
+
 	if *jsonOut {
+		// Anonymous embedding flattens projectStatus's fields to the top level, so the existing JSON
+		// shape is preserved and the release/toolchain fields are additive (omitempty when unrecorded).
+		type statusWithRelease struct {
+			projectStatus
+			ReleaseID        string `json:"release_id,omitempty"`
+			ReleaseVersion   string `json:"release_version,omitempty"`
+			ReleaseChannel   string `json:"release_channel,omitempty"`
+			ReleasePlatform  string `json:"release_platform,omitempty"`
+			ToolchainVersion string `json:"toolchain_version,omitempty"`
+		}
+		enriched := statusWithRelease{projectStatus: status}
+		if haveRelease {
+			enriched.ReleaseID = relID
+			enriched.ReleaseVersion = relVersion
+			enriched.ReleaseChannel = relChannel
+			enriched.ReleasePlatform = relPlatform
+			enriched.ToolchainVersion = relToolchain
+		}
 		encoder := json.NewEncoder(os.Stdout)
 		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(status); err != nil {
+		if err := encoder.Encode(enriched); err != nil {
 			return err
 		}
 		if *check && !status.Ready {
@@ -822,6 +1255,21 @@ func runStatus(args []string) error {
 	}
 	if status.AndroidNDKVersion != "" {
 		fmt.Fprintf(os.Stdout, "android ndkVersion: %s\n", status.AndroidNDKVersion)
+	}
+	if haveRelease {
+		fmt.Fprintf(os.Stdout, "release_id: %s\n", relID)
+		if relVersion != "" {
+			fmt.Fprintf(os.Stdout, "version: %s\n", relVersion)
+		}
+		if relChannel != "" {
+			fmt.Fprintf(os.Stdout, "release channel: %s\n", relChannel)
+		}
+		if relToolchain != "" {
+			fmt.Fprintf(os.Stdout, "toolchain_version: %s\n", relToolchain)
+		}
+		fmt.Fprintf(os.Stdout, "release platform: %s\n", relPlatform)
+	} else {
+		fmt.Fprintln(os.Stdout, "release: no release recorded")
 	}
 	fmt.Fprintf(os.Stdout, "release ready: %s\n", yesNo(status.ReleaseReady))
 	fmt.Fprintf(os.Stdout, "patch ready: %s\n", yesNo(status.PatchReady))

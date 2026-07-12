@@ -102,6 +102,9 @@ func runBrowserLogin(options browserLoginOptions) error {
 		fmt.Fprintf(os.Stderr, "Could not open the browser automatically: %v\n", err)
 	}
 
+	// Progress goes to stderr so --json stdout stays clean/parseable.
+	fmt.Fprintf(os.Stderr, "Waiting for browser approval... (up to %s; press Ctrl+C to cancel)\n", timeout)
+
 	result, err := callback.Wait()
 	if err != nil {
 		return err
@@ -260,7 +263,7 @@ func (callback *browserLoginCallback) Wait() (browserLoginResult, error) {
 	case err := <-callback.errs:
 		return browserLoginResult{}, err
 	case <-timer.C:
-		return browserLoginResult{}, fmt.Errorf("browser login timed out after %s", callback.timeout)
+		return browserLoginResult{}, fmt.Errorf("browser login timed out after %s; run soroq login again to retry (use --callback-timeout to allow more time)", callback.timeout)
 	}
 }
 

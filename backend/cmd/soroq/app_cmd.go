@@ -109,7 +109,7 @@ func runAppCreate(args []string) error {
 		DisplayName: resolvedName,
 	}
 	apiBaseURL := strings.TrimRight(*apiBase, "/")
-	app, err := postJSONDecode[domain.App](apiBaseURL+"/v1/apps", req)
+	app, err := createSoroqApp(apiBaseURL, req)
 	created := true
 	if err != nil {
 		if !*ifNotExists {
@@ -250,4 +250,13 @@ func resolveAppIDForProject(projectDir string, appID string) (projectStatus, str
 
 func appURL(apiBase string, appID string) string {
 	return strings.TrimRight(apiBase, "/") + "/v1/apps/" + url.PathEscape(appID)
+}
+
+// createSoroqApp POSTs a Soroq app registration to the control plane. It is the single
+// create+bind path shared by `soroq app create` and the auto-registration that `soroq
+// release` performs when the control plane reports the "unknown app" sentinel. Ownership
+// binding is enforced server-side from the operator credential carried by applyOperatorHeaders
+// (via postJSONDecode), so a foreign-owned app id is rejected there rather than hijacked here.
+func createSoroqApp(apiBase string, req domain.CreateAppRequest) (domain.App, error) {
+	return postJSONDecode[domain.App](strings.TrimRight(apiBase, "/")+"/v1/apps", req)
 }

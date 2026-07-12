@@ -516,12 +516,20 @@ func runPatchAndroid(args []string) error {
 	}
 	var selectedHostedRelease *domain.Release
 	if resolvedReleaseID == "" && resolvedReleaseVersion == "" && lastRelease == nil {
+		// P3 (LOCK WINS on the fresh-clone path): the base release id is not yet known here, but a
+		// committed soroq.lock still pins the android toolchain. Resolve against it (platform-only) so
+		// this auto-infer build cannot use a toolchain != base. No lock -> returns the user's toolchain
+		// unchanged (zero regression).
+		earlyBuildToolchain, err := resolveAndroidPatchToolchain(status.ProjectDir, "", strings.TrimSpace(*toolchainVersion), flutterBuildArgs)
+		if err != nil {
+			return err
+		}
 		resolvedCandidateArtifactPath, err = resolveCandidateArtifactForReleaseSelection(
 			status.ProjectDir,
 			resolvedCandidateArtifactPath,
 			*buildBeforeDiscover,
 			*buildArtifactType,
-			strings.TrimSpace(*toolchainVersion),
+			earlyBuildToolchain,
 			flutterBuildArgs,
 		)
 		if err != nil {
@@ -625,7 +633,14 @@ func runPatchAndroid(args []string) error {
 		return errors.New("Flutter build passthrough args require automatic build; omit --candidate-artifact and keep --build=true")
 	}
 	if resolvedCandidateArtifactPath == "" && *buildBeforeDiscover {
-		if err := runFlutterAndroidReleaseBuild(status.ProjectDir, *buildArtifactType, strings.TrimSpace(*toolchainVersion), flutterBuildArgs); err != nil {
+		// P3 (LOCK WINS): when SOROQ builds the candidate, it MUST use the SAME toolchain that built the
+		// base release. Resolve the toolchain against the committed soroq.lock pin for this exact base
+		// release before building, so a patch can never build with a toolchain != base.
+		buildToolchainVersion, err := resolveAndroidPatchToolchain(status.ProjectDir, resolvedReleaseID, strings.TrimSpace(*toolchainVersion), flutterBuildArgs)
+		if err != nil {
+			return err
+		}
+		if err := runFlutterAndroidReleaseBuild(status.ProjectDir, *buildArtifactType, buildToolchainVersion, flutterBuildArgs); err != nil {
 			return err
 		}
 		candidateBuildRan = true
@@ -1028,6 +1043,43 @@ func resolveCandidateArtifactForReleaseSelection(
 		return "", err
 	}
 	return artifactPath, nil
+}
+
+// resolveAndroidPatchToolchain applies the soroq.lock precedence (LOCK WINS) for a SOROQ-built candidate:
+//
+//   - no pin for this base release (e.g. an --artifact release wrote none) -> keep current behavior:
+//     use the user's --toolchain (may be empty; resolveAndroidEngineSource decides/blocks downstream).
+//   - pin present + user passed a --toolchain that DIFFERS -> REFUSE, naming both versions and the base.
+//   - pin present + no --toolchain (or --toolchain == pin) -> AUTO-SELECT the pinned toolchain, and
+//     verify it is installed — emitting the EXISTING exact `soroq toolchain install <v> --api <base>`
+//     recovery (via resolveAndroidEngineSource) and refusing if it is not.
+//
+// baseReleaseID may be empty on the early auto-infer path (fresh clone: soroq.lock is committed but the
+// git-ignored cli-state.json is absent, so the base release id is not yet known). An empty id does a
+// platform-only lookup — the android pin holds exactly one release — and the refusal names the pin's own
+// release id. This closes the guarantee on the fresh-clone/CI path, not just the local record path.
+func resolveAndroidPatchToolchain(projectDir string, baseReleaseID string, userToolchain string, flutterBuildArgs []string) (string, error) {
+	userToolchain = strings.TrimSpace(userToolchain)
+	pin, found := loadSoroqLockPin(projectDir, "android", baseReleaseID)
+	if !found {
+		return userToolchain, nil
+	}
+	refusedReleaseID := strings.TrimSpace(baseReleaseID)
+	if refusedReleaseID == "" {
+		refusedReleaseID = strings.TrimSpace(pin.ReleaseID)
+	}
+	if userToolchain != "" && userToolchain != pin.ToolchainVersion {
+		return "", fmt.Errorf(
+			"--toolchain %q conflicts with toolchain %q pinned for base release %q in %s; a patch must build with the SAME toolchain as its base release — omit --toolchain to use the pinned toolchain",
+			userToolchain, pin.ToolchainVersion, refusedReleaseID, soroqLockPath(projectDir),
+		)
+	}
+	// Auto-select the pinned toolchain; reuse the Android engine-source resolver so a not-installed pin
+	// emits the exact `soroq toolchain install <version> --api <base>` recovery rather than a cryptic build failure.
+	if _, err := resolveAndroidEngineSource(pin.ToolchainVersion, flutterBuildArgs); err != nil {
+		return "", err
+	}
+	return pin.ToolchainVersion, nil
 }
 
 func downloadReleaseArtifact(apiBase string, releaseID string, projectDir string) (string, error) {

@@ -332,18 +332,38 @@ auto-detect it (no SOROQ_FLUTTER_BIN). A verified existing install short-circuit
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return err
 	}
+
+	// Preflight (STDERR): print size/dest and ABORT before downloading if the target filesystem lacks
+	// the PEAK footprint (temp archive + extracted temp dir). Runs BEFORE any byte is fetched.
+	if err := runInstallPreflight(preflightInfo{
+		label:             "frontend",
+		version:           version,
+		destDir:           versionDir,
+		checkDir:          root,
+		compressedBytes:   manifest.Archive.CompressedBytes,
+		uncompressedBytes: manifest.Archive.UncompressedBytes,
+		force:             *force,
+	}); err != nil {
+		return err
+	}
+
 	tmpArchive, err := os.CreateTemp(root, ".frontend-archive-*.tar.gz")
 	if err != nil {
 		return err
 	}
 	tmpArchivePath := tmpArchive.Name()
 	defer os.Remove(tmpArchivePath)
-	fmt.Fprintf(os.Stdout, "Downloading frontend archive (%s, %s)…\n", manifest.SoroqFrontendVersion, humanBytes(manifest.Archive.CompressedBytes))
-	gotSHA, gotSize, err := streamDownloadToFile(manifest.Archive.URL, tmpArchive)
+	// Banner + live progress go to STDERR only (never STDOUT), and progress is suppressed under --json or
+	// a non-TTY so machine output on stdout is never corrupted.
+	live := stderrIsTTY() && !*jsonOut
+	fmt.Fprintf(os.Stderr, "Downloading frontend archive (%s, %s)…\n", manifest.SoroqFrontendVersion, humanBytes(manifest.Archive.CompressedBytes))
+	prog := newProgressReporter(manifest.Archive.CompressedBytes, live)
+	gotSHA, gotSize, err := streamDownloadToFile(manifest.Archive.URL, tmpArchive, prog)
 	tmpArchive.Close()
 	if err != nil {
 		return fmt.Errorf("download frontend archive: %w", err)
 	}
+	prog.finish()
 	if want := manifest.Archive.CompressedBytes; want > 0 && gotSize != want {
 		return fmt.Errorf("REFUSED: frontend archive size mismatch: manifest=%d downloaded=%d bytes (from %s)", want, gotSize, manifest.Archive.URL)
 	}
@@ -654,7 +674,7 @@ func frontendInstalledCheck() doctorCheck {
 			Name:    "Soroq Flutter frontend",
 			Status:  "error",
 			Message: "no frontend installed",
-			Fix:     "soroq frontend install <version> --api https://soroq-control-plane-prod.fly.dev",
+			Fix:     "soroq frontend install <version> --api " + defaultControlPlaneAPI,
 		}
 	}
 	versionDir, err := frontendVersionDir(active.Version)
@@ -664,11 +684,11 @@ func frontendInstalledCheck() doctorCheck {
 	manifest, valid, err := reverifyInstalledFrontend(active.Version, versionDir)
 	if err != nil {
 		return doctorCheck{Name: "Soroq Flutter frontend", Status: "error", Message: "verification failed: " + err.Error(),
-			Fix: "soroq frontend install " + active.Version + " --force --api https://soroq-control-plane-prod.fly.dev"}
+			Fix: "soroq frontend install " + active.Version + " --force --api " + defaultControlPlaneAPI}
 	}
 	if !valid {
 		return doctorCheck{Name: "Soroq Flutter frontend", Status: "error", Message: "install incomplete",
-			Fix: "soroq frontend install " + active.Version + " --force --api https://soroq-control-plane-prod.fly.dev"}
+			Fix: "soroq frontend install " + active.Version + " --force --api " + defaultControlPlaneAPI}
 	}
 	if !strings.EqualFold(strings.ToLower(strings.TrimSpace(manifest.Archive.SHA256)), strings.ToLower(strings.TrimSpace(active.ArchiveSHA256))) {
 		return doctorCheck{Name: "Soroq Flutter frontend", Status: "error",
@@ -740,8 +760,10 @@ func flutterRevisionOf(binPath string) (string, error) {
 // --- low-level helpers ---
 
 // streamDownloadToFile streams rawURL into dst (following redirects, no size cap), returning the sha256
-// (hex) + byte count. Bytes are never buffered whole in memory.
-func streamDownloadToFile(rawURL string, dst *os.File) (string, int64, error) {
+// (hex) + byte count. Bytes are never buffered whole in memory. An optional progress sink (a
+// *progressReporter, or nil) is added to the MultiWriter so callers can report live download progress to
+// STDERR; it never affects the hash or the returned byte count.
+func streamDownloadToFile(rawURL string, dst *os.File, progress io.Writer) (string, int64, error) {
 	resp, err := http.Get(rawURL)
 	if err != nil {
 		return "", 0, err
@@ -756,7 +778,11 @@ func streamDownloadToFile(rawURL string, dst *os.File) (string, int64, error) {
 		return "", 0, fmt.Errorf("GET %s: %s", rawURL, msg)
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(dst, h), resp.Body)
+	writers := []io.Writer{dst, h}
+	if progress != nil {
+		writers = append(writers, progress)
+	}
+	n, err := io.Copy(io.MultiWriter(writers...), resp.Body)
 	if err != nil {
 		return "", 0, err
 	}

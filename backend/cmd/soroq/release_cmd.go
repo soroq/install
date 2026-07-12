@@ -19,6 +19,10 @@ import (
 	"soroq/backend/internal/domain"
 )
 
+// androidReleaseBuildFn indirects runFlutterAndroidReleaseBuild (defined in project_state.go) so tests
+// can stub the SOROQ build step and exercise the soroq.lock pin-write path without a real Flutter build.
+var androidReleaseBuildFn = runFlutterAndroidReleaseBuild
+
 type releaseAndroidSummary struct {
 	ProjectDir      string                      `json:"project_dir"`
 	Snapshot        *androidrelease.Snapshot    `json:"snapshot"`
@@ -221,10 +225,27 @@ func runReleaseAndroid(args []string) error {
 	if len(flutterBuildArgs) > 0 && (resolvedArtifactPath != "" || !*buildBeforeDiscover) {
 		return errors.New("Flutter build passthrough args require automatic build; omit --artifact and keep --build=true")
 	}
+	// P3: when --toolchain is absent, default it from `soroq setup`'s active.json (the setup->release
+	// link — this is the first reader of active.json). If neither the flag nor active.json provides one,
+	// keep the current behavior (empty -> resolveAndroidEngineSource decides or blocks; don't invent).
+	resolvedToolchainVersion := strings.TrimSpace(*toolchainVersion)
+	resolvedFrontendVersion := ""
+	if resolvedToolchainVersion == "" {
+		if active, activeErr := loadActiveToolchains(); activeErr == nil {
+			if entry, ok := active.Platforms["android"]; ok {
+				resolvedToolchainVersion = strings.TrimSpace(entry.ToolchainVersion)
+				resolvedFrontendVersion = strings.TrimSpace(entry.FrontendVersion)
+			}
+		}
+	}
+	// soroqBuilt is true ONLY when SOROQ ran the build below. On the --artifact bypass (soroq did NOT
+	// build and resolves no toolchain) it stays false, so NO soroq.lock pin is written for that release.
+	soroqBuilt := false
 	if resolvedArtifactPath == "" && *buildBeforeDiscover {
-		if err := runFlutterAndroidReleaseBuild(status.ProjectDir, *buildArtifactType, strings.TrimSpace(*toolchainVersion), flutterBuildArgs); err != nil {
+		if err := androidReleaseBuildFn(status.ProjectDir, *buildArtifactType, resolvedToolchainVersion, flutterBuildArgs); err != nil {
 			return err
 		}
+		soroqBuilt = true
 	}
 	if resolvedArtifactPath == "" {
 		resolvedArtifactPath, err = discoverDefaultAndroidArtifact(status.ProjectDir)
@@ -289,16 +310,9 @@ func runReleaseAndroid(args []string) error {
 		ManifestSigningKeyID: resolvedManifestKeyID,
 	}
 
-	release, err := postJSONDecode[domain.Release](strings.TrimRight(*apiBase, "/")+"/v1/releases", req)
+	release, err := createRelease(*apiBase, req, projectConfig.AppID)
 	if err != nil {
-		if strings.Contains(err.Error(), "unknown app") {
-			return addAppCreateHint(err, projectConfig.AppID)
-		}
-		existing, statusErr := getJSONDecode[domain.Release](strings.TrimRight(*apiBase, "/") + "/v1/releases/" + url.PathEscape(resolvedReleaseID))
-		if statusErr != nil || !releaseMatchesRequest(existing, req) {
-			return addAppCreateHint(err, projectConfig.AppID)
-		}
-		release = existing
+		return err
 	}
 	var releaseArtifact *domain.ReleaseArtifact
 	if *uploadArtifact {
@@ -310,6 +324,20 @@ func runReleaseAndroid(args []string) error {
 	}
 	if err := rememberAndroidRelease(status.ProjectDir, *apiBase, snapshot, release, resolvedManifestKeyID); err != nil {
 		return err
+	}
+	// P3: pin the toolchain that built this release into the committed project-root soroq.lock, but
+	// ONLY when SOROQ ran the build. On the --artifact bypass (soroqBuilt == false) soroq did not
+	// resolve a toolchain, so we write no pin — an honest absent pin lets `soroq patch` fall back.
+	if soroqBuilt {
+		if err := recordSoroqLockPin(status.ProjectDir, "android", soroqLockPin{
+			ReleaseID:        release.ID,
+			Version:          release.Version,
+			ToolchainVersion: resolvedToolchainVersion,
+			FrontendVersion:  resolvedFrontendVersion,
+			RecordedAt:       time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
 	}
 	releaseArtifactPath := projectReleaseArtifactPath(status.ProjectDir, release.ID, snapshot.Artifact.Path)
 
@@ -422,16 +450,9 @@ func runReleaseIOS(args []string) error {
 		ManifestSigningKeyID: strings.TrimSpace(*manifestKeyID),
 	}
 
-	release, err := postJSONDecode[domain.Release](strings.TrimRight(*apiBase, "/")+"/v1/releases", req)
+	release, err := createRelease(*apiBase, req, projectConfig.AppID)
 	if err != nil {
-		if strings.Contains(err.Error(), "unknown app") {
-			return addAppCreateHint(err, projectConfig.AppID)
-		}
-		existing, statusErr := getJSONDecode[domain.Release](strings.TrimRight(*apiBase, "/") + "/v1/releases/" + url.PathEscape(resolvedReleaseID))
-		if statusErr != nil || !releaseMatchesRequest(existing, req) {
-			return addAppCreateHint(err, projectConfig.AppID)
-		}
-		release = existing
+		return err
 	}
 	if err := rememberIOSRelease(status.ProjectDir, *apiBase, release, strings.TrimSpace(*manifestKeyID)); err != nil {
 		return err
@@ -637,6 +658,60 @@ func rememberAndroidRelease(projectDir string, apiBase string, snapshot *android
 		ManifestSigningKeyID: manifestKeyID,
 	}
 	return saveProjectCLIState(projectDir, state)
+}
+
+// createRelease registers a release in the control plane, closing the fresh-user gap where
+// `soroq release` fails because the app was never registered. When the control plane reports
+// the EXISTING "unknown app" sentinel (store file_store.go: `unknown app %q`, surfaced as a 400)
+// AND the operator is logged in, it auto-registers the app on the same create+bind path
+// `soroq app create` uses (ownership is bound server-side from the operator credential), then
+// retries the release create EXACTLY ONCE.
+//
+// Safety (consumes the server's already-correct auth/store semantics, changes none of it):
+//   - A foreign-owned app returns requireOperatorApp 403 errOperatorForbidden, which does NOT
+//     contain "unknown app": it flows to the else branch below and is surfaced verbatim by
+//     addAppCreateHint (no auto-create, no misleading "soroq app create" hint).
+//   - No login creds -> fail with a clear "run soroq login" and DO NOT attempt registration.
+//   - Registration is attempted at most once; on its failure the error is surfaced verbatim with
+//     no retry loop.
+func createRelease(apiBase string, req domain.CreateReleaseRequest, appID string) (domain.Release, error) {
+	apiBaseURL := strings.TrimRight(apiBase, "/")
+	release, err := postJSONDecode[domain.Release](apiBaseURL+"/v1/releases", req)
+	if err == nil {
+		return release, nil
+	}
+
+	// Reuse the EXACT sentinel condition release already keyed on; do NOT broaden the match.
+	if strings.Contains(err.Error(), "unknown app") {
+		creds, credErr := currentOperatorCredentialsForRequest("", apiBaseURL)
+		if credErr != nil {
+			return domain.Release{}, credErr
+		}
+		if strings.TrimSpace(creds.Token) == "" {
+			return domain.Release{}, fmt.Errorf("app %q is not registered and no operator is logged in; run `soroq login` first, then re-run this release to auto-register it", appID)
+		}
+		// Auto-register on the same create+bind path `soroq app create` uses. Ownership is bound
+		// server-side from the operator credential; a foreign-owned id is rejected there, not here.
+		if _, regErr := createSoroqApp(apiBaseURL, domain.CreateAppRequest{ID: appID, DisplayName: appID}); regErr != nil {
+			// Registration failed (e.g. an ownership conflict or unauthenticated): surface it
+			// clearly and do NOT retry-loop or emit the create hint.
+			return domain.Release{}, regErr
+		}
+		// Retry the release create EXACTLY ONCE now that the app is registered.
+		release, err = postJSONDecode[domain.Release](apiBaseURL+"/v1/releases", req)
+		if err != nil {
+			return domain.Release{}, err
+		}
+		return release, nil
+	}
+
+	// Non-"unknown app" failure: preserve the idempotent existing-release fallback. A 403
+	// errOperatorForbidden lands here and is returned verbatim by addAppCreateHint (no hint).
+	existing, statusErr := getJSONDecode[domain.Release](apiBaseURL + "/v1/releases/" + url.PathEscape(req.ID))
+	if statusErr != nil || !releaseMatchesRequest(existing, req) {
+		return domain.Release{}, addAppCreateHint(err, appID)
+	}
+	return existing, nil
 }
 
 func releaseMatchesRequest(release domain.Release, req domain.CreateReleaseRequest) bool {

@@ -26,8 +26,10 @@ import (
 // stored prod credential.
 //
 // Refusal order (all clear errors, no partial trust): manifest fetch -> signature (CLI-pinned key) ->
-// platform/flutter-revision/dart-revision/build-mode -> archive download + archive SHA-256 ->
-// extract -> UNCHANGED verifyEngineBundle. Idempotent re-install = cache hit (re-verified offline).
+// platform/flutter-revision/dart-revision/build-mode -> archive download (streamed) + size + archive
+// SHA-256 -> extract-to-TEMP -> UNCHANGED verifyEngineBundle -> ONLY THEN atomic swap into the cache.
+// A failed install (download/extract/verify) leaves the last-working cached toolchain UNTOUCHED.
+// Idempotent re-install = cache hit (re-verified offline).
 func runToolchainInstall(args []string) error {
 	fs := flag.NewFlagSet("toolchain install", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
@@ -116,47 +118,102 @@ A verified cache entry short-circuits (offline OK); --force re-downloads.`)
 		return fmt.Errorf("REFUSED: %w", err)
 	}
 
-	// 4. Download the archive from the signed manifest URL and VERIFY its SHA-256 (REFUSAL: mismatch).
+	// 4. Stream the archive to a temp file (no in-memory buffer / 512 MiB cap) and VERIFY its SIZE then
+	// SHA-256 against the signed manifest BEFORE extract (REFUSAL: mismatch). The size is checked first
+	// (a cheap length check that also catches a truncated/oversized object-store download; it is signed,
+	// so it is a real trust check), then the single-pass SHA computed while streaming.
 	if strings.TrimSpace(manifest.Archive.URL) == "" {
 		return errors.New("REFUSED: signed manifest has no archive.url to download from")
 	}
-	archiveBytes, err := httpGetBytes(manifest.Archive.URL)
+	root, err := toolchainsRoot()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+
+	// Preflight (STDERR): print size/dest and ABORT before downloading if the target filesystem lacks the
+	// PEAK footprint (temp archive + extracted temp dir). Runs BEFORE any byte is fetched. The toolchain
+	// manifest exposes uncompressed_bytes (toolchain_cmd.go:148), so the check uses the real peak.
+	if err := runInstallPreflight(preflightInfo{
+		label:             "toolchain",
+		version:           version,
+		destDir:           versionDir,
+		checkDir:          root,
+		compressedBytes:   manifest.Archive.CompressedBytes,
+		uncompressedBytes: manifest.Archive.UncompressedBytes,
+		force:             *force,
+	}); err != nil {
+		return err
+	}
+
+	tmpArchive, err := os.CreateTemp(root, ".toolchain-archive-*.tar.gz")
+	if err != nil {
+		return err
+	}
+	tmpArchivePath := tmpArchive.Name()
+	defer os.Remove(tmpArchivePath)
+	// Banner + live progress go to STDERR only (never STDOUT); progress is suppressed under --json or a
+	// non-TTY so the machine-readable report on stdout is never corrupted.
+	live := stderrIsTTY() && !*jsonOut
+	fmt.Fprintf(os.Stderr, "Downloading toolchain archive (%s, %s)…\n", version, humanBytes(manifest.Archive.CompressedBytes))
+	prog := newProgressReporter(manifest.Archive.CompressedBytes, live)
+	gotSHA, gotSize, err := streamDownloadToFile(manifest.Archive.URL, tmpArchive, prog)
+	tmpArchive.Close()
 	if err != nil {
 		return fmt.Errorf("download toolchain archive: %w", err)
 	}
-	// Verify the archive SIZE against the signed manifest BEFORE the SHA (a cheap length check that also
-	// catches a truncated/oversized object-store download; the size is signed, so it is a real trust check).
-	if want := manifest.Archive.CompressedBytes; want > 0 && int64(len(archiveBytes)) != want {
-		return fmt.Errorf("REFUSED: toolchain archive size mismatch: manifest=%d downloaded=%d bytes (from %s)", want, len(archiveBytes), manifest.Archive.URL)
+	prog.finish()
+	if want := manifest.Archive.CompressedBytes; want > 0 && gotSize != want {
+		return fmt.Errorf("REFUSED: toolchain archive size mismatch: manifest=%d downloaded=%d bytes (from %s)", want, gotSize, manifest.Archive.URL)
 	}
-	gotSHA := sha256Hex(archiveBytes)
 	if !strings.EqualFold(gotSHA, strings.TrimSpace(manifest.Archive.SHA256)) {
 		return fmt.Errorf("REFUSED: toolchain archive sha256 mismatch: manifest=%s downloaded=%s", manifest.Archive.SHA256, gotSHA)
 	}
 
-	// 5. Extract atomically into the version dir (write to a temp sibling, then rename). The bundle
-	// subdir is platform-aware (ios | android) so an Android toolchain caches under .../android/.
+	// 5. Extract the archive into a TEMP sibling dir. The swap into versionDir happens ONLY after
+	// verifyEngineBundle passes (verify-BEFORE-swap), so a failed install can NEVER damage the
+	// last-working cached toolchain. The bundle subdir is platform-aware (ios | android).
 	subdir := toolchainBundleSubdir(manifest.Platform)
-	if err := extractToolchainArchive(archiveBytes, versionDir, subdir, manifestBytes, sigHex); err != nil {
+	tmpDir, err := extractToolchainArchive(tmpArchivePath, subdir, manifestBytes, sigHex)
+	if err != nil {
 		return err
 	}
+	swapped := false
+	defer func() {
+		if !swapped {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
 
-	// 6. Run the UNCHANGED (platform-aware) verifyEngineBundle on the extracted bundle (REFUSAL: verify
-	// failure). iOS shells `release ios-engine`; Android shells the side-effect-free `verify-engine-bundle`.
-	bundleDir := filepath.Join(versionDir, subdir)
+	// 6. Run the UNCHANGED (platform-aware) verifyEngineBundle on the extracted TEMP bundle BEFORE the
+	// swap (REFUSAL: verify failure). iOS shells `release ios-engine`; Android shells the side-effect-free
+	// `verify-engine-bundle`. On failure the pre-existing versionDir is left UNTOUCHED (only the temp is
+	// dropped by the defer above).
 	if !*skipBundleVerify {
-		out, err := runUnchangedVerifyEngineBundleForPlatform(manifest.Platform, bundleDir)
+		out, err := runVerifyEngineBundle(manifest.Platform, filepath.Join(tmpDir, subdir))
 		if err != nil {
-			// Leave no partially-trusted cache entry on verify failure.
-			_ = os.RemoveAll(versionDir)
 			return fmt.Errorf("REFUSED: extracted bundle failed the UNCHANGED verifyEngineBundle: %w\n%s", err, out)
 		}
 		result.BundleVerified = true
 	}
 
-	// 7. Android only: materialize the SOROQ engine artifacts into the Flutter `--local-engine` `out/`
-	// layout (+ the Gradle embedding jar). The version-matched STOCK host tooling is overlaid later by
-	// the release/patch build path (completeAndroidLocalEngineLayout). iOS is untouched.
+	// 7. Verify passed: atomically swap the temp dir into versionDir (remove stale, rename). Only now is
+	// the last-working toolchain replaced.
+	if err := os.RemoveAll(versionDir); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpDir, versionDir); err != nil {
+		return err
+	}
+	swapped = true
+
+	// 8. Android only: materialize the SOROQ engine artifacts into the Flutter `--local-engine` `out/`
+	// layout (+ the Gradle embedding jar), post-SWAP against versionDir/subdir. The version-matched STOCK
+	// host tooling is overlaid later by the release/patch build path (completeAndroidLocalEngineLayout).
+	// iOS is untouched.
+	bundleDir := filepath.Join(versionDir, subdir)
 	if strings.EqualFold(strings.TrimSpace(manifest.Platform), "android") {
 		if err := materializeAndroidLocalEngineLayout(bundleDir); err != nil {
 			return fmt.Errorf("materialize android local-engine layout: %w", err)
@@ -284,20 +341,22 @@ func reverifyCachedToolchain(version, versionDir string, skipBundleVerify bool) 
 	return manifest, true, nil
 }
 
-// extractToolchainArchive extracts the tar.gz bytes into versionDir atomically (temp sibling +
-// rename), then writes the verbatim manifest.json + manifest.sig alongside the bundle subdir. Writes
-// ONLY under ~/.soroq/toolchains/<version>/. subdir is the platform bundle subdir ("ios" | "android").
-func extractToolchainArchive(archiveBytes []byte, versionDir, subdir string, manifestBytes []byte, sigHex string) error {
+// extractToolchainArchive streams the tar.gz file into a TEMP sibling dir under ~/.soroq/toolchains/,
+// then writes the verbatim manifest.json + manifest.sig alongside the bundle subdir. It does NOT swap
+// into versionDir — the caller owns the swap AFTER verifyEngineBundle passes (verify-BEFORE-swap), so a
+// failed install never damages the last-working cache. Returns the temp dir path; on success the caller
+// must either rename it into place or RemoveAll it. subdir is the platform bundle subdir ("ios" | "android").
+func extractToolchainArchive(archivePath, subdir string, manifestBytes []byte, sigHex string) (string, error) {
 	root, err := toolchainsRoot()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
-		return err
+		return "", err
 	}
 	tmpDir, err := os.MkdirTemp(root, ".tmp-install-")
 	if err != nil {
-		return err
+		return "", err
 	}
 	cleanup := true
 	defer func() {
@@ -306,30 +365,35 @@ func extractToolchainArchive(archiveBytes []byte, versionDir, subdir string, man
 		}
 	}()
 
-	if err := untarGz(archiveBytes, tmpDir); err != nil {
-		return fmt.Errorf("extract toolchain archive: %w", err)
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if err := untarGz(f, tmpDir); err != nil {
+		return "", fmt.Errorf("extract toolchain archive: %w", err)
 	}
 	if _, err := os.Stat(filepath.Join(tmpDir, subdir, "engine.json")); err != nil {
-		return fmt.Errorf("extracted toolchain archive is missing %s/engine.json: %w", subdir, err)
+		return "", fmt.Errorf("extracted toolchain archive is missing %s/engine.json: %w", subdir, err)
 	}
 	// Persist the verbatim manifest + signature so the cache can be re-verified offline.
 	if err := os.WriteFile(filepath.Join(tmpDir, "manifest.json"), manifestBytes, 0o644); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(tmpDir, "manifest.sig"), []byte(sigHex), 0o644); err != nil {
-		return err
+		return "", err
 	}
 
-	// Atomic-ish swap: remove any stale dir, then rename the fully-built temp into place.
-	if err := os.RemoveAll(versionDir); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpDir, versionDir); err != nil {
-		return err
-	}
+	// The caller now owns tmpDir (verify-BEFORE-swap): it renames it into versionDir only after verify
+	// passes, else RemoveAll's it. Do not remove it here.
 	cleanup = false
-	return nil
+	return tmpDir, nil
 }
+
+// runVerifyEngineBundle routes the post-extract verifyEngineBundle gate. It is a var ONLY so a test can
+// simulate a verify FAILURE to prove the verify-BEFORE-swap invariant; in production it resolves to the
+// UNCHANGED soroqctl-backed gate (runUnchangedVerifyEngineBundleForPlatform), NOT a reimplementation.
+var runVerifyEngineBundle = runUnchangedVerifyEngineBundleForPlatform
 
 // runUnchangedVerifyEngineBundleForPlatform routes the post-extract verify to the right soroqctl entry
 // for the toolchain's platform: iOS keeps the proven `release ios-engine` path; Android uses the
@@ -425,9 +489,12 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// untarGz extracts gzip'd tar bytes into dst. Rejects unsafe (absolute / .. traversal) entries.
-func untarGz(archiveBytes []byte, dst string) error {
-	gz, err := gzip.NewReader(bytes.NewReader(archiveBytes))
+// untarGz extracts a gzip'd tar stream (r) into dst. Rejects unsafe (absolute / .. traversal) entries.
+// Reads from an io.Reader (a streamed temp file) so a large toolchain archive is never held whole in
+// memory. Keeps the toolchain's permissive typeflag handling (any non-dir entry is written as a regular
+// file) rather than switching to the frontend's untarGzReader, which REJECTS non-regular/non-dir entries.
+func untarGz(r io.Reader, dst string) error {
+	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return err
 	}

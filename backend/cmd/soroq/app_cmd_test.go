@@ -184,6 +184,34 @@ func TestRunAppCreateIfNotExistsFetchesExistingApp(t *testing.T) {
 	}
 }
 
+func TestCreateSoroqAppPostsCreateAndBindRequest(t *testing.T) {
+	var captured domain.CreateAppRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/apps" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("Decode() error = %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(domain.App{ID: captured.ID, DisplayName: captured.DisplayName}); err != nil {
+			t.Fatalf("Encode() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	app, err := createSoroqApp(server.URL, domain.CreateAppRequest{ID: "com.example.app", DisplayName: "com.example.app"})
+	if err != nil {
+		t.Fatalf("createSoroqApp() error = %v", err)
+	}
+	if app.ID != "com.example.app" {
+		t.Fatalf("expected created app id, got %q", app.ID)
+	}
+	if captured.ID != "com.example.app" || captured.DisplayName != "com.example.app" {
+		t.Fatalf("expected create request, got %+v", captured)
+	}
+}
+
 func TestRunAppStatusUsesSoroqYamlAppID(t *testing.T) {
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)

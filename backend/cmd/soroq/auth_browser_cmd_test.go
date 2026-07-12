@@ -129,6 +129,24 @@ func TestBrowserLoginCallbackStateMismatchErrors(t *testing.T) {
 	}
 }
 
+func TestBrowserLoginWaitTimeoutIncludesRetryHint(t *testing.T) {
+	cb := &browserLoginCallback{
+		result:  make(chan browserLoginResult, 1),
+		errs:    make(chan error, 1),
+		timeout: 10 * time.Millisecond,
+	}
+	_, err := cb.Wait()
+	if err == nil {
+		t.Fatal("expected a timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected a timeout error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "retry") {
+		t.Fatalf("expected a retry hint in the timeout error, got %v", err)
+	}
+}
+
 func TestBrowserLoginCallbackAccessDeniedErrors(t *testing.T) {
 	cb := newTestLoginCallback()
 	req := httptest.NewRequest(http.MethodGet, "/callback?error=access_denied&state=test-state", nil)

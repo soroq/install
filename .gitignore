@@ -1,6 +1,12 @@
-backend/soroq
-dist/
-*.tar.gz
-*.zip
-checksums.txt
+# Public Soroq CLI — curated .gitignore (emitted by scripts/export-public-cli.sh).
+
+# Per-user local cache; never commit. (soroq.lock IS committable and is intentionally not listed.)
+.soroq/
+
+# Build outputs.
+/backend/soroq
+/backend/soroqctl
+*.test
+
+# OS / editor cruft.
 .DS_Store

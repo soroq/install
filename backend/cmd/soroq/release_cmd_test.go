@@ -599,7 +599,215 @@ func TestRunReleaseAndroidDefaultsMultiABIAPKToArm64(t *testing.T) {
 	}
 }
 
-func TestRunReleaseAndroidSuggestsAppCreateWhenAppUnknown(t *testing.T) {
+// isolateOperatorCredentials points credential resolution at an empty temp config and clears the
+// environment operator tokens so a test never reads the developer's real ~/.soroq/config.json.
+func isolateOperatorCredentials(t *testing.T) {
+	t.Helper()
+	t.Setenv("SOROQ_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("SOROQ_CONTROL_PLANE_OPERATOR_TOKEN", "")
+	t.Setenv("SOROQ_OPERATOR_TOKEN", "")
+	t.Setenv("SOROQ_OPERATOR_EMAIL", "")
+	t.Setenv("SOROQ_API", "")
+}
+
+func echoRelease(w http.ResponseWriter, req domain.CreateReleaseRequest) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(domain.Release{
+		ID:        req.ID,
+		AppID:     req.AppID,
+		RuntimeID: req.RuntimeID,
+		Version:   req.Version,
+		Platform:  req.Platform,
+		Arch:      req.Arch,
+		Channel:   req.Channel,
+	})
+}
+
+func testCreateReleaseRequest() domain.CreateReleaseRequest {
+	return domain.CreateReleaseRequest{
+		ID:        "release-1",
+		AppID:     "com.example.app",
+		RuntimeID: "runtime-1",
+		Version:   "1.2.3+45",
+		Platform:  "android",
+		Arch:      "arm64-v8a",
+		Channel:   "stable",
+	}
+}
+
+// new-reg: the control plane reports the "unknown app" sentinel, the operator is logged in, so
+// createRelease auto-registers the app (create+bind) then retries the release exactly once.
+func TestCreateReleaseAutoRegistersUnknownAppThenRetries(t *testing.T) {
+	isolateOperatorCredentials(t)
+	t.Setenv("SOROQ_CONTROL_PLANE_OPERATOR_TOKEN", "cli-secret")
+	t.Setenv("SOROQ_OPERATOR_EMAIL", "owner@example.com")
+
+	var (
+		releasePosts int
+		appPosts     int
+		appReq       domain.CreateAppRequest
+		appAuth      string
+		appEmail     string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
+			releasePosts++
+			var req domain.CreateReleaseRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("Decode(release) error = %v", err)
+			}
+			if releasePosts == 1 {
+				http.Error(w, `{"error":"unknown app \"com.example.app\""}`, http.StatusBadRequest)
+				return
+			}
+			echoRelease(w, req)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/apps":
+			appPosts++
+			appAuth = r.Header.Get("Authorization")
+			appEmail = r.Header.Get("X-Soroq-Operator-Email")
+			if err := json.NewDecoder(r.Body).Decode(&appReq); err != nil {
+				t.Fatalf("Decode(app) error = %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(domain.App{ID: appReq.ID, DisplayName: appReq.DisplayName, OwnerEmail: "owner@example.com"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	release, err := createRelease(server.URL, testCreateReleaseRequest(), "com.example.app")
+	if err != nil {
+		t.Fatalf("createRelease() error = %v", err)
+	}
+	if release.ID != "release-1" {
+		t.Fatalf("expected retried release, got %+v", release)
+	}
+	if appPosts != 1 {
+		t.Fatalf("expected exactly one app create, got %d", appPosts)
+	}
+	if releasePosts != 2 {
+		t.Fatalf("expected release create then retry (2), got %d", releasePosts)
+	}
+	if appReq.ID != "com.example.app" {
+		t.Fatalf("expected auto-created app id, got %q", appReq.ID)
+	}
+	// Binding to the logged-in operator: the create carries that operator credential, so the
+	// server binds the new app to them (foreign-owned ids are rejected server-side, not hijacked).
+	if appAuth != "Bearer cli-secret" {
+		t.Fatalf("expected operator bearer on app create, got %q", appAuth)
+	}
+	if appEmail != "owner@example.com" {
+		t.Fatalf("expected operator email on app create, got %q", appEmail)
+	}
+}
+
+// existing-reg: the app already exists, so the first release create succeeds and NO app create
+// is attempted (idempotent).
+func TestCreateReleaseExistingAppMakesNoCreateAttempt(t *testing.T) {
+	isolateOperatorCredentials(t)
+
+	var releasePosts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
+			releasePosts++
+			var req domain.CreateReleaseRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("Decode(release) error = %v", err)
+			}
+			echoRelease(w, req)
+		case r.URL.Path == "/v1/apps":
+			t.Fatalf("existing app must not trigger an app create")
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	release, err := createRelease(server.URL, testCreateReleaseRequest(), "com.example.app")
+	if err != nil {
+		t.Fatalf("createRelease() error = %v", err)
+	}
+	if release.ID != "release-1" {
+		t.Fatalf("expected release, got %+v", release)
+	}
+	if releasePosts != 1 {
+		t.Fatalf("expected a single release create, got %d", releasePosts)
+	}
+}
+
+// ownership-conflict: a foreign-owned app returns 403 errOperatorForbidden (NOT the "unknown app"
+// sentinel), so the release FAILS with the forbidden error verbatim, with NO app create attempt
+// and WITHOUT the misleading "soroq app create" hint.
+func TestCreateReleaseForbiddenAppSurfacesErrorWithoutCreateOrHint(t *testing.T) {
+	isolateOperatorCredentials(t)
+	t.Setenv("SOROQ_CONTROL_PLANE_OPERATOR_TOKEN", "cli-secret")
+	t.Setenv("SOROQ_OPERATOR_EMAIL", "stranger@example.com")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps":
+			t.Fatalf("a foreign-owned 403 must not trigger an app create")
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
+			http.Error(w, `{"error":"operator is not allowed for this app: com.example.app"}`, http.StatusForbidden)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/releases/release-1":
+			http.Error(w, `{"error":"operator is not allowed for this app: com.example.app"}`, http.StatusForbidden)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	_, err := createRelease(server.URL, testCreateReleaseRequest(), "com.example.app")
+	if err == nil {
+		t.Fatalf("expected forbidden error")
+	}
+	if !strings.Contains(err.Error(), "operator is not allowed for this app") {
+		t.Fatalf("expected forbidden error verbatim, got %v", err)
+	}
+	if strings.Contains(err.Error(), "soroq app create") {
+		t.Fatalf("forbidden error must not carry the app create hint, got %v", err)
+	}
+}
+
+// unauthenticated: with no login creds, the "unknown app" sentinel must fail with a clear "run
+// soroq login" and MUST NOT attempt registration.
+func TestCreateReleaseUnauthenticatedRequiresLoginWithoutCreate(t *testing.T) {
+	isolateOperatorCredentials(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps":
+			t.Fatalf("an unauthenticated release must not attempt an app create")
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
+			http.Error(w, `{"error":"unknown app \"com.example.app\""}`, http.StatusBadRequest)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	_, err := createRelease(server.URL, testCreateReleaseRequest(), "com.example.app")
+	if err == nil {
+		t.Fatalf("expected unauthenticated error")
+	}
+	if !strings.Contains(err.Error(), "soroq login") {
+		t.Fatalf("expected run soroq login guidance, got %v", err)
+	}
+	if strings.Contains(err.Error(), "soroq app create") {
+		t.Fatalf("unauthenticated error must not carry the app create hint, got %v", err)
+	}
+}
+
+// End-to-end wiring: `soroq release android` against an unknown app auto-registers then registers
+// the release, proving the helper is wired into the CLI path a fresh user hits.
+func TestRunReleaseAndroidAutoRegistersUnknownApp(t *testing.T) {
+	isolateOperatorCredentials(t)
+	t.Setenv("SOROQ_CONTROL_PLANE_OPERATOR_TOKEN", "cli-secret")
+	t.Setenv("SOROQ_OPERATOR_EMAIL", "owner@example.com")
+
 	projectDir := t.TempDir()
 	writeSoroqFlutterPubspec(t, projectDir)
 	writeFile(t, filepath.Join(projectDir, "soroq.yaml"), testSoroqYAML("com.example.app", "stable"))
@@ -610,28 +818,51 @@ func TestRunReleaseAndroidSuggestsAppCreateWhenAppUnknown(t *testing.T) {
 		"lib/arm64-v8a/libapp.so":                         []byte("app"),
 	})
 
+	var releasePosts, appPosts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/releases" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
+			releasePosts++
+			var req domain.CreateReleaseRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("Decode(release) error = %v", err)
+			}
+			if releasePosts == 1 {
+				http.Error(w, `{"error":"unknown app \"com.example.app\""}`, http.StatusBadRequest)
+				return
+			}
+			echoRelease(w, req)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/apps":
+			appPosts++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(domain.App{ID: "com.example.app", DisplayName: "com.example.app", OwnerEmail: "owner@example.com"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
-		http.Error(w, `{"error":"unknown app \"com.example.app\""}`, http.StatusBadRequest)
 	}))
 	defer server.Close()
 
-	err := runReleaseAndroid([]string{
-		"--project-dir", projectDir,
-		"--artifact", artifactPath,
-		"--api", server.URL,
-		"--release-id", "release-1",
+	stdout := captureStdout(t, func() {
+		err := runReleaseAndroid([]string{
+			"--project-dir", projectDir,
+			"--artifact", artifactPath,
+			"--api", server.URL,
+			"--release-id", "release-1",
+			"--upload-artifact=false",
+		})
+		if err != nil {
+			t.Fatalf("runReleaseAndroid() error = %v", err)
+		}
 	})
-	if err == nil {
-		t.Fatalf("expected unknown app error")
+
+	if appPosts != 1 {
+		t.Fatalf("expected exactly one app create, got %d", appPosts)
 	}
-	if !strings.Contains(err.Error(), "soroq app create") {
-		t.Fatalf("expected app create guidance, got %v", err)
+	if releasePosts != 2 {
+		t.Fatalf("expected release create then retry (2), got %d", releasePosts)
 	}
-	if !strings.Contains(err.Error(), "com.example.app") {
-		t.Fatalf("expected app id in guidance, got %v", err)
+	if !strings.Contains(stdout, "Registered Android release release-1") {
+		t.Fatalf("expected registration output, got %q", stdout)
 	}
 }
 

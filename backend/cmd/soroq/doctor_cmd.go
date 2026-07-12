@@ -31,6 +31,9 @@ type doctorReport struct {
 	Warnings   int           `json:"warnings"`
 	Errors     int           `json:"errors"`
 	OK         bool          `json:"ok"`
+	// Fixes lists the offline/idempotent local fixes `--fix` auto-applied this run. Nil (omitted)
+	// when `--fix` is not passed, so the default JSON shape is byte-identical to before.
+	Fixes []string `json:"fixes,omitempty"`
 }
 
 // runDoctor diagnoses the local environment + Flutter project for the iOS dart_eval
@@ -43,13 +46,16 @@ func runDoctor(args []string) error {
 	apiBase := fs.String("api", "", "control plane base URL")
 	configPath := fs.String("config", "", "credential config path")
 	offline := fs.Bool("offline", false, "skip the network control-plane auth verification")
+	fix := fs.Bool("fix", false, "auto-apply the offline/idempotent local fixes (scaffold soroq.yaml / manifest_trust); network/creds/Xcode/pub fixes stay advisory")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq doctor [--project-dir .] [--api https://api.soroq.dev] [--config ~/.soroq/config.json] [--offline] [--json]
+		fmt.Fprintln(os.Stdout, `usage: soroq doctor [--project-dir .] [--api https://api.soroq.dev] [--config ~/.soroq/config.json] [--offline] [--fix] [--json]
 
 Checks the local environment + project for the iOS dart_eval patch-point OTA lane:
 Flutter project + soroq.yaml, soroq_flutter dependency + version, iOS bundle id, Xcode,
 Apple signing team, and control-plane auth. Exits non-zero if any check is an error.
+--fix auto-applies only the offline/idempotent local fixes (scaffold soroq.yaml / manifest_trust);
+everything needing network/creds/download/Xcode/pub stays advisory.
 (Patch-point lane only — not Shorebird parity, not an App-Store-safe guarantee.)`)
 	}
 	if err := fs.Parse(args); err != nil {
@@ -63,44 +69,22 @@ Apple signing team, and control-plane auth. Exits non-zero if any check is an er
 	if err != nil {
 		return err
 	}
-	report := doctorReport{ProjectDir: absDir}
 
-	// Inspect the project once; reuse for both the project checks and the app_id-scoped
-	// release-version check.
-	status, projectErr := inspectProject(absDir)
-	if projectErr != nil {
-		report.Checks = append(report.Checks, doctorCheck{Name: "Project", Status: "error",
-			Message: projectErr.Error(),
-			Fix:     "run from a Flutter app directory, or pass --project-dir <path>"})
-	} else {
-		report.Checks = append(report.Checks, doctorProjectChecks(status)...)
+	report := buildDoctorReport(absDir, *apiBase, *configPath, *offline)
+	if *fix {
+		// Auto-apply ONLY the offline/idempotent local fixes, then re-run every check so the report
+		// reflects the post-fix state. Network/creds/download/Xcode/pub fixes are never auto-run.
+		fixes := applyOfflineDoctorFixes(absDir)
+		report = buildDoctorReport(absDir, *apiBase, *configPath, *offline)
+		report.Fixes = fixes
 	}
-	report.Checks = append(report.Checks, doctorSoroqFlutterVersion(absDir))
-	report.Checks = append(report.Checks, doctorIOSBundleID(absDir))
-	if runtime.GOOS == "darwin" {
-		report.Checks = append(report.Checks, doctorXcode())
-		report.Checks = append(report.Checks, doctorSigningTeam(absDir))
-	} else {
-		report.Checks = append(report.Checks,
-			doctorCheck{Name: "Xcode", Status: "skip", Message: "not on macOS"},
-			doctorCheck{Name: "Apple signing team", Status: "skip", Message: "not on macOS"})
-	}
-	report.Checks = append(report.Checks, doctorControlPlaneAuth(*apiBase, *configPath, *offline))
-	report.Checks = append(report.Checks, doctorReleaseVersion(*apiBase, status.AppID, *offline))
-	report.Checks = append(report.Checks, doctorToolchainStatus())
 
 	okCount := 0
 	for _, c := range report.Checks {
-		switch c.Status {
-		case "warn":
-			report.Warnings++
-		case "error":
-			report.Errors++
-		case "ok":
+		if c.Status == "ok" {
 			okCount++
 		}
 	}
-	report.OK = report.Errors == 0
 
 	if *jsonOut {
 		encoder := json.NewEncoder(os.Stdout)
@@ -126,12 +110,123 @@ Apple signing team, and control-plane auth. Exits non-zero if any check is an er
 		}
 	}
 	fmt.Fprintf(os.Stdout, "\n%d ok, %d warning(s), %d error(s)\n", okCount, report.Warnings, report.Errors)
+	if *fix {
+		if len(report.Fixes) > 0 {
+			fmt.Fprintln(os.Stdout, "\nauto-applied offline fixes:")
+			for _, f := range report.Fixes {
+				fmt.Fprintf(os.Stdout, "  ✓ %s\n", f)
+			}
+		} else {
+			fmt.Fprintln(os.Stdout, "\nno offline auto-fixes were applicable")
+		}
+		var advisory []string
+		for _, c := range report.Checks {
+			if (c.Status == "warn" || c.Status == "error") && c.Fix != "" {
+				advisory = append(advisory, c.Name+": "+c.Fix)
+			}
+		}
+		if len(advisory) > 0 {
+			fmt.Fprintln(os.Stdout, "still advisory (network/creds/download/Xcode/pub — not auto-run):")
+			for _, a := range advisory {
+				fmt.Fprintf(os.Stdout, "  → %s\n", a)
+			}
+		}
+	}
 	if report.Errors > 0 {
 		fmt.Fprintln(os.Stdout, "status: not ready — fix the error(s) above")
 		return errAlreadyPrinted
 	}
 	fmt.Fprintln(os.Stdout, "status: ready")
 	return nil
+}
+
+// buildDoctorReport runs every health check against the project + environment and returns a fully
+// populated report (counts + OK). It performs no writes, so `--fix` can call it before and after
+// applying the offline fixes to show the post-fix state.
+func buildDoctorReport(absDir, apiBase, configPath string, offline bool) doctorReport {
+	report := doctorReport{ProjectDir: absDir}
+
+	// Inspect the project once; reuse for both the project checks and the app_id-scoped
+	// release-version check.
+	status, projectErr := inspectProject(absDir)
+	if projectErr != nil {
+		report.Checks = append(report.Checks, doctorCheck{Name: "Project", Status: "error",
+			Message: projectErr.Error(),
+			Fix:     "run from a Flutter app directory, or pass --project-dir <path>"})
+	} else {
+		report.Checks = append(report.Checks, doctorProjectChecks(status)...)
+	}
+	report.Checks = append(report.Checks, doctorSoroqFlutterVersion(absDir))
+	report.Checks = append(report.Checks, doctorIOSBundleID(absDir))
+	if runtime.GOOS == "darwin" {
+		report.Checks = append(report.Checks, doctorXcode())
+		report.Checks = append(report.Checks, doctorSigningTeam(absDir))
+	} else {
+		report.Checks = append(report.Checks,
+			doctorCheck{Name: "Xcode", Status: "skip", Message: "not on macOS"},
+			doctorCheck{Name: "Apple signing team", Status: "skip", Message: "not on macOS"})
+	}
+	report.Checks = append(report.Checks, doctorControlPlaneAuth(apiBase, configPath, offline))
+	report.Checks = append(report.Checks, doctorReleaseVersion(apiBase, status.AppID, offline))
+	report.Checks = append(report.Checks, doctorToolchainStatus())
+
+	for _, c := range report.Checks {
+		switch c.Status {
+		case "warn":
+			report.Warnings++
+		case "error":
+			report.Errors++
+		}
+	}
+	report.OK = report.Errors == 0
+	return report
+}
+
+// applyOfflineDoctorFixes auto-applies ONLY the offline, idempotent, local project fixes: it
+// scaffolds a missing soroq.yaml (offline, using the same init helpers) and ensures a valid
+// manifest_trust block. It NEVER runs anything requiring network/creds/download/Xcode/pub — those
+// stay advisory. Returns a human-readable list of the fixes it applied (empty on a no-op re-run).
+func applyOfflineDoctorFixes(projectDir string) []string {
+	var applied []string
+
+	status, err := inspectProject(projectDir)
+	if err != nil || !status.HasPubspec {
+		// No readable Flutter project: nothing safe to scaffold. Stays advisory.
+		return applied
+	}
+
+	if !status.HasSoroqConfig {
+		appID, ok := inferOfflineAppID(status.ProjectDir)
+		if !ok {
+			// Cannot infer an app id offline; do not fabricate one — leave it advisory.
+			return applied
+		}
+		// Mirror `soroq init`'s offline path: render soroq.yaml with a local (no hosted keys)
+		// runtime_id_strategy, then let ensureManifestTrust scaffold the app-owned key block below.
+		content := renderSoroqConfig(appID, "stable", hostedManifestTrustResponse{RuntimeIDStrategy: "manifest_trust_v1"})
+		if writeErr := os.WriteFile(status.SoroqConfigPath, []byte(content), 0o644); writeErr != nil {
+			return applied
+		}
+		applied = append(applied, fmt.Sprintf("scaffolded soroq.yaml offline (app_id=%s, channel=stable)", appID))
+	}
+
+	before, _ := inspectProject(projectDir)
+	if _, err := ensureManifestTrust(projectDir); err == nil && !before.HasManifestTrust {
+		applied = append(applied, "scaffolded manifest_trust block in soroq.yaml")
+	}
+	return applied
+}
+
+// inferOfflineAppID infers a Soroq app id from the Android applicationId, then the iOS bundle id,
+// without any network call (mirrors `soroq init`'s inference). It never fabricates a random id.
+func inferOfflineAppID(projectDir string) (string, bool) {
+	if id, err := inferAndroidApplicationID(projectDir); err == nil && looksLikeSoroqAppID(id) {
+		return id, true
+	}
+	if id, err := inferIOSBundleIdentifier(projectDir); err == nil && looksLikeSoroqAppID(id) {
+		return id, true
+	}
+	return "", false
 }
 
 func doctorIcon(status string) string {
@@ -316,7 +411,7 @@ func doctorControlPlaneAuth(apiBase, configPath string, offline bool) doctorChec
 	}
 	if strings.TrimSpace(creds.Token) == "" {
 		return doctorCheck{Name: "Control-plane auth", Status: "warn", Message: "not logged in",
-			Fix: "run: soroq login   (or set SOROQ_CONTROL_PLANE_OPERATOR_TOKEN)"}
+			Fix: "run: soroq login"}
 	}
 	if offline {
 		return doctorCheck{Name: "Control-plane auth", Status: "ok",

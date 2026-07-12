@@ -99,7 +99,7 @@ func runLogin(args []string) error {
 	callbackTimeout := fs.Duration("callback-timeout", 3*time.Minute, "browser login callback timeout")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq login [--hosted-surface https://soroq.dev] [--config ~/.soroq/config.json] [--json]
+		fmt.Fprintln(os.Stdout, `usage: soroq login [--hosted-surface https://soroq.dev] [--callback-timeout 3m] [--no-open] [--config ~/.soroq/config.json] [--json]
        soroq login --email operator@example.com (--token <token> | --token-file ./token.txt | --token-stdin) [--api https://api.soroq.dev] [--config ~/.soroq/config.json] [--skip-verify] [--json]`)
 	}
 	if err := fs.Parse(args); err != nil {

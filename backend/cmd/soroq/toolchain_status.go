@@ -218,7 +218,7 @@ func toolchainSoroqFlutterFrontendCheck() doctorCheck {
 			Name:    "Soroq Flutter frontend",
 			Status:  "error",
 			Message: "not found — the Soroq Flutter fork provides the canonical asset bundler (soroq_metadata.json / runtime_id)",
-			Fix:     "soroq frontend install <version> --api https://soroq-control-plane-prod.fly.dev (or set SOROQ_FLUTTER_BIN to a Soroq Flutter fork's bin/flutter)",
+			Fix:     "soroq frontend install <version> --api " + defaultControlPlaneAPI,
 		}
 	}
 	return doctorCheck{Name: "Soroq Flutter frontend", Status: "ok", Message: bin}
