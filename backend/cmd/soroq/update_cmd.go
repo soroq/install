@@ -1,37 +1,45 @@
 package main
 
-// update_cmd.go — `soroq update`.
+// update_cmd.go — `soroq update` (production-safe self-updater) + `soroq update
+// --check`.
 //
-// Deliberately NOT a self-updater. Soroq CLI binaries are distributed as signed
-// release archives installed by the canonical installer (soroq/install's
-// install.sh). This command therefore does NOT download or replace any binary in
-// place; it reports the running version and points the developer at the one
-// canonical, checksum-verifying install command. There is no releases API in the
-// Go tree to query, so the latest-version check is intentionally a no-op here and
-// the installer (which resolves "latest") is the source of truth.
+// This REPLACES the P4 installer-pointer stub with a real, safety-first self
+// updater. It resolves the latest STABLE public release of soroq/install via the
+// public GitHub releases API (NO auth), downloads the exact archive for this
+// OS/arch plus checksums.txt, verifies the archive SHA-256 BEFORE extraction,
+// confirms the archive carries BOTH `soroq` and `soroqctl`, and replaces the two
+// installed binaries TRANSACTIONALLY (both-or-neither) in the directory holding the
+// currently-running soroq. Any failure at any step restores the previous binaries,
+// so the existing installation always stays usable. See selfupdate.go for the
+// engine. `--check` reports whether a newer stable release exists and makes ZERO
+// filesystem changes.
 
 import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
+	"time"
 )
-
-// canonicalInstallCommand is the exact one-liner published by the soroq/install
-// README (verified against raw.githubusercontent.com/soroq/install/main). It
-// verifies the download checksum and installs to ~/.soroq/bin by default.
-const canonicalInstallCommand = "curl --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/soroq/install/main/install.sh -sSf | bash"
 
 func runUpdate(args []string) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
-	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	checkOnly := fs.Bool("check", false, "check for a newer stable release without installing (no filesystem changes)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq update [--json]
+		fmt.Fprintln(os.Stdout, `usage: soroq update [--check]
 
-Reports the running soroq CLI version and the canonical install command. soroq
-does NOT self-replace its binary; re-run the installer below to upgrade (it
-downloads, checksum-verifies, and installs the latest signed release).`)
+Updates the installed soroq and soroqctl binaries to the latest stable release.
+
+soroq update downloads the release archive for this OS/arch from the public
+soroq/install releases (no GitHub auth), verifies its SHA-256 checksum BEFORE
+extracting, and replaces both binaries atomically (both-or-neither). If anything
+fails, the previous binaries are restored and the install stays usable.
+
+  --check   report whether a newer stable release exists; makes NO changes`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -40,17 +48,27 @@ downloads, checksum-verifies, and installs the latest signed release).`)
 		return err
 	}
 
-	if *jsonOut {
-		return writeJSON(os.Stdout, map[string]any{
-			"current_version": buildVersion,
-			"self_update":     false,
-			"install_command": canonicalInstallCommand,
-		})
+	// Resolve the install dir = the directory holding the CURRENTLY-RUNNING soroq
+	// binary (typically ~/.soroq/bin). We deliberately do NOT fall back to any
+	// other directory: replacing the wrong binary would silently corrupt PATH.
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot locate the running soroq binary: %w", err)
+	}
+	if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
+		exe = resolved
 	}
 
-	fmt.Fprintf(os.Stdout, "soroq %s\n", buildVersion)
-	fmt.Fprintln(os.Stdout, "soroq does not self-update its binary.")
-	fmt.Fprintln(os.Stdout, "To install or upgrade to the latest signed release, run:")
-	fmt.Fprintf(os.Stdout, "  %s\n", canonicalInstallCommand)
-	return nil
+	cfg := selfUpdateConfig{
+		apiBase:        githubAPIBase,
+		installRepo:    "soroq/install",
+		installDir:     filepath.Dir(exe),
+		goos:           runtime.GOOS,
+		goarch:         runtime.GOARCH,
+		currentVersion: buildVersion,
+		checkOnly:      *checkOnly,
+		stdout:         os.Stdout,
+		httpClient:     &http.Client{Timeout: 120 * time.Second},
+	}
+	return performSelfUpdate(cfg)
 }

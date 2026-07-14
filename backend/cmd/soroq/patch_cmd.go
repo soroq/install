@@ -698,6 +698,28 @@ func runPatchAndroid(args []string) error {
 		return err
 	}
 	if requestedPatchKind == domain.PatchKindExperimentalNativeAOT || (requestedPatchKind == "" && codePlan.Ready) {
+		// Fail-closed guard (Fix C): in AUTO mode the code lane is chosen because only libapp.so
+		// changed at the native level — but a native-AOT code patch ships ONLY libapp.so, never
+		// flutter_assets. If the candidate also changed a font / FontManifest / image / manifest that
+		// the code patch cannot deliver, the OTA'd app would render against the base's stale asset.
+		// Refuse to emit a silently-broken code-only patch and tell the caller exactly which assets
+		// drifted and what to do. (Fix A ships the full icon font in the base, so an icon-only change
+		// does not alter the font and therefore does not trip this guard.) Scoped to auto-mode: an
+		// explicit --kind experimental_native_aot is the caller deliberately choosing the code lane.
+		if requestedPatchKind == "" {
+			drift, err := androidpatch.DetectCodePatchAssetDrift(resolvedBaseArtifactPath, resolvedCandidateArtifactPath)
+			if err != nil {
+				return fmt.Errorf("check flutter asset drift before emitting native-AOT code patch: %w", err)
+			}
+			if drift.HasDrift() {
+				return fmt.Errorf(
+					"android auto-patch selected the native-AOT code lane, but the candidate changed flutter asset(s) that a code-only patch cannot deliver: %s. "+
+						"A native-AOT code patch ships only libapp.so, so these asset changes would NOT reach the device and the app would render incorrectly. "+
+						"These changed assets require a new base release that includes them (a combined code+asset patch lane is not yet available)",
+					strings.Join(drift.Paths(), ", "),
+				)
+			}
+		}
 		return publishAndroidCodePatch(publishAndroidCodePatchOptions{
 			ProjectDir:            status.ProjectDir,
 			APIBase:               resolvedAPIBase,

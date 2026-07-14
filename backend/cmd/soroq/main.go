@@ -126,6 +126,6 @@ commands:
   status    inspect whether a Flutter app looks Soroq-ready
   toolchain publish, install, list, or diagnose hosted build-time engine toolchains
   uninstall remove ~/.soroq and the installed soroq + soroqctl binaries (requires --yes)
-  update    print the running CLI version and the canonical install command
+  update    download, verify, and install the latest stable Soroq CLI (--check to check only)
   whoami    verify the current hosted control-plane operator`)
 }

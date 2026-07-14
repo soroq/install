@@ -208,6 +208,63 @@ func BuildAssetPatchBundle(
 	return report, bundleBytes, nil
 }
 
+// FlutterAssetDrift describes flutter_asset changes between a base and candidate Android artifact
+// that a native-AOT code-only patch (libapp.so bsdiff) would NOT deliver. It excludes the
+// deterministic Soroq metadata asset and kernel_blob.bin, which legitimately track code changes and
+// are not shipped as standalone assets by the code lane.
+type FlutterAssetDrift struct {
+	Changed []AssetDiffEntry
+	Removed []string
+}
+
+// HasDrift reports whether any non-.so flutter_asset changed between base and candidate.
+func (d FlutterAssetDrift) HasDrift() bool {
+	return len(d.Changed) > 0 || len(d.Removed) > 0
+}
+
+// Paths returns a sorted, human-readable list of the drifted asset paths (with change kind) for
+// use in an actionable error message.
+func (d FlutterAssetDrift) Paths() []string {
+	paths := make([]string, 0, len(d.Changed)+len(d.Removed))
+	for _, entry := range d.Changed {
+		paths = append(paths, entry.Path+" ("+entry.Change+")")
+	}
+	for _, path := range d.Removed {
+		paths = append(paths, path+" (removed)")
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// DetectCodePatchAssetDrift compares the flutter_assets of the base and candidate Android artifacts
+// and reports any font / FontManifest / image / AssetManifest / package asset change that a code-only
+// (experimental_native_aot) patch cannot carry. It is the fail-closed guard used before emitting a
+// code-only patch: the code lane ships only libapp.so, so any change reported here would be silently
+// dropped and the OTA'd app would render against the base's stale asset. The deterministic Soroq
+// metadata asset and kernel_blob.bin are ignored (they are not standalone deliverables of the code
+// lane), so a pure Dart-logic change does not false-trip this guard.
+func DetectCodePatchAssetDrift(baseArtifactPath, candidateArtifactPath string) (FlutterAssetDrift, error) {
+	base, err := readFlutterAssetEntriesFromArtifact(baseArtifactPath)
+	if err != nil {
+		return FlutterAssetDrift{}, err
+	}
+	candidate, err := readFlutterAssetEntriesFromArtifact(candidateArtifactPath)
+	if err != nil {
+		return FlutterAssetDrift{}, err
+	}
+	diff := ignoreKernelBlobUnsupportedChange(diffAndroidFlutterAssets(base, candidate))
+
+	drift := FlutterAssetDrift{}
+	drift.Changed = append(drift.Changed, diff.overlayEntries...)
+	drift.Changed = append(drift.Changed, diff.unsupportedChanges...)
+	drift.Removed = append(drift.Removed, diff.removedOverlayEntries...)
+	sort.Slice(drift.Changed, func(i, j int) bool {
+		return drift.Changed[i].Path < drift.Changed[j].Path
+	})
+	sort.Strings(drift.Removed)
+	return drift, nil
+}
+
 func readFlutterAssetEntriesFromArtifact(artifactPath string) (map[string]artifactFile, error) {
 	reader, err := zip.OpenReader(filepath.Clean(artifactPath))
 	if err != nil {

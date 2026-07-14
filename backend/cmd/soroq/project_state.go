@@ -442,6 +442,20 @@ func isNoisyFlutterBuildLine(line string) bool {
 
 func soroqAndroidBuildHelperExtraArgs(extraArgs []string) []string {
 	effectiveArgs := append([]string{}, extraArgs...)
+	// Patchable-correctness (Fix A): force the FULL MaterialIcons font into every Soroq Android
+	// release build unless the user explicitly chose a tree-shake policy. Soroq Android release
+	// builds feed `soroq release`/`patch`, and the native-AOT code-patch lane ships only libapp.so
+	// (never flutter_assets/fonts + FontManifest.json). If the base APK tree-shook the icon font, a
+	// later patch that introduces a new icon references a glyph the shipped subset lacks, so the icon
+	// renders blank/wrong on the OTA'd device. Shipping the full font (+~0.6-1.6MB) guarantees any
+	// glyph a future patch introduces is already present in the base. Dedup: respect an explicit
+	// --tree-shake-icons / --no-tree-shake-icons the caller already passed. This single choke point is
+	// shared by the direct-flutter build path (soroqAndroidBuildExtraArgsForSource) and the custom
+	// build-script path (which receives these args via the FLUTTER_EXTRA_ARGS env it forwards to
+	// `flutter build`), so the flag is applied on both.
+	if !hasFlutterFlag(effectiveArgs, "--no-tree-shake-icons") && !hasFlutterFlag(effectiveArgs, "--tree-shake-icons") {
+		effectiveArgs = append(effectiveArgs, "--no-tree-shake-icons")
+	}
 	for _, arg := range effectiveArgs {
 		if arg == "--target-platform" || strings.HasPrefix(arg, "--target-platform=") {
 			return effectiveArgs

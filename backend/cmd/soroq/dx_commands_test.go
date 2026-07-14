@@ -230,46 +230,7 @@ func TestCacheClean_SoroqLockPinPreserved(t *testing.T) {
 	}
 }
 
-// --- update ---
-
-func TestUpdate_PrintsVersionAndInstallerNoBinary(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	buildVersion = "test-1.2.3"
-
-	out := captureCmdStdout(t, func() {
-		if err := runUpdate([]string{}); err != nil {
-			t.Fatalf("update: %v", err)
-		}
-	})
-	if !strings.Contains(out, "test-1.2.3") {
-		t.Fatalf("update did not print version:\n%s", out)
-	}
-	if !strings.Contains(out, "install.sh") {
-		t.Fatalf("update did not print the installer pointer:\n%s", out)
-	}
-	// No binary self-replacement: ~/.soroq/bin must not have been created.
-	if _, err := os.Stat(filepath.Join(home, ".soroq", "bin")); !os.IsNotExist(err) {
-		t.Fatalf("update created a binary dir (err=%v) — must not self-replace", err)
-	}
-
-	jsonOut := captureCmdStdout(t, func() {
-		if err := runUpdate([]string{"--json"}); err != nil {
-			t.Fatalf("update --json: %v", err)
-		}
-	})
-	var parsed struct {
-		CurrentVersion string `json:"current_version"`
-		SelfUpdate     bool   `json:"self_update"`
-		InstallCommand string `json:"install_command"`
-	}
-	if err := json.Unmarshal([]byte(jsonOut), &parsed); err != nil {
-		t.Fatalf("parse json %q: %v", jsonOut, err)
-	}
-	if parsed.CurrentVersion != "test-1.2.3" || parsed.SelfUpdate || !strings.Contains(parsed.InstallCommand, "install.sh") {
-		t.Fatalf("update --json wrong: %+v", parsed)
-	}
-}
+// update tests moved to update_cmd_test.go (P4 stub → production-safe self-updater).
 
 // --- uninstall ---
 
