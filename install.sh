@@ -233,9 +233,13 @@ persist_path() {
 }
 
 # Preference-ordered list of "global" bin directories to expose the CLI from.
-# The first WRITABLE one wins. Rationale per entry:
-#   /usr/local/bin   - on the system default PATH (/etc/paths) so it reaches even
-#                      non-interactive/bare-sh shells; usually needs sudo to write.
+# Selection (see install_global_symlinks) prefers a candidate that is BOTH writable
+# AND already on the CURRENT shell's PATH, then falls back to any writable one.
+# Rationale per entry:
+#   /usr/local/bin   - on the macOS default PATH (/etc/paths), so it works in
+#                      ordinary shells whose inherited/default PATH includes it;
+#                      usually needs sudo to write. (No installer can reach a
+#                      deliberately restricted PATH like PATH=/usr/bin:/bin.)
 #   /opt/homebrew/bin - Apple Silicon Homebrew prefix: writable + on the
 #                      interactive PATH (fixes the current terminal immediately).
 #   $HOME/.local/bin - per-user fallback; created if missing; on many PATHs.
@@ -285,7 +289,10 @@ link_into_global_dir() {
 
   # Pre-flight: bail before creating ANY link if a foreign file would be clobbered,
   # so we never leave a partial (soroq linked, soroqctl blocked) state behind.
-  for name in $(global_link_names); do
+  # Read names line-by-line (IFS= read -r) so a path/name with spaces is safe.
+  names="$(global_link_names)"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
     target="$dir/$name"
     if [ -e "$target" ] || [ -L "$target" ]; then
       if ! is_our_symlink "$target"; then
@@ -293,39 +300,65 @@ link_into_global_dir() {
         return 1
       fi
     fi
-  done
+  done <<EOF
+$names
+EOF
 
-  for name in $(global_link_names); do
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
     ln -sf "$INSTALL_DIR/$name" "$dir/$name" || return 1
-  done
+  done <<EOF
+$names
+EOF
   return 0
 }
 
-# Expose the CLI globally by symlinking into the first writable candidate dir so
-# `soroq` resolves immediately (current shell + others) instead of only after a
-# profile re-source. Never uses sudo; never clobbers a non-Soroq file (skips the
-# dir and tries the next, recording why). Sets GLOBAL_LINK_DIR on success and
-# accumulates GLOBAL_LINK_SKIPPED for the post-install message.
+# Expose the CLI globally by symlinking into a candidate dir so `soroq` resolves
+# immediately (current shell + others) instead of only after a profile re-source.
+# Two passes so a candidate already on the CURRENT PATH wins even if an earlier-
+# ranked one is only writable: pass 1 = writable AND on $PATH (usable right now);
+# pass 2 = any writable (works in ordinary new shells whose default PATH includes
+# it). Never uses sudo; never clobbers a non-Soroq file (skips the dir + records
+# why). Sets GLOBAL_LINK_DIR on success and accumulates GLOBAL_LINK_SKIPPED.
+# Candidates are read line-by-line (IFS= read -r) so paths with spaces are safe.
 GLOBAL_LINK_DIR=""
 GLOBAL_LINK_SKIPPED=""
+dir_on_path() {
+  case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac
+}
 install_global_symlinks() {
   GLOBAL_LINK_DIR=""
   GLOBAL_LINK_SKIPPED=""
-  for dir in $(global_bin_candidates); do
-    if [ ! -d "$dir" ]; then
-      # Only create the per-user fallback; never mkdir a system dir (needs sudo /
-      # would be surprising). Skip missing system dirs.
-      case "$dir" in
-        "$HOME"/*) mkdir -p "$dir" 2>/dev/null || continue ;;
-        *) continue ;;
+  candidates="$(global_bin_candidates)"
+  for pass in on_path any; do
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      if [ ! -d "$dir" ]; then
+        # Only create the per-user fallback; never mkdir a system dir (needs sudo /
+        # would be surprising). Skip missing system dirs.
+        case "$dir" in
+          "$HOME"/*) mkdir -p "$dir" 2>/dev/null || continue ;;
+          *) continue ;;
+        esac
+      fi
+      [ -w "$dir" ] || continue
+      # Pass 1 only considers dirs already on the live PATH (immediately usable).
+      if [ "$pass" = "on_path" ] && ! dir_on_path "$dir"; then
+        continue
+      fi
+      if link_into_global_dir "$dir"; then
+        GLOBAL_LINK_DIR="$dir"
+        return 0
+      fi
+      # Record a foreign-file skip once (a dir rejected in pass 1 is re-seen in
+      # pass 2; only add it if we haven't noted it already).
+      case ";$GLOBAL_LINK_SKIPPED;" in
+        *";$dir ($SKIP_REASON);"*) : ;;
+        *) GLOBAL_LINK_SKIPPED="${GLOBAL_LINK_SKIPPED}${GLOBAL_LINK_SKIPPED:+; }$dir ($SKIP_REASON)" ;;
       esac
-    fi
-    [ -w "$dir" ] || continue
-    if link_into_global_dir "$dir"; then
-      GLOBAL_LINK_DIR="$dir"
-      return 0
-    fi
-    GLOBAL_LINK_SKIPPED="${GLOBAL_LINK_SKIPPED}${GLOBAL_LINK_SKIPPED:+; }$dir ($SKIP_REASON)"
+    done <<EOF
+$candidates
+EOF
   done
   return 1
 }
@@ -501,12 +534,14 @@ else
   say "  ${BOLD}exec \$SHELL${RESET}"
 fi
 
-# System-wide (incl. non-interactive/bare-sh shells) needs /usr/local/bin, which
-# is on /etc/paths but usually requires sudo. Offer it as OPTIONAL guidance only;
-# never run sudo ourselves. Skip if we already landed there.
+# /usr/local/bin is on the macOS default PATH (/etc/paths), so linking there makes
+# soroq resolve in ordinary shells whose inherited/default PATH includes it (it
+# cannot reach a deliberately restricted PATH like /usr/bin:/bin). Writing it
+# usually needs sudo, so offer it as OPTIONAL guidance only; never run sudo
+# ourselves. Skip if we already landed there.
 if [ "$GLOBAL_LINK_DIR" != "/usr/local/bin" ]; then
   say ""
-  say "${DIM}Optional — expose soroq system-wide (all shells) with sudo:${RESET}"
+  say "${DIM}Optional — link into /usr/local/bin (on the default PATH of ordinary shells) with sudo:${RESET}"
   say "  sudo ln -sf \"$INSTALL_DIR/soroq\" /usr/local/bin/soroq && sudo ln -sf \"$INSTALL_DIR/soroqctl\" /usr/local/bin/soroqctl"
 fi
 
