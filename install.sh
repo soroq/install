@@ -7,6 +7,11 @@ INSTALL_DIR="${SOROQ_INSTALL_DIR:-$HOME/.soroq/bin}"
 BINARY_NAME="soroq"
 GITHUB_TOKEN_VALUE="${SOROQ_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 
+# Managed-block markers for the idempotent PATH entry the installer appends to the
+# active shell profile. Do not change these once shipped — re-runs match on them.
+SOROQ_PATH_BLOCK_BEGIN="# >>> soroq PATH >>>"
+SOROQ_PATH_BLOCK_END="# <<< soroq PATH <<<"
+
 if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
   BOLD="$(printf '\033[1m')"
   DIM="$(printf '\033[2m')"
@@ -133,6 +138,106 @@ profile_hint() {
   esac
 }
 
+# Profile file to auto-manage for the active shell. Only zsh and bash are
+# configured automatically (the two supported interactive shells); anything else
+# (fish, unknown) returns empty so the caller prints a manual hint instead.
+# bash reads a different login file per OS: macOS Terminal starts a login shell
+# (~/.bash_profile), Linux terminals start interactive non-login shells (~/.bashrc).
+target_profile() {
+  shell_name="$(basename "${SHELL:-sh}")"
+  case "$shell_name" in
+    zsh) echo "$HOME/.zshrc" ;;
+    bash)
+      if [ "${os:-}" = "darwin" ]; then
+        echo "$HOME/.bash_profile"
+      else
+        echo "$HOME/.bashrc"
+      fi
+      ;;
+    *) echo "" ;;
+  esac
+}
+
+# The PATH value to write. Keep it $HOME-relative when INSTALL_DIR is under $HOME
+# so the profile line is portable (matches the documented export in the README).
+managed_path_spec() {
+  case "$INSTALL_DIR" in
+    "$HOME") printf '$HOME' ;;
+    "$HOME"/*) printf '$HOME%s' "${INSTALL_DIR#"$HOME"}" ;;
+    *) printf '%s' "$INSTALL_DIR" ;;
+  esac
+}
+
+# Emit the profile's contents with any existing managed block removed (inclusive
+# of the marker lines). Used to replace a stale block instead of appending a new one.
+strip_managed_block() {
+  awk -v b="$SOROQ_PATH_BLOCK_BEGIN" -v e="$SOROQ_PATH_BLOCK_END" '
+    $0 == b { inblock = 1; next }
+    $0 == e { inblock = 0; next }
+    !inblock { print }
+  ' "$1"
+}
+
+# Idempotently ensure the profile contains exactly one managed PATH block.
+# Sets CONFIG_STATUS to "already" | "updated" | "added". Non-destructive: existing
+# content is preserved and the block is appended (the profile is created if absent).
+CONFIG_STATUS=""
+configure_path() {
+  profile="$1"
+  path_spec="$2"
+  line="export PATH=\"$path_spec:\$PATH\""
+
+  if [ ! -e "$profile" ]; then
+    if ! : > "$profile" 2>/dev/null; then
+      return 1
+    fi
+  fi
+  [ -w "$profile" ] || return 1
+
+  if grep -qF "$SOROQ_PATH_BLOCK_BEGIN" "$profile" 2>/dev/null; then
+    if grep -qF "$line" "$profile" 2>/dev/null; then
+      CONFIG_STATUS="already"
+      return 0
+    fi
+    # Stale managed block (e.g. install dir changed): replace it, keeping one block.
+    stripped="$(mktemp 2>/dev/null || mktemp -t soroq-profile)" || return 1
+    if ! strip_managed_block "$profile" > "$stripped"; then
+      rm -f "$stripped"
+      return 1
+    fi
+    cat "$stripped" > "$profile"
+    rm -f "$stripped"
+    CONFIG_STATUS="updated"
+  else
+    CONFIG_STATUS="added"
+  fi
+
+  {
+    printf '\n%s\n' "$SOROQ_PATH_BLOCK_BEGIN"
+    printf '%s\n' "# Added by the Soroq CLI installer. Managed block; safe to remove as one unit."
+    printf '%s\n' "$line"
+    printf '%s\n' "$SOROQ_PATH_BLOCK_END"
+  } >> "$profile"
+}
+
+# Persist PATH for the active shell. Returns non-zero (so the caller falls back to
+# a manual hint) for unsupported shells, install dirs outside $HOME, or write errors.
+persist_path() {
+  profile="$(target_profile)"
+  [ -n "$profile" ] || return 2
+  case "$INSTALL_DIR" in
+    "$HOME" | "$HOME"/*) : ;;
+    *) return 2 ;;
+  esac
+  configure_path "$profile" "$(managed_path_spec)"
+}
+
+# Allow the helper functions above to be sourced (for tests) without running the
+# installer: `SOROQ_INSTALL_LIB_ONLY=1 . ./install.sh`.
+if [ "${SOROQ_INSTALL_LIB_ONLY:-}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 banner
 
 need_cmd tar
@@ -234,22 +339,40 @@ success "Soroq CLI is ready"
 say ""
 say "${BOLD}${GREEN}Installation complete.${RESET}"
 
+step "Configuring PATH"
+if persist_path; then
+  updated_profile="$(target_profile)"
+  case "$CONFIG_STATUS" in
+    already)
+      success "PATH already configured in ${BOLD}${updated_profile}${RESET}"
+      ;;
+    *)
+      success "Added ${BOLD}${INSTALL_DIR}${RESET} to your PATH in ${BOLD}${updated_profile}${RESET}"
+      say ""
+      say "Restart your terminal, or run this to use ${BOLD}soroq${RESET} in the current session:"
+      say "  ${BOLD}source ${updated_profile}${RESET}"
+      ;;
+  esac
+else
+  # Unsupported shell (e.g. fish), a non-$HOME install dir, or a non-writable
+  # profile: don't touch any file — print manual instructions instead.
+  warn "Could not configure PATH automatically for this shell/install dir."
+  say "Add this to $(profile_hint):"
+  say ""
+  if [ "$(basename "${SHELL:-sh}")" = "fish" ]; then
+    say "  fish_add_path $INSTALL_DIR"
+  else
+    say "  export PATH=\"$INSTALL_DIR:\$PATH\""
+  fi
+  say ""
+  say "For this terminal session, you can run:"
+  say "  export PATH=\"$INSTALL_DIR:\$PATH\""
+fi
+
 case ":$PATH:" in
   *":$INSTALL_DIR:"*)
+    say ""
     say "Run ${BOLD}soroq --help${RESET} to get started."
-    ;;
-  *)
-    warn "$INSTALL_DIR is not currently on PATH."
-    say "Add this to $(profile_hint):"
-    say ""
-    if [ "$(basename "${SHELL:-sh}")" = "fish" ]; then
-      say "  fish_add_path $INSTALL_DIR"
-    else
-      say "  export PATH=\"$INSTALL_DIR:\$PATH\""
-    fi
-    say ""
-    say "For this terminal session, you can run:"
-    say "  export PATH=\"$INSTALL_DIR:\$PATH\""
     ;;
 esac
 
