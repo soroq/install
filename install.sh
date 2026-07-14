@@ -232,6 +232,137 @@ persist_path() {
   configure_path "$profile" "$(managed_path_spec)"
 }
 
+# Preference-ordered list of "global" bin directories to expose the CLI from.
+# Selection (see install_global_symlinks) prefers a candidate that is BOTH writable
+# AND already on the CURRENT shell's PATH, then falls back to any writable one.
+# Rationale per entry:
+#   /usr/local/bin   - on the macOS default PATH (/etc/paths), so it works in
+#                      ordinary shells whose inherited/default PATH includes it;
+#                      usually needs sudo to write. (No installer can reach a
+#                      deliberately restricted PATH like PATH=/usr/bin:/bin.)
+#   /opt/homebrew/bin - Apple Silicon Homebrew prefix: writable + on the
+#                      interactive PATH (fixes the current terminal immediately).
+#   $HOME/.local/bin - per-user fallback; created if missing; on many PATHs.
+# Test-only seam: SOROQ_GLOBAL_BIN_DIRS (a ':'-separated list) overrides the list
+# so tests can point exclusively at temp dirs (same spirit as SOROQ_INSTALL_LIB_ONLY).
+global_bin_candidates() {
+  if [ -n "${SOROQ_GLOBAL_BIN_DIRS:-}" ]; then
+    printf '%s\n' "$SOROQ_GLOBAL_BIN_DIRS" | tr ':' '\n'
+    return 0
+  fi
+  printf '%s\n' \
+    "/usr/local/bin" \
+    "/opt/homebrew/bin" \
+    "$HOME/.local/bin"
+}
+
+# Binary names to expose globally. soroqctl is only linked when it was installed
+# (it ships in the same archive but may be absent in older releases).
+global_link_names() {
+  echo "$BINARY_NAME"
+  [ -x "$INSTALL_DIR/soroqctl" ] && echo "soroqctl"
+  return 0
+}
+
+# True only if $1 is a symlink that WE own, i.e. it points at a file inside
+# $INSTALL_DIR. Used to distinguish a refreshable Soroq symlink from a real file
+# or another tool's binary (which must never be clobbered).
+is_our_symlink() {
+  target="$1"
+  [ -L "$target" ] || return 1
+  dest="$(readlink "$target" 2>/dev/null)" || return 1
+  case "$dest" in
+    "$INSTALL_DIR"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Try to symlink every managed name into $1. Non-destructive and idempotent:
+#   - target missing              -> create the symlink
+#   - target is our symlink       -> refresh it (points back into $INSTALL_DIR)
+#   - target is a foreign file    -> touch NOTHING; set SKIP_REASON and return 1
+#                                    so the caller tries the next candidate dir.
+SKIP_REASON=""
+link_into_global_dir() {
+  dir="$1"
+  SKIP_REASON=""
+
+  # Pre-flight: bail before creating ANY link if a foreign file would be clobbered,
+  # so we never leave a partial (soroq linked, soroqctl blocked) state behind.
+  # Read names line-by-line (IFS= read -r) so a path/name with spaces is safe.
+  names="$(global_link_names)"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    target="$dir/$name"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      if ! is_our_symlink "$target"; then
+        SKIP_REASON="$target exists and is not a Soroq symlink"
+        return 1
+      fi
+    fi
+  done <<EOF
+$names
+EOF
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    ln -sf "$INSTALL_DIR/$name" "$dir/$name" || return 1
+  done <<EOF
+$names
+EOF
+  return 0
+}
+
+# Expose the CLI globally by symlinking into a candidate dir so `soroq` resolves
+# immediately (current shell + others) instead of only after a profile re-source.
+# Two passes so a candidate already on the CURRENT PATH wins even if an earlier-
+# ranked one is only writable: pass 1 = writable AND on $PATH (usable right now);
+# pass 2 = any writable (works in ordinary new shells whose default PATH includes
+# it). Never uses sudo; never clobbers a non-Soroq file (skips the dir + records
+# why). Sets GLOBAL_LINK_DIR on success and accumulates GLOBAL_LINK_SKIPPED.
+# Candidates are read line-by-line (IFS= read -r) so paths with spaces are safe.
+GLOBAL_LINK_DIR=""
+GLOBAL_LINK_SKIPPED=""
+dir_on_path() {
+  case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac
+}
+install_global_symlinks() {
+  GLOBAL_LINK_DIR=""
+  GLOBAL_LINK_SKIPPED=""
+  candidates="$(global_bin_candidates)"
+  for pass in on_path any; do
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      if [ ! -d "$dir" ]; then
+        # Only create the per-user fallback; never mkdir a system dir (needs sudo /
+        # would be surprising). Skip missing system dirs.
+        case "$dir" in
+          "$HOME"/*) mkdir -p "$dir" 2>/dev/null || continue ;;
+          *) continue ;;
+        esac
+      fi
+      [ -w "$dir" ] || continue
+      # Pass 1 only considers dirs already on the live PATH (immediately usable).
+      if [ "$pass" = "on_path" ] && ! dir_on_path "$dir"; then
+        continue
+      fi
+      if link_into_global_dir "$dir"; then
+        GLOBAL_LINK_DIR="$dir"
+        return 0
+      fi
+      # Record a foreign-file skip once (a dir rejected in pass 1 is re-seen in
+      # pass 2; only add it if we haven't noted it already).
+      case ";$GLOBAL_LINK_SKIPPED;" in
+        *";$dir ($SKIP_REASON);"*) : ;;
+        *) GLOBAL_LINK_SKIPPED="${GLOBAL_LINK_SKIPPED}${GLOBAL_LINK_SKIPPED:+; }$dir ($SKIP_REASON)" ;;
+      esac
+    done <<EOF
+$candidates
+EOF
+  done
+  return 1
+}
+
 # Allow the helper functions above to be sourced (for tests) without running the
 # installer: `SOROQ_INSTALL_LIB_ONLY=1 . ./install.sh`.
 if [ "${SOROQ_INSTALL_LIB_ONLY:-}" = "1" ]; then
@@ -248,6 +379,8 @@ need_cmd mv
 need_cmd chmod
 need_cmd grep
 need_cmd awk
+need_cmd ln
+need_cmd readlink
 
 os="$(detect_os)"
 arch="$(detect_arch)"
@@ -339,19 +472,32 @@ success "Soroq CLI is ready"
 say ""
 say "${BOLD}${GREEN}Installation complete.${RESET}"
 
+# Primary global-availability mechanism: symlink the CLI into a bin dir that is
+# already on PATH, so `soroq` resolves NOW without re-sourcing a profile. The
+# canonical binaries stay in $INSTALL_DIR (the self-updater's target); the
+# symlink resolves through to them and keeps working after `soroq update`.
+step "Linking ${BINARY_NAME} into a global bin directory"
+linked_globally=0
+if install_global_symlinks; then
+  linked_globally=1
+  linked_names="$BINARY_NAME"
+  [ -x "$INSTALL_DIR/soroqctl" ] && linked_names="$linked_names, soroqctl"
+  success "Linked ${BOLD}${linked_names}${RESET} into ${BOLD}${GLOBAL_LINK_DIR}${RESET}"
+else
+  warn "No writable global bin directory found; relying on your shell profile below."
+fi
+if [ -n "$GLOBAL_LINK_SKIPPED" ]; then
+  info "Left existing files untouched (not Soroq symlinks): $GLOBAL_LINK_SKIPPED"
+fi
+
+# Fallback so `soroq` still resolves in shells where the symlink dir is not on
+# PATH (kept regardless of the symlink outcome).
 step "Configuring PATH"
 if persist_path; then
   updated_profile="$(target_profile)"
   case "$CONFIG_STATUS" in
-    already)
-      success "PATH already configured in ${BOLD}${updated_profile}${RESET}"
-      ;;
-    *)
-      success "Added ${BOLD}${INSTALL_DIR}${RESET} to your PATH in ${BOLD}${updated_profile}${RESET}"
-      say ""
-      say "Restart your terminal, or run this to use ${BOLD}soroq${RESET} in the current session:"
-      say "  ${BOLD}source ${updated_profile}${RESET}"
-      ;;
+    already) success "PATH already configured in ${BOLD}${updated_profile}${RESET}" ;;
+    *) success "Added ${BOLD}${INSTALL_DIR}${RESET} to your PATH in ${BOLD}${updated_profile}${RESET}" ;;
   esac
 else
   # Unsupported shell (e.g. fish), a non-$HOME install dir, or a non-writable
@@ -364,17 +510,40 @@ else
   else
     say "  export PATH=\"$INSTALL_DIR:\$PATH\""
   fi
-  say ""
-  say "For this terminal session, you can run:"
-  say "  export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
 
-case ":$PATH:" in
-  *":$INSTALL_DIR:"*)
-    say ""
-    say "Run ${BOLD}soroq --help${RESET} to get started."
-    ;;
-esac
+# Single authoritative "is it usable now?" summary. `soroq` resolves in THIS
+# shell if the dir we linked into (or the install dir) is already on the live PATH.
+usable_now=0
+on_path=""
+if [ "$linked_globally" = "1" ]; then
+  case ":$PATH:" in *":$GLOBAL_LINK_DIR:"*) usable_now=1; on_path="$GLOBAL_LINK_DIR" ;; esac
+fi
+if [ "$usable_now" = "0" ]; then
+  case ":$PATH:" in *":$INSTALL_DIR:"*) usable_now=1; on_path="$INSTALL_DIR" ;; esac
+fi
+
+say ""
+if [ "$usable_now" = "1" ]; then
+  success "${BOLD}soroq${RESET} is available now (via ${on_path})."
+  say "Run ${BOLD}soroq --help${RESET} to get started."
+else
+  # Only the profile was updated (or nothing was on the current PATH): the
+  # current shell needs to pick it up.
+  say "Open a new terminal, or reload this one, to use ${BOLD}soroq${RESET}:"
+  say "  ${BOLD}exec \$SHELL${RESET}"
+fi
+
+# /usr/local/bin is on the macOS default PATH (/etc/paths), so linking there makes
+# soroq resolve in ordinary shells whose inherited/default PATH includes it (it
+# cannot reach a deliberately restricted PATH like /usr/bin:/bin). Writing it
+# usually needs sudo, so offer it as OPTIONAL guidance only; never run sudo
+# ourselves. Skip if we already landed there.
+if [ "$GLOBAL_LINK_DIR" != "/usr/local/bin" ]; then
+  say ""
+  say "${DIM}Optional — link into /usr/local/bin (on the default PATH of ordinary shells) with sudo:${RESET}"
+  say "  sudo ln -sf \"$INSTALL_DIR/soroq\" /usr/local/bin/soroq && sudo ln -sf \"$INSTALL_DIR/soroqctl\" /usr/local/bin/soroqctl"
+fi
 
 say ""
 say "${DIM}Next: soroq frontend install soroq-flutter-frontend-f74781f6-6903c161 --api https://api.soroq.dev  then  soroq toolchain doctor${RESET}"
