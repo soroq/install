@@ -164,6 +164,9 @@ jobs:
             if (Test-Path (Join-Path $sandbox ".soroq\frontends")) {
               throw "Windows setup created a frontend directory despite the pre-download guard"
             }
+            # The non-zero native exit is the expected result; clear it so pwsh does not propagate
+            # that value after the assertions above have converted it into a passing test.
+            $global:LASTEXITCODE = 0
             Write-Host "OK Windows build-artifact guard failed closed before network/download"
           } finally {
             $env:HOME = $oldHome
