@@ -11,7 +11,7 @@ private control-plane/store/S3 code are excluded). From a clean checkout:
 ```bash
 cd backend
 make build        # stamps ./VERSION -> ./soroq + ./soroqctl
-./soroq version   # -> soroq v0.2.2
+./soroq version   # -> soroq v0.2.4
 # or plainly:
 go build ./cmd/soroq
 go build ./cmd/soroqctl
@@ -32,7 +32,7 @@ Shorebird parity, and no arbitrary-Dart/Flutter parity. iOS hard-OTA is device-o
 |---|---|
 | macOS arm64 / amd64 | **Supported** (smoke-tested) |
 | Linux amd64 / arm64 | **Supported** (smoke-tested in a container) |
-| Windows | **Pending** (builds, not runtime-smoked; no published installer yet) |
+| Windows amd64 | **CLI beta / hard-OTA pending** (real Windows CI; experimental ZIP + gated installer) |
 
 ## Install (macOS or Linux)
 
@@ -44,7 +44,7 @@ Then add Soroq to your current shell (the installer also prints your profile fil
 
 ```bash
 export PATH="$HOME/.soroq/bin:$PATH"
-soroq version   # -> soroq v0.2.2
+soroq version   # -> soroq v0.2.4
 ```
 
 The installer detects your OS/CPU, downloads the matching archive from this repo's GitHub
@@ -66,10 +66,25 @@ soroq toolchain doctor
 
 See the docs: <https://soroq.dev/getting-started>.
 
-## Windows (pending)
+## Windows CLI beta (hard-OTA builds pending)
 
-A native Windows installer is not published yet. `soroq.exe` builds, but it has not been
-runtime-smoke-tested, so it is not offered as supported. Track status on this repo.
+The public release includes an experimental `soroq_windows_amd64.zip`. The Windows binaries run
+on a real `windows-latest` runner, and the gated PowerShell installer verifies the checksum,
+installs both `soroq.exe` and `soroqctl.exe` atomically, and configures the current-user PATH.
+
+This is **not yet Windows hard-OTA build support**. The signed catalog currently points at
+frontend/toolchain archives built for another host, so `soroq setup`, `frontend install`, and
+`toolchain install` fail before downloading them. Windows-host archives and secure native credential
+storage remain required before Windows is promoted from CLI beta.
+
+Opt-in tester install from a clone of this repository:
+
+```powershell
+$env:SOROQ_INSTALL_ALLOW_WINDOWS = "1"
+.\install.ps1
+# Open a new PowerShell window:
+soroq version
+```
 
 ## Published release assets
 
@@ -77,6 +92,7 @@ runtime-smoke-tested, so it is not offered as supported. Track status on this re
 - `soroq_darwin_amd64.tar.gz`
 - `soroq_linux_amd64.tar.gz`
 - `soroq_linux_arm64.tar.gz`
+- `soroq_windows_amd64.zip` (experimental)
 - `checksums.txt`
 
 Each archive contains `soroq` + `soroqctl`, no secrets, no local paths, no private keys.
@@ -86,7 +102,7 @@ Each archive contains `soroq` + `soroqctl`, no secrets, no local paths, no priva
 Pin a version:
 
 ```bash
-SOROQ_INSTALL_VERSION=v0.2.2 sh install.sh
+SOROQ_INSTALL_VERSION=v0.2.4 sh install.sh
 ```
 
 Install somewhere else:

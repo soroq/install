@@ -62,6 +62,9 @@ a bad signature, wrong schema, or absent platform is REFUSED. --api is an advanc
 	if err != nil {
 		return err
 	}
+	if err := requireBuildArtifactsForHost(); err != nil {
+		return err
+	}
 
 	base := strings.TrimRight(strings.TrimSpace(*apiBase), "/")
 	if base == "" {

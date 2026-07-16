@@ -143,6 +143,32 @@ jobs:
           Write-Host $tc
           if ($tc -notmatch 'usage: soroq toolchain') { throw "toolchain --help missing usage" }
 
+      - name: Windows host guard refuses incompatible build artifacts before download
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sandbox = Join-Path $env:RUNNER_TEMP "host-guard-home"
+          New-Item -ItemType Directory -Force -Path $sandbox | Out-Null
+          $oldHome = $env:HOME
+          $env:HOME = $sandbox
+          try {
+            $out = & (Join-Path $env:SOROQ_BIN "soroq.exe") setup android --api http://127.0.0.1:1/must-not-be-called 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            Write-Host $out
+            if ($code -eq 0) { throw "Windows setup unexpectedly succeeded" }
+            if ($out -notmatch 'Windows-host Soroq Flutter frontend/toolchain artifacts') {
+              throw "Windows setup did not explain the host-artifact boundary"
+            }
+            if ($out -notmatch 'no download was started') {
+              throw "Windows setup did not confirm the pre-download refusal"
+            }
+            if (Test-Path (Join-Path $sandbox ".soroq\frontends")) {
+              throw "Windows setup created a frontend directory despite the pre-download guard"
+            }
+            Write-Host "OK Windows build-artifact guard failed closed before network/download"
+          } finally {
+            $env:HOME = $oldHome
+          }
+
       - name: Checksum-verify unit (build archive + checksums.txt, verify sha256)
         run: |
           $ErrorActionPreference = "Stop"
@@ -202,10 +228,28 @@ jobs:
             & .\install.ps1
             if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited $LASTEXITCODE" }
             $exe = Join-Path $installDir "soroq.exe"
+            $ctl = Join-Path $installDir "soroqctl.exe"
             if (-not (Test-Path $exe)) { throw "installer did not place soroq.exe" }
+            if (-not (Test-Path $ctl)) { throw "installer did not place soroqctl.exe" }
             & $exe version | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "installed soroq.exe did not run" }
-            Write-Host "OK install.ps1 dry test"
+            & $ctl --help 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "installed soroqctl.exe did not run" }
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            $matches = @($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })
+            if ($matches.Count -ne 1) { throw "installer did not add exactly one User PATH entry for $installDir" }
+
+            # Reinstalling must not duplicate PATH or split the two-binary install.
+            & .\install.ps1
+            if ($LASTEXITCODE -ne 0) { throw "second install.ps1 exited $LASTEXITCODE" }
+            $userPath2 = [Environment]::GetEnvironmentVariable("Path", "User")
+            $matches2 = @($userPath2 -split ';' | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })
+            if ($matches2.Count -ne 1) { throw "installer duplicated the User PATH entry" }
+            & $exe version | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "soroq.exe failed after idempotent reinstall" }
+            & $ctl --help 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "soroqctl.exe failed after idempotent reinstall" }
+            Write-Host "OK install.ps1 dual-binary + PATH + idempotence test"
           } finally { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
 
       - name: install.ps1 into a path with spaces
@@ -226,9 +270,17 @@ jobs:
             & .\install.ps1
             if ($LASTEXITCODE -ne 0) { throw "install.ps1 (spaces) exited $LASTEXITCODE" }
             $exe = Join-Path $installDir "soroq.exe"
+            $ctl = Join-Path $installDir "soroqctl.exe"
             if (-not (Test-Path -LiteralPath $exe)) { throw "installer did not place soroq.exe in a spaced path" }
+            if (-not (Test-Path -LiteralPath $ctl)) { throw "installer did not place soroqctl.exe in a spaced path" }
             & $exe version | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "installed soroq.exe (spaces) did not run" }
+            & $ctl --help 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "installed soroqctl.exe (spaces) did not run" }
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            if (-not ($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
+              throw "spaced install path was not persisted to User PATH"
+            }
             Write-Host "OK spaced-path install"
           } finally { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
 
@@ -250,7 +302,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "prior good install failed" }
           } finally { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
           $priorExe = Join-Path $installDir "soroq.exe"
-          $priorHash = (Get-FileHash -Algorithm SHA256 $priorExe).Hash
+          $priorCtl = Join-Path $installDir "soroqctl.exe"
+          $priorExeHash = (Get-FileHash -Algorithm SHA256 $priorExe).Hash
+          $priorCtlHash = (Get-FileHash -Algorithm SHA256 $priorCtl).Hash
 
           # Now serve a TRUNCATED archive (simulated interrupted download) with the ORIGINAL checksums.txt.
           $bad = Join-Path $env:RUNNER_TEMP "srvbad"
@@ -277,11 +331,15 @@ jobs:
             Write-Host "OK installer failed cleanly on truncated archive (exit $code)"
           } finally { Stop-Process -Id $proc2.Id -Force -ErrorAction SilentlyContinue }
           # Prior install must be intact (installer stages in temp; only copies after verify).
-          $afterHash = (Get-FileHash -Algorithm SHA256 $priorExe).Hash
-          if ($priorHash -ne $afterHash) { throw "prior install was corrupted by a failed install" }
+          $afterExeHash = (Get-FileHash -Algorithm SHA256 $priorExe).Hash
+          $afterCtlHash = (Get-FileHash -Algorithm SHA256 $priorCtl).Hash
+          if ($priorExeHash -ne $afterExeHash) { throw "prior soroq.exe was corrupted by a failed install" }
+          if ($priorCtlHash -ne $afterCtlHash) { throw "prior soroqctl.exe was corrupted by a failed install" }
           & $priorExe version | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "prior install no longer runs after a failed install" }
-          Write-Host "OK prior install intact after interrupted install"
+          if ($LASTEXITCODE -ne 0) { throw "prior soroq.exe no longer runs after a failed install" }
+          & $priorCtl --help 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "prior soroqctl.exe no longer runs after a failed install" }
+          Write-Host "OK both prior binaries intact after interrupted install"
 
       - name: Loopback-callback protocol test (soroq login round-trip vs local auth stub)
         run: |

@@ -5,11 +5,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$BinaryName = "soroq.exe"
+$BinaryNames = @("soroq.exe", "soroqctl.exe")
 $Token = if ($env:SOROQ_GITHUB_TOKEN) { $env:SOROQ_GITHUB_TOKEN } else { $env:GITHUB_TOKEN }
 
-# Windows is pending for the Soroq hard-OTA beta: no Windows release asset is published yet
-# (soroq.exe builds but has not been runtime-smoke-tested). Fail clearly instead of 404ing.
+# Windows is pending for the Soroq hard-OTA beta. A Windows CLI candidate is published for
+# explicit testers, but Windows-host frontend/toolchain artifacts have not passed acceptance.
+# Refuse by default so a runnable CLI is not mistaken for complete Windows build support.
 if (-not $env:SOROQ_INSTALL_ALLOW_WINDOWS) {
     Write-Host ""
     Write-Host "Soroq CLI: a native Windows installer is not published yet (Windows is pending for the hard-OTA beta)."
@@ -55,7 +56,7 @@ function Fail([string]$Text) {
     Write-Host ""
     Write-Host "$(Paint Bold 'What to try next')"
     Write-Host "  - Run PowerShell as a normal user unless installing to a protected directory."
-    Write-Host "  - Pin a version: `$env:SOROQ_INSTALL_VERSION='<version>'; .\install.ps1   (e.g. v0.2.2)"
+    Write-Host "  - Pin a version: `$env:SOROQ_INSTALL_VERSION='<version>'; .\install.ps1   (e.g. v0.2.4)"
     Write-Host "  - Change install path: `$env:SOROQ_INSTALL_DIR='C:\Tools\soroq'; .\install.ps1"
     Write-Host "  - Private repo? set SOROQ_GITHUB_TOKEN to a GitHub token that can read $Repo"
     exit 1
@@ -64,8 +65,100 @@ function Fail([string]$Text) {
 function Detect-Arch {
     switch ($env:PROCESSOR_ARCHITECTURE.ToLowerInvariant()) {
         "amd64" { return "amd64" }
-        "arm64" { return "arm64" }
-        default { Fail "Unsupported CPU architecture: $env:PROCESSOR_ARCHITECTURE. Soroq CLI releases support amd64 and arm64." }
+        "arm64" { Fail "Windows arm64 is not published yet. Use an x64 PowerShell under Windows emulation, or wait for a native arm64 release." }
+        default { Fail "Unsupported CPU architecture: $env:PROCESSOR_ARCHITECTURE. The Windows CLI candidate currently supports amd64." }
+    }
+}
+
+function PathContains([string]$PathValue, [string]$Entry) {
+    if (-not $PathValue) { return $false }
+    $needle = $Entry.Trim().TrimEnd('\')
+    foreach ($part in ($PathValue -split [System.IO.Path]::PathSeparator)) {
+        if ($part.Trim().TrimEnd('\').Equals($needle, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Ensure-UserPath([string]$Entry) {
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (-not (PathContains $userPath $Entry)) {
+        $updated = if ([string]::IsNullOrWhiteSpace($userPath)) {
+            $Entry
+        } else {
+            $userPath.TrimEnd(';') + ';' + $Entry
+        }
+        [Environment]::SetEnvironmentVariable("Path", $updated, "User")
+        Success "Added $Entry to the current-user PATH"
+    } else {
+        Success "Current-user PATH already contains $Entry"
+    }
+
+    # Make the command available to the remainder of this PowerShell session too.
+    if (-not (PathContains $env:PATH $Entry)) {
+        $env:PATH = $Entry + [System.IO.Path]::PathSeparator + $env:PATH
+    }
+}
+
+function Install-BinariesAtomically([string]$ExtractDir, [string]$DestinationDir) {
+    New-Item -ItemType Directory -Force -Path $DestinationDir | Out-Null
+    $id = [System.Guid]::NewGuid().ToString("N")
+    $staged = @{}
+    $backups = @{}
+    $installed = New-Object System.Collections.Generic.List[string]
+
+    try {
+        foreach ($name in $BinaryNames) {
+            $source = Join-Path $ExtractDir $name
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                throw "Archive did not contain $name."
+            }
+            $stage = Join-Path $DestinationDir (".$name.$id.new")
+            Copy-Item -LiteralPath $source -Destination $stage -Force
+            $staged[$name] = $stage
+        }
+
+        # Verify staged bytes before touching a working installation.
+        & $staged["soroq.exe"] version *> $null
+        if ($LASTEXITCODE -ne 0) { throw "Staged soroq.exe did not run successfully." }
+        & $staged["soroqctl.exe"] --help *> $null
+        if ($LASTEXITCODE -ne 0) { throw "Staged soroqctl.exe did not run successfully." }
+
+        foreach ($name in $BinaryNames) {
+            $destination = Join-Path $DestinationDir $name
+            if (Test-Path -LiteralPath $destination) {
+                $backup = Join-Path $DestinationDir (".$name.$id.bak")
+                Move-Item -LiteralPath $destination -Destination $backup -Force
+                $backups[$name] = $backup
+            }
+        }
+
+        foreach ($name in $BinaryNames) {
+            $destination = Join-Path $DestinationDir $name
+            Move-Item -LiteralPath $staged[$name] -Destination $destination -Force
+            $installed.Add($name)
+        }
+
+        & (Join-Path $DestinationDir "soroq.exe") version *> $null
+        if ($LASTEXITCODE -ne 0) { throw "Installed soroq.exe did not run successfully." }
+        & (Join-Path $DestinationDir "soroqctl.exe") --help *> $null
+        if ($LASTEXITCODE -ne 0) { throw "Installed soroqctl.exe did not run successfully." }
+
+        foreach ($backup in $backups.Values) {
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        foreach ($name in $installed) {
+            Remove-Item -LiteralPath (Join-Path $DestinationDir $name) -Force -ErrorAction SilentlyContinue
+        }
+        foreach ($name in $backups.Keys) {
+            Move-Item -LiteralPath $backups[$name] -Destination (Join-Path $DestinationDir $name) -Force -ErrorAction SilentlyContinue
+        }
+        foreach ($stage in $staged.Values) {
+            Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue
+        }
+        throw
     }
 }
 
@@ -110,7 +203,7 @@ try {
     Say "$(Paint Blue 'i') Repository: $(Paint Bold $Repo)"
     Say "$(Paint Blue 'i') Version:    $(Paint Bold $Version)"
     Say "$(Paint Blue 'i') Target:     $(Paint Bold "windows/$Arch")"
-    Say "$(Paint Blue 'i') Install:    $(Paint Bold (Join-Path $InstallDir $BinaryName))"
+    Say "$(Paint Blue 'i') Install:    $(Paint Bold $InstallDir)"
     if ($Token) {
         Say "$(Paint Blue 'i') Auth:       $(Paint Bold 'GitHub token detected')"
     } else {
@@ -142,38 +235,41 @@ try {
 
     Step "Unpacking CLI"
     Expand-Archive -Path $Archive -DestinationPath $TmpDir -Force
-    $ExtractedBinary = Join-Path $TmpDir $BinaryName
-    if (-not (Test-Path $ExtractedBinary)) {
-        Fail "Archive did not contain $BinaryName."
+    foreach ($name in $BinaryNames) {
+        if (-not (Test-Path -LiteralPath (Join-Path $TmpDir $name) -PathType Leaf)) {
+            Fail "Archive did not contain $name."
+        }
     }
     Success "Archive unpacked"
 
-    Step "Installing binary"
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item -Path $ExtractedBinary -Destination (Join-Path $InstallDir $BinaryName) -Force
-    Success "Installed $(Paint Bold (Join-Path $InstallDir $BinaryName))"
+    Step "Installing soroq + soroqctl atomically"
+    try {
+        Install-BinariesAtomically $TmpDir $InstallDir
+    } catch {
+        Fail "Could not install both binaries safely. The previous installation was restored. $($_.Exception.Message)"
+    }
+    Success "Installed $(Paint Bold (Join-Path $InstallDir 'soroq.exe'))"
+    Success "Installed $(Paint Bold (Join-Path $InstallDir 'soroqctl.exe'))"
 
     Step "Checking installation"
-    & (Join-Path $InstallDir $BinaryName) --help *> $null
-    if ($LASTEXITCODE -ne 0) {
-        Fail "Installed binary did not run successfully."
+    & (Join-Path $InstallDir "soroq.exe") version *> $null
+    if ($LASTEXITCODE -ne 0) { Fail "Installed soroq.exe did not run successfully." }
+    & (Join-Path $InstallDir "soroqctl.exe") --help *> $null
+    if ($LASTEXITCODE -ne 0) { Fail "Installed soroqctl.exe did not run successfully." }
+    Success "Both Soroq CLI binaries are ready"
+
+    Step "Configuring PATH"
+    try {
+        Ensure-UserPath $InstallDir
+    } catch {
+        Fail "Binaries were installed, but the current-user PATH could not be updated safely. $($_.Exception.Message)"
     }
-    Success "Soroq CLI is ready"
 
     Say ""
     Say "$(Paint Bold (Paint Green 'Installation complete.'))"
-    $PathEntries = $env:PATH -split [System.IO.Path]::PathSeparator
-    if ($PathEntries -contains $InstallDir) {
-        Say "Run $(Paint Bold 'soroq --help') to get started."
-    } else {
-        Say "$(Paint Yellow 'WARN') $InstallDir is not currently on PATH."
-        Say "Add it for the current user:"
-        Say ""
-        Say "  [Environment]::SetEnvironmentVariable('Path', `$env:Path + ';$InstallDir', 'User')"
-        Say ""
-        Say "Then open a new PowerShell window and run:"
-        Say "  soroq --help"
-    }
+    Say "Open a new PowerShell window, then run:"
+    Say "  soroq version"
+    Say "  soroq --help"
     Say ""
 } finally {
     Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue

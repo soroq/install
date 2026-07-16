@@ -269,6 +269,9 @@ auto-detect it (no SOROQ_FLUTTER_BIN). A verified existing install short-circuit
 	if version == "" {
 		return errors.New("usage: soroq frontend install <version> --api <base>")
 	}
+	if err := requireBuildArtifactsForHost(); err != nil {
+		return err
+	}
 	versionDir, err := frontendVersionDir(version)
 	if err != nil {
 		return err

@@ -59,6 +59,9 @@ A verified cache entry short-circuits (offline OK); --force re-downloads.`)
 	if version == "" {
 		return errors.New("usage: soroq toolchain install <version> --api <base>")
 	}
+	if err := requireBuildArtifactsForHost(); err != nil {
+		return err
+	}
 	versionDir, err := toolchainVersionDir(version)
 	if err != nil {
 		return err

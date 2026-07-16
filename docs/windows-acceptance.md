@@ -1,17 +1,17 @@
 # Windows acceptance kit (Soroq CLI)
 
-**Status: Windows is PENDING.** The Soroq CLI is **supported** on macOS and Linux only. `soroq.exe`
-and `soroqctl.exe` build on Windows and pass a non-interactive CI job (see `.github/workflows/ci.yml`,
-job `windows (informational)`), but automated CI cannot cover the interactive, production paths a real
-operator depends on: a browser login against the live hosted surface, credential storage/revocation,
-and real frontend/toolchain installs.
+**Status: Windows CLI beta; Windows hard-OTA builds are PENDING.** `soroq.exe` and `soroqctl.exe`
+build and execute on a real Windows runner (see `.github/workflows/ci.yml`, job
+`windows (informational)`). The remaining boundary is not disk space or cross-compilation: the catalog
+does not yet publish Windows-host frontend/toolchain artifacts, and the CLI does not yet use Windows
+Credential Manager for its browser-login token.
 
 Windows stays PENDING until a human completes **every** gate below on a real Windows machine, against
 production (`https://soroq.dev` / `https://api.soroq.dev`), and records a pass. Until then:
 
 - `install.sh` does not offer Windows.
 - `install.ps1` refuses to run unless `SOROQ_INSTALL_ALLOW_WINDOWS=1` is set (opt-in for testers).
-- No Windows asset is advertised as supported (the release zip is labeled pending/experimental).
+- The Windows release zip is labeled pending/experimental.
 
 Honest boundaries still apply: hard-OTA is an experimental tier; iOS is device-only; no App
 Store / Play production approval, no Shorebird parity, no arbitrary-Dart/Flutter parity.
@@ -38,9 +38,9 @@ $env:SOROQ_INSTALL_ALLOW_WINDOWS = "1"
 $env:SOROQ_INSTALL_DIR = "$HOME\.soroq\bin"
 .\install.ps1
 
-# Put the bin dir on PATH for this session:
-$env:PATH = "$HOME\.soroq\bin;$env:PATH"
-soroq version   # expect: soroq v0.2.1
+# The installer persists the current-user PATH idempotently. Open a new PowerShell window:
+soroq version   # expect: the release version under test
+soroqctl --help
 ```
 
 ---
@@ -92,18 +92,19 @@ soroq whoami --api https://api.soroq.dev   # expect: an unauthenticated / no-cre
 - **PASS if** logout succeeds, the stored credential is removed, and a subsequent `whoami` fails
   because there is no longer a valid credential (server-side revoke best-effort + local removal).
 
-### G5 — Frontend install
+### G5 — Windows-host artifact guard (current beta)
 
 ```powershell
+soroq setup android
 soroq frontend install soroq-flutter-frontend-f74781f6-6903c161 --api https://api.soroq.dev
-soroq frontend list
-soroq frontend doctor
 ```
 
-- **PASS if** the frontend downloads, verifies (signature + archive sha256/size), installs under
-  `%USERPROFILE%\.soroq\frontends\`, and `doctor` reports it healthy.
+- **PASS for the CLI beta if** both commands refuse clearly before downloading and say Windows-host
+  frontend/toolchain artifacts are not available. This guard prevents a misleading 1 GB download.
+- **Windows hard-OTA remains PENDING** until a signed catalog entry selects a Windows-host frontend
+  and this gate is replaced by a successful install/build proof.
 
-### G6 — Toolchain install + doctor
+### G6 — Windows-host toolchain install + doctor (future promotion gate)
 
 ```powershell
 soroq toolchain install soroq-android-3.44.2-release-12d3315131f5 --api https://api.soroq.dev
@@ -111,8 +112,9 @@ soroq toolchain list
 soroq toolchain doctor
 ```
 
-- **PASS if** the toolchain downloads, verifies (signature + archive hash + `verifyEngineBundle`),
-  caches under `%USERPROFILE%\.soroq\toolchains\`, and `doctor` reports availability + compatibility.
+- **Not currently runnable.** PASS requires a Windows-host toolchain to download, verify (signature,
+  archive hash, and `verifyEngineBundle`), cache under `%USERPROFILE%\.soroq\toolchains\`, and report
+  compatibility. Do not test with the existing macOS-host archive.
 
 ### G7 — Normal command execution
 
@@ -151,13 +153,10 @@ $env:SOROQ_INSTALL_ALLOW_WINDOWS = "1"
 $env:SOROQ_INSTALL_DIR = $spaced
 .\install.ps1
 & (Join-Path $spaced "soroq.exe") version
-# And a frontend install into a spaced HOME-like path:
-$spacedHome = "C:\Users\Public\Soroq Work Dir"
-New-Item -ItemType Directory -Force -Path $spacedHome | Out-Null
-$env:SOROQ_CONFIG_HOME = $spacedHome   # if supported by your build; otherwise use --config on each command
+& (Join-Path $spaced "soroqctl.exe") --help
 ```
 
-- **PASS if** install into a spaced directory works and the installed `soroq.exe` runs. Prefer
+- **PASS if** install into a spaced directory works and both installed binaries run. Prefer
   `Set-Location -LiteralPath` (not bare `cd`) whenever a working directory contains spaces.
 
 ---
@@ -173,8 +172,8 @@ when all gates are PASS on a real machine against production.
 | G2 | whoami verifies identity server-side | ☐ PASS ☐ FAIL |
 | G3 | config.json exists + owner-only ACL (no plaintext exposure) | ☐ PASS ☐ FAIL |
 | G4 | logout removes + revokes the credential | ☐ PASS ☐ FAIL |
-| G5 | `frontend install` verifies + installs, `doctor` healthy | ☐ PASS ☐ FAIL |
-| G6 | `toolchain install` verifies + caches, `doctor` healthy | ☐ PASS ☐ FAIL |
+| G5 | Host guard refuses incompatible frontend/toolchain before download | ☐ PASS ☐ FAIL |
+| G6 | Windows-host toolchain installs and verifies (future promotion gate) | ☐ PASS ☐ FAIL |
 | G7 | help/doctor/soroqctl run cleanly | ☐ PASS ☐ FAIL |
 | G8 | file credential fallback works on a fresh profile, owner-only ACL | ☐ PASS ☐ FAIL |
 | G9 | install + run under paths containing spaces | ☐ PASS ☐ FAIL |
