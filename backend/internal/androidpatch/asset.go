@@ -378,7 +378,23 @@ func diffAndroidFlutterAssets(base map[string]artifactFile, candidate map[string
 }
 
 func isIgnoredFlutterAssetPath(path string) bool {
-	return path == soroqBundledMetadataRelativePath
+	return path == soroqBundledMetadataRelativePath || isGeneratedLicenseMetadataPath(path)
+}
+
+// isGeneratedLicenseMetadataPath reports whether path is Flutter's generated, aggregated OSS-license
+// blob (NOTICES.Z). Flutter concatenates every dependency's LICENSE file into this single asset at
+// build time, so adding OR updating ANY Dart dependency changes its bytes even when the dependency
+// declares no `flutter: assets:` and ships no real runtime-rendered asset. It is consumed only by
+// `LicenseRegistry`/`showLicensePage` (the About > Licenses screen) — it is NOT a widget-rendered
+// asset, so a native-AOT code patch that omits it does not make the app render incorrectly (the code
+// — including the new dependency — is delivered in libapp.so). Treating a NOTICES.Z-only change as
+// asset drift is the exact misclassification that blocks dependency-bearing code patches (e.g. adding
+// riverpod). Ignoring it here does NOT weaken the guard for real assets: images/fonts/bundles under
+// assets/ or packages/, AssetManifest entries backed by real files, and the full MaterialIcons font
+// (Fix A) are all still classified as drift and refused. The license page is refreshed by the next
+// base release.
+func isGeneratedLicenseMetadataPath(path string) bool {
+	return path == "NOTICES.Z" || path == "NOTICES"
 }
 
 func isOverlayEligibleFlutterAssetPath(path string) bool {

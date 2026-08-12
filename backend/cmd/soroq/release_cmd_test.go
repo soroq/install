@@ -77,13 +77,14 @@ func TestRunReleaseAndroidRegistersRelease(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(domain.Release{
-				ID:        captured.ID,
-				AppID:     captured.AppID,
-				RuntimeID: captured.RuntimeID,
-				Version:   captured.Version,
-				Platform:  captured.Platform,
-				Arch:      captured.Arch,
-				Channel:   captured.Channel,
+				ID:                   captured.ID,
+				AppID:                captured.AppID,
+				RuntimeID:            captured.RuntimeID,
+				Version:              captured.Version,
+				Platform:             captured.Platform,
+				Arch:                 captured.Arch,
+				Channel:              captured.Channel,
+				ManifestSigningKeyID: captured.ManifestSigningKeyID,
 			}); err != nil {
 				t.Fatalf("Encode() error = %v", err)
 			}
@@ -120,6 +121,7 @@ func TestRunReleaseAndroidRegistersRelease(t *testing.T) {
 			"--artifact", artifactPath,
 			"--api", server.URL,
 			"--release-id", "release-1",
+			"--manifest-key-id", "prod-primary",
 		})
 		if err != nil {
 			t.Fatalf("runReleaseAndroid() error = %v", err)
@@ -140,6 +142,9 @@ func TestRunReleaseAndroidRegistersRelease(t *testing.T) {
 	}
 	if captured.Arch != "arm64-v8a" {
 		t.Fatalf("expected inferred arch, got %q", captured.Arch)
+	}
+	if captured.ManifestSigningKeyID != "prod-primary" {
+		t.Fatalf("expected explicit server manifest key id, got %q", captured.ManifestSigningKeyID)
 	}
 	sourceBytes, err := os.ReadFile(artifactPath)
 	if err != nil {
@@ -250,8 +255,8 @@ func TestRunReleaseIOSRegistersConfigBaseline(t *testing.T) {
 	for _, expected := range []string{
 		"Registered iOS config baseline ios-release-1",
 		"ios_support: config_ota_only",
-		"submit:",                 // names the App Store/TestFlight submission step
-		"TestFlight/App Store",    // what to submit to
+		"submit:",              // names the App Store/TestFlight submission step
+		"TestFlight/App Store", // what to submit to
 		"soroq patch ios --config-file config.json",
 		"soroq patch config --release-id ios-release-1",
 		"does not enable iOS Dart-code OTA",
@@ -362,7 +367,7 @@ func TestRunReleaseAndroidDefaultsToNewestArtifactAndRecordsState(t *testing.T) 
 				Platform:             captured.Platform,
 				Arch:                 captured.Arch,
 				Channel:              captured.Channel,
-				ManifestSigningKeyID: captured.ManifestSigningKeyID,
+				ManifestSigningKeyID: "server-default",
 			}); err != nil {
 				t.Fatalf("Encode() error = %v", err)
 			}
@@ -408,8 +413,8 @@ func TestRunReleaseAndroidDefaultsToNewestArtifactAndRecordsState(t *testing.T) 
 	if captured.Arch != "universal" {
 		t.Fatalf("expected universal arch for multi-ABI AAB, got %q", captured.Arch)
 	}
-	if captured.ManifestSigningKeyID != "prod-primary" {
-		t.Fatalf("expected bundled manifest key id, got %q", captured.ManifestSigningKeyID)
+	if captured.ManifestSigningKeyID != "" {
+		t.Fatalf("expected server default manifest key selection, got explicit key %q", captured.ManifestSigningKeyID)
 	}
 	if !strings.Contains(stdout, "artifact: "+artifactPath) {
 		t.Fatalf("expected discovered artifact in stdout, got %q", stdout)
@@ -436,6 +441,9 @@ func TestRunReleaseAndroidDefaultsToNewestArtifactAndRecordsState(t *testing.T) 
 	}
 	if state.LastAndroidRelease.ReleaseID != "release-1" {
 		t.Fatalf("expected release id in state, got %+v", state.LastAndroidRelease)
+	}
+	if state.LastAndroidRelease.ManifestSigningKeyID != "server-default" {
+		t.Fatalf("expected server-resolved manifest key in state, got %+v", state.LastAndroidRelease)
 	}
 	if state.LastAndroidRelease.ArtifactPath == artifactPath {
 		t.Fatalf("expected stashed immutable release artifact path, got source path %+v", state.LastAndroidRelease)

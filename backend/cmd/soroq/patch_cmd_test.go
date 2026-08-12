@@ -113,6 +113,9 @@ func TestRunPatchAndroidPublishesHostedAssetPatch(t *testing.T) {
 	if capturedCreate.Kind != domain.PatchKindAsset {
 		t.Fatalf("expected asset kind, got %q", capturedCreate.Kind)
 	}
+	if capturedCreate.ManifestSigningKeyID != "" {
+		t.Fatalf("expected release/default server key resolution, got artifact trust key %q", capturedCreate.ManifestSigningKeyID)
+	}
 	if capturedCreate.BundleURL != server.URL+"/v1/patches/patch-1/bundle" {
 		t.Fatalf("unexpected bundle url %q", capturedCreate.BundleURL)
 	}

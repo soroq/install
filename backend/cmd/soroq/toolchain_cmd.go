@@ -72,7 +72,7 @@ const toolchainPinnedKeyID = "soroq-toolchain-kid-v1"
 const toolchainManifestSchema = "soroq.toolchain.v1"
 
 // Expected build-time identity the CLI is wired for. These mirror the committed canonical
-// soroq.ios_engine.v1 engine.json (tools/soroq_toolchain_packer/canonical/). doctor + install use them
+// soroq.ios_engine.v2 engine.json (tools/soroq_toolchain_packer/canonical/). doctor + install use them
 // to refuse a flutter/dart revision mismatch up front (a clear refusal before any extraction).
 const (
 	// iOS toolchain identity — the R3 matched revision (dart_dynamic_modules=true), device-proven

@@ -79,10 +79,30 @@ type autoUpdateConfigFile struct {
 	Enabled bool   `json:"enabled"`
 }
 
-var runFlutterPubAddSoroqFlutter = func(projectDir string) error {
-	flutterBin, err := exec.LookPath("flutter")
+// soroqInitFlutterBin resolves the flutter used by `soroq init`.
+//
+// It MUST prefer the installed Soroq frontend over PATH. A developer's PATH flutter is routinely a
+// different (often older) SDK -- here it was Dart 3.9.2 against a frontend on 3.13.0 -- and resolving
+// PATH first makes `soroq init` fail version solving on a project the Soroq frontend can build
+// perfectly well. Worse, it fails with a pub version error that says nothing about which SDK was
+// picked, so the obvious "fix" is to set SOROQ_FLUTTER_BIN, which the zero-touch workflow exists to
+// make unnecessary.
+func soroqInitFlutterBin() (string, error) {
+	if bin, err := resolveInstalledFrontendFlutterBin(); err == nil && strings.TrimSpace(bin) != "" {
+		return bin, nil
+	}
+	bin, err := exec.LookPath("flutter")
 	if err != nil {
-		return errors.New("flutter was not found on PATH; install Flutter first or run `flutter pub add soroq_flutter` manually before `soroq init`")
+		return "", errors.New("no Soroq frontend is installed and flutter was not found on PATH; " +
+			"run `soroq frontend install <version>` (or install Flutter) before `soroq init`")
+	}
+	return bin, nil
+}
+
+var runFlutterPubAddSoroqFlutter = func(projectDir string) error {
+	flutterBin, err := soroqInitFlutterBin()
+	if err != nil {
+		return err
 	}
 	cmd := exec.Command(flutterBin, "pub", "add", "soroq_flutter")
 	cmd.Dir = projectDir
@@ -261,6 +281,16 @@ func runInit(args []string) error {
 	// Guarantee a build-ready manifest_trust: validate the block already present (or auto-scaffold an
 	// app-owned key if hosted trust yielded none), so a fresh init never dead-ends on the fork's
 	// `Expected soroq.yaml to define "manifest_trust"` error. No-op when a valid block exists.
+	// A manifest_trust block alone does not make the project SIGNABLE. When init obtains trust keys
+	// from the control plane, soroq.yaml carries a HOSTED key whose private half lives server-side and
+	// no local seed exists — so `soroq patch --platforms=...` later fails at publish time with "no
+	// engine signing key", AFTER a full successful build, telling the developer to run an internal
+	// command. init is where that gap belongs: provision the project's own key here, alongside any
+	// hosted key, so the canonical workflow needs no further setup. Existing seeds are reused, so this
+	// can never orphan a key that already signed shipped patches.
+	if err := ensureProjectSigningKey(status.ProjectDir); err != nil {
+		return fmt.Errorf("provision project signing key: %w", err)
+	}
 	if _, err := ensureManifestTrust(status.ProjectDir); err != nil {
 		return err
 	}
@@ -716,6 +746,16 @@ func renderSoroqConfig(appID string, channel string, trust hostedManifestTrustRe
 	fmt.Fprintf(&builder, "app_id: %s\n", strings.TrimSpace(appID))
 	fmt.Fprintf(&builder, "channel: %s\n", strings.TrimSpace(channel))
 	fmt.Fprintf(&builder, "runtime_id_strategy: %s\n", strings.TrimSpace(trust.RuntimeIDStrategy))
+	// Enable the iOS engine lane by default.
+	//
+	// `soroq init` + `soroq release --platforms=ios` is the canonical zero-touch workflow, and it failed
+	// on a fresh project with "soroq.yaml does not enable the iOS engine lane" -- a setting the
+	// developer had no way to learn about from init's output. init exists to make a project
+	// Soroq-ready, and the lane is inert until an iOS release is actually run.
+	//
+	// Deliberately NO `patchable` list: the freehand lane derives patchable declarations from the
+	// kernel diff, and a hand-maintained list is exactly what it replaced.
+	builder.WriteString("ios_engine:\n  enabled: true\n")
 	if len(trust.ManifestTrust.Keys) == 0 {
 		// No hosted keys (offline fallback): leave the manifest_trust block for
 		// ensureManifestTrust to scaffold locally so init still yields a build-ready

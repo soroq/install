@@ -24,12 +24,13 @@ import (
 func buildFixtureToolchainArchive(t *testing.T) []byte {
 	t.Helper()
 	files := map[string]string{
-		"ios/engine.json":       `{"schema":"soroq.ios_engine.v1"}`,
-		"ios/flutter_framework": "fixture-flutter-framework-bytes",
-		"ios/dart2bytecode":     "fixture-dart2bytecode-bytes",
-		"ios/gen_snapshot":      "fixture-gen-snapshot-bytes",
-		"ios/vm_platform":       "fixture-vm-platform-bytes",
-		"ios/dartaotruntime":    "fixture-dartaotruntime-bytes",
+		"ios/engine.json":               `{"schema":"soroq.ios_engine.v2"}`,
+		"ios/flutter_framework":         "fixture-flutter-framework-bytes",
+		"ios/dart2bytecode":             "fixture-dart2bytecode-bytes",
+		"ios/flutter_compile_interface": "fixture-flutter-compile-interface-bytes",
+		"ios/gen_snapshot":              "fixture-gen-snapshot-bytes",
+		"ios/vm_platform":               "fixture-vm-platform-bytes",
+		"ios/dartaotruntime":            "fixture-dartaotruntime-bytes",
 	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)

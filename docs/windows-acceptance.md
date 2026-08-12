@@ -40,7 +40,7 @@ $env:SOROQ_INSTALL_DIR = "$HOME\.soroq\bin"
 
 # Put the bin dir on PATH for this session:
 $env:PATH = "$HOME\.soroq\bin;$env:PATH"
-soroq version   # expect: soroq v0.2.1
+soroq version   # expect: soroq v0.2.5
 ```
 
 ---

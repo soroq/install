@@ -74,6 +74,16 @@ func TestVerifyEngineBundleAcceptsValid(t *testing.T) {
 	}
 }
 
+func TestVerifyEngineBundleAcceptsLegacyV1WithoutCompileInterface(t *testing.T) {
+	dir := writeEngineBundle(t, func(m *engineBundleManifest) {
+		m.Schema = engineBundleSchemaV1
+		delete(m.Artifacts, "flutter_compile_interface")
+	})
+	if _, err := verifyEngineBundle(dir); err != nil {
+		t.Fatalf("legacy R3 v1 bundle must remain accepted: %v", err)
+	}
+}
+
 func TestVerifyEngineBundleRefusals(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -229,9 +239,11 @@ func TestEngineMatchesBaselineRejectsSkew(t *testing.T) {
 		t.Fatal(err)
 	}
 	good := engineLaneBaseline{
-		FrameworkSHA256:  ve.FrameworkSHA,
-		Dart2bytecodeSHA: ve.Manifest.Artifacts["dart2bytecode"],
-		GenSnapshotSHA:   ve.Manifest.Artifacts["gen_snapshot"],
+		EngineBundleSchema:  engineBundleSchema,
+		FrameworkSHA256:     ve.FrameworkSHA,
+		Dart2bytecodeSHA:    ve.Manifest.Artifacts["dart2bytecode"],
+		CompileInterfaceSHA: ve.Manifest.Artifacts["flutter_compile_interface"],
+		GenSnapshotSHA:      ve.Manifest.Artifacts["gen_snapshot"],
 	}
 	if err := engineMatchesBaseline(ve, good); err != nil {
 		t.Fatalf("matching baseline should pass, got %v", err)
@@ -240,6 +252,235 @@ func TestEngineMatchesBaselineRejectsSkew(t *testing.T) {
 	skew.FrameworkSHA256 = "00deadbeef"
 	if err := engineMatchesBaseline(ve, skew); err == nil || !strings.Contains(err.Error(), "framework") {
 		t.Fatalf("expected framework skew rejection, got %v", err)
+	}
+	skew = good
+	skew.CompileInterfaceSHA = "00deadbeef"
+	if err := engineMatchesBaseline(ve, skew); err == nil || !strings.Contains(err.Error(), "compile interface") {
+		t.Fatalf("expected compile-interface skew rejection, got %v", err)
+	}
+}
+
+func TestEngineLaneBaselineEqualsCoversCompleteIdentity(t *testing.T) {
+	base := engineLaneBaseline{
+		Schema: engineLaneBaselineSchema, EngineBundleSchema: engineBundleSchema,
+		ReleaseID: "release", AppID: "com.example.app", FlutterCommit: "flutter", DartRevision: "dart",
+		FrameworkSHA256: "aa", Dart2bytecodeSHA: "bb", CompileInterfaceSHA: "cc", GenSnapshotSHA: "dd",
+		AppDillSHA256: "ee", PatchableSHA256: "ff", Arch: "arm64", BuildMode: "profile",
+		ToolchainVersion: "r4", Experimental: true,
+	}
+	if !base.equals(base) {
+		t.Fatal("identical baselines must compare equal")
+	}
+	mutations := []struct {
+		name   string
+		mutate func(*engineLaneBaseline)
+	}{
+		{"app id", func(b *engineLaneBaseline) { b.AppID = "com.attacker.other" }},
+		{"patchable manifest", func(b *engineLaneBaseline) { b.PatchableSHA256 = "00" }},
+		{"flutter revision", func(b *engineLaneBaseline) { b.FlutterCommit = "other" }},
+		{"arch", func(b *engineLaneBaseline) { b.Arch = "x64" }},
+		{"toolchain", func(b *engineLaneBaseline) { b.ToolchainVersion = "other" }},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			other := base
+			tc.mutate(&other)
+			if base.equals(other) {
+				t.Fatalf("mutation %q was not detected", tc.name)
+			}
+		})
+	}
+}
+
+func TestPatchCompileArgsAlwaysUsesVersionMatchedFlutterInterface(t *testing.T) {
+	got := patchCompileArgs("dart2bytecode.snapshot", "vm_platform.dill", "app.dill",
+		"flutter_compile_interface.dill", preparedRuntimePatchSource{
+			CompilerInput: "patch.dart", PackageConfig: "package_config.json",
+		}, "patch.bytecode")
+	want := []string{
+		"dart2bytecode.snapshot",
+		"--platform", "vm_platform.dill",
+		"--import-dill", "app.dill",
+		"--compile-interface", "flutter_compile_interface.dill",
+		"--prefix-library-uris", "import/prefix",
+		"--packages", "package_config.json",
+		"-o", "patch.bytecode",
+		"patch.dart",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("unexpected compiler arguments:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestPatchCompileArgsLegacyV1OmitsCompileInterface(t *testing.T) {
+	got := patchCompileArgs("dart2bytecode.snapshot", "vm_platform.dill", "app.dill",
+		"", preparedRuntimePatchSource{
+			CompilerInput: "patch.dart", PackageConfig: "package_config.json",
+		}, "patch.bytecode")
+	if strings.Contains(strings.Join(got, "\x00"), "--compile-interface") {
+		t.Fatalf("legacy v1 args unexpectedly require the v2 interface: %q", got)
+	}
+}
+
+func TestPrepareRuntimePatchSourceGeneratesEntrypointWithoutTouchingCustomerSource(t *testing.T) {
+	project := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(project, ".dart_tool"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	packageConfig := filepath.Join(project, ".dart_tool", "package_config.json")
+	if err := os.WriteFile(packageConfig, []byte(`{"configVersion":2,"packages":[{"name":"demo","rootUri":"../","packageUri":"lib/","languageVersion":"3.7"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	patchPath := filepath.Join(project, "lib", "surface.dart")
+	original := []byte("String label() => 'NEW';\nclass Panel { static int icon() => 7; }\n")
+	if err := os.WriteFile(patchPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(project, "soroq_app_manifest.txt")
+	if err := os.WriteFile(manifest, []byte("package:demo/surface.dart::::label\npackage:demo/surface.dart::Panel::icon\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := prepareRuntimePatchSource(runtimePatchSourceRequest{
+		PatchDart: patchPath, PackageConfig: packageConfig, PatchableManifest: manifest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Cleanup()
+	if got := prepared.Indices; len(got) != 2 || got[0] != 0 || got[1] != 1 {
+		t.Fatalf("unexpected auto-selected indices: %v", got)
+	}
+	// The module must compile under a DISTINCT synthetic library URI, never the
+	// base's real package: URI — a dynamic module that redeclares the already-loaded
+	// base library is refused by loadDynamicModule ("... is already loaded").
+	if prepared.CompilerInput != "soroq-patch:///_soroq_dynamic_module/lib/surface.dart" {
+		t.Fatalf("module not compiled under a distinct synthetic library URI: %q", prepared.CompilerInput)
+	}
+	if strings.HasPrefix(prepared.CompilerInput, "package:") {
+		t.Fatalf("module redeclares an already-loaded base package URI: %q", prepared.CompilerInput)
+	}
+	if prepared.FileSystemScheme != "soroq-patch" || len(prepared.FileSystemRoots) != 2 {
+		t.Fatalf("temporary overlay not configured: %#v", prepared)
+	}
+	generated, err := os.ReadFile(prepared.SourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"@pragma('dyn-module:entry-point')",
+		"Object? dynamicModuleEntrypoint()",
+		"dynamicModuleEntrypoint() => _soroqReplacementForIndex",
+		"case 0:\n      return label",
+		"case 1:\n      return Panel.icon",
+	} {
+		if !strings.Contains(string(generated), want) {
+			t.Fatalf("generated overlay missing %q:\n%s", want, generated)
+		}
+	}
+	after, err := os.ReadFile(patchPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatal("customer patch source was modified")
+	}
+	if prepared.EntrypointContract != indexedSelectorEntrypointContract {
+		t.Fatalf("unexpected entrypoint contract %q", prepared.EntrypointContract)
+	}
+}
+
+func TestPrepareRuntimePatchSourceUsesDistinctLibraryForExistingEntrypoint(t *testing.T) {
+	project := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(project, ".dart_tool"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	packageConfig := filepath.Join(project, ".dart_tool", "package_config.json")
+	if err := os.WriteFile(packageConfig, []byte(`{"configVersion":2,"packages":[{"name":"demo","rootUri":"../","packageUri":"lib/"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	patchPath := filepath.Join(project, "lib", "surface.dart")
+	original := []byte("String label() => 'NEW';\n@pragma('dyn-module:entry-point')\nObject? dynamicModuleEntrypoint() => label;\n")
+	if err := os.WriteFile(patchPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(project, "manifest.txt")
+	if err := os.WriteFile(manifest, []byte("package:demo/surface.dart::::label\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := prepareRuntimePatchSource(runtimePatchSourceRequest{
+		PatchDart: patchPath, PackageConfig: packageConfig, PatchableManifest: manifest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Cleanup()
+	// Even a hand-authored entrypoint compiles under a distinct synthetic library URI
+	// (not the base package: URI) so loadDynamicModule accepts it; redirect is keyed
+	// by soroqPatchTable index and is independent of the replacement library identity.
+	if prepared.CompilerInput != "soroq-patch:///_soroq_dynamic_module/lib/surface.dart" || prepared.FileSystemScheme != "soroq-patch" {
+		t.Fatalf("existing entrypoint not compiled under a distinct synthetic library URI: %#v", prepared)
+	}
+	if strings.HasPrefix(prepared.CompilerInput, "package:") {
+		t.Fatalf("module redeclares an already-loaded base package URI: %q", prepared.CompilerInput)
+	}
+	got, err := os.ReadFile(prepared.SourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("existing entrypoint source was unexpectedly rewritten:\n%s", got)
+	}
+}
+
+func TestPrepareRuntimePatchSourceRejectsCrossLibraryIndex(t *testing.T) {
+	project := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(project, ".dart_tool"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	packageConfig := filepath.Join(project, ".dart_tool", "package_config.json")
+	_ = os.WriteFile(packageConfig, []byte(`{"configVersion":2,"packages":[{"name":"demo","rootUri":"../","packageUri":"lib/"}]}`), 0o644)
+	patchPath := filepath.Join(project, "lib", "a.dart")
+	_ = os.WriteFile(patchPath, []byte("String a() => 'a';\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(project, "lib", "b.dart"), []byte("String b() => 'b';\n"), 0o644)
+	manifest := filepath.Join(project, "manifest.txt")
+	_ = os.WriteFile(manifest, []byte("package:demo/a.dart::::a\npackage:demo/b.dart::::b\n"), 0o644)
+	_, err := prepareRuntimePatchSource(runtimePatchSourceRequest{
+		PatchDart: patchPath, PackageConfig: packageConfig, PatchableManifest: manifest,
+		IndicesCSV: "0,1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not --patch") {
+		t.Fatalf("expected cross-library refusal, got %v", err)
+	}
+}
+
+func TestPatchCompileArgsUsesTemporaryMultiRootOverlay(t *testing.T) {
+	got := patchCompileArgs("dart2bytecode.snapshot", "vm_platform.dill", "app.dill",
+		"flutter_compile_interface.dill", preparedRuntimePatchSource{
+			CompilerInput: "package:demo/surface.dart", PackageConfig: "soroq-patch:///.dart_tool/package_config.json",
+			FileSystemScheme: "soroq-patch", FileSystemRoots: []string{"/tmp/overlay", "/project"},
+		}, "patch.bytecode")
+	joined := strings.Join(got, "\x00")
+	for _, want := range []string{
+		"--filesystem-scheme\x00soroq-patch",
+		"--filesystem-root\x00/tmp/overlay",
+		"--filesystem-root\x00/project",
+		"--packages\x00soroq-patch:///.dart_tool/package_config.json",
+		"package:demo/surface.dart",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("compiler args missing %q: %q", want, got)
+		}
 	}
 }
 
@@ -260,14 +501,14 @@ func TestRollbackIOSEngineEmitsSignedVersion0(t *testing.T) {
 	seed[0] = 9
 	seedB64 := base64.RawURLEncoding.EncodeToString(seed)
 	out := t.TempDir()
-	if err := runRollbackIOSEngine([]string{"--seed-base64", seedB64, "--out", out}); err != nil {
+	if err := runRollbackIOSEngine([]string{"--seed-base64", seedB64, "--runtime-id", "rt-test", "--out", out}); err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
 	manifestBytes, err := os.ReadFile(filepath.Join(out, "manifest.json"))
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
-	if got := string(manifestBytes); got != `{"version":0,"bytecodeSha256":"","patches":[]}` {
+	if got := string(manifestBytes); got != `{"version":0,"runtime_id":"rt-test","bytecodeSha256":"","patches":[]}` {
 		t.Fatalf("unexpected rollback manifest: %s", got)
 	}
 	sigHex, err := os.ReadFile(filepath.Join(out, "manifest.sig"))
@@ -354,7 +595,7 @@ func TestPublishEngineBundleSendsRollout(t *testing.T) {
 
 func TestIsAlreadyExistsErrToleratesBothStores(t *testing.T) {
 	for _, msg := range []string{
-		`app "x" already exists`,                                                 // file store
+		`app "x" already exists`, // file store
 		`400 Bad Request: {"error":"create app: ERROR: duplicate key value violates unique constraint \"apps_pkey\" (SQLSTATE 23505)"}`, // postgres
 	} {
 		if !isAlreadyExistsErr(errors.New(msg)) {

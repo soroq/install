@@ -36,7 +36,19 @@ func runRollback(args []string) error {
 	// resolves the newest rollback-able patch from local project config + recorded state, so a user
 	// never needs to hand-copy a --patch-id. `rollback ios-engine` (above) stays delegated.
 	if len(args) > 0 && (args[0] == "android" || args[0] == "ios") {
-		return runRollbackConfigLane(args[0], args[1:])
+		// iOS freehand/engine projects: the developer-facing meaning of "roll back" is RETURN TO BASE,
+		// which is the signed version-0 engine manifest — not the record rollback, which merely exposes
+		// an older patch. Record rollback stays reachable through the explicit --patch-record flag.
+		if args[0] == "ios" && !hasFlag(args[1:], "patch-record") {
+			dir := releaseProjectDir(args[1:])
+			if fh, _ := isFreehandIOSBuild(dir); fh {
+				rel, _ := flagValue(args[1:], "release-id")
+				rt, _ := flagValue(args[1:], "runtime-id")
+				api, _ := flagValue(args[1:], "api")
+				return runRollbackIOSEngineCanonical(dir, rel, rt, api, hasFlag(args[1:], "json"))
+			}
+		}
+		return runRollbackConfigLane(args[0], stripFlag(args[1:], "patch-record", true))
 	}
 	fs := flag.NewFlagSet("rollback", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)

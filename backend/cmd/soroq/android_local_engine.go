@@ -49,12 +49,35 @@ func materializeAndroidLocalEngineLayout(androidBundleDir string) error {
 	if _, err := os.Stat(flatGenSnapshot); err != nil {
 		return fmt.Errorf("packed gen_snapshot missing under %s: %w", androidBundleDir, err)
 	}
+	// THE SYMBOL-BEARING COPY. The engine-source convention this layout imitates is that `out/<target>/`
+	// holds the UNSTRIPPED library and `out/<target>/lib.stripped/` the stripped one. Copying the
+	// stripped library into both — which is what this used to do — is how three byte-identical copies
+	// reached the installed toolchain: the Gradle embedding jar then carried a pre-stripped libflutter.so,
+	// AGP had nothing to extract, no libflutter.so.sym was emitted, and flutter_tools rejected every
+	// release AAB with "failed to strip debug symbols from native libraries".
+	//
+	// A toolchain packed before libflutter_unstripped.so was required has nothing better to offer, so the
+	// old behaviour is preserved for it — but loudly, because the release build WILL fail and the reason
+	// is otherwise unfindable.
+	flatLibflutterUnstripped := filepath.Join(androidBundleDir, "libflutter_unstripped.so")
+	symbolBearing := flatLibflutterUnstripped
+	if _, err := os.Stat(flatLibflutterUnstripped); err != nil {
+		symbolBearing = flatLibflutter
+		fmt.Fprintf(os.Stderr,
+			"soroq: WARNING — this Android toolchain ships no libflutter_unstripped.so, so the engine\n"+
+				"  library carries no debug symbols. `flutter build appbundle --release` will fail its\n"+
+				"  debug-symbol verification (\"Release app bundle failed to strip debug symbols from native\n"+
+				"  libraries\") no matter how correct the build is. A repacked toolchain is required; see\n"+
+				"  handoff/android-toolchain-repack/OWNER-HANDOFF.md.\n")
+	}
+
 	targetOut := filepath.Join(androidBundleDir, "out", androidLocalEngineTargetName)
 	// SOROQ device runtime: the stripped libflutter.so where Flutter's local-engine resolves it.
 	if err := linkOrCopyFile(flatLibflutter, filepath.Join(targetOut, "lib.stripped", "libflutter.so")); err != nil {
 		return fmt.Errorf("materialize lib.stripped/libflutter.so: %w", err)
 	}
-	if err := linkOrCopyFile(flatLibflutter, filepath.Join(targetOut, "libflutter.so")); err != nil {
+	// The unstripped position: what AGP extracts native debug metadata FROM.
+	if err := linkOrCopyFile(symbolBearing, filepath.Join(targetOut, "libflutter.so")); err != nil {
 		return fmt.Errorf("materialize libflutter.so: %w", err)
 	}
 	// SOROQ host AOT snapshotter (Flutter prefers universal/ for an android_ target on darwin).
@@ -62,7 +85,9 @@ func materializeAndroidLocalEngineLayout(androidBundleDir string) error {
 		return fmt.Errorf("materialize universal/gen_snapshot: %w", err)
 	}
 	// SOROQ engine embedding jar (lib/<abi>/libflutter.so) for Gradle's --local-engine Maven repo.
-	if err := writeAndroidEmbeddingJar(flatLibflutter, filepath.Join(targetOut, androidLocalEngineABI+"_release.jar")); err != nil {
+	// The jar is what Gradle resolves as the engine dependency, so its libflutter.so is the one AGP
+	// merges, strips and extracts symbols from — it must be the symbol-bearing copy.
+	if err := writeAndroidEmbeddingJar(symbolBearing, filepath.Join(targetOut, androidLocalEngineABI+"_release.jar")); err != nil {
 		return fmt.Errorf("materialize %s_release.jar: %w", androidLocalEngineABI, err)
 	}
 	// T017: the SOROQ flutter_embedding_release.jar (the Java embedding carrying the setSoroq*
@@ -143,11 +168,11 @@ func completeAndroidLocalEngineLayout(androidBundleDir, flutterBin string) error
 
 	// Stock, version-matched host tooling (NOT soroq-specific; the pack deliberately omits these).
 	stockLinks := map[string]string{
-		filepath.Join(targetOut, "flutter_patched_sdk"):         filepath.Join(commonEngine, "flutter_patched_sdk"),
-		filepath.Join(targetOut, "flutter_patched_sdk_product"): filepath.Join(commonEngine, "flutter_patched_sdk_product"),
-		filepath.Join(targetOut, "icudtl.dat"):                  filepath.Join(hostEngine, "icudtl.dat"),
-		filepath.Join(hostOut, "dart-sdk"):                      filepath.Join(cacheDir, "dart-sdk"),
-		filepath.Join(hostOut, "flutter_patched_sdk"):           filepath.Join(commonEngine, "flutter_patched_sdk"),
+		filepath.Join(targetOut, "flutter_patched_sdk"):             filepath.Join(commonEngine, "flutter_patched_sdk"),
+		filepath.Join(targetOut, "flutter_patched_sdk_product"):     filepath.Join(commonEngine, "flutter_patched_sdk_product"),
+		filepath.Join(targetOut, "icudtl.dat"):                      filepath.Join(hostEngine, "icudtl.dat"),
+		filepath.Join(hostOut, "dart-sdk"):                          filepath.Join(cacheDir, "dart-sdk"),
+		filepath.Join(hostOut, "flutter_patched_sdk"):               filepath.Join(commonEngine, "flutter_patched_sdk"),
 		filepath.Join(hostOut, "gen", "const_finder.dart.snapshot"): filepath.Join(hostEngine, "const_finder.dart.snapshot"),
 		filepath.Join(hostOut, "font-subset"):                       filepath.Join(hostEngine, "font-subset"),
 	}

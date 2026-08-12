@@ -94,6 +94,8 @@ func runFrontend(args []string) error {
 		return errAlreadyPrinted
 	}
 	switch args[0] {
+	case "use-candidate":
+		return runFrontendUseCandidate(args[1:])
 	case "install":
 		return runFrontendInstall(args[1:])
 	case "publish":
@@ -119,6 +121,7 @@ func frontendUsage() {
 subcommands:
   install  download, verify (signature + archive sha256/size), and install a Soroq Flutter frontend
   publish  operator: sign + PUT a frontend manifest + upload the archive to the registry
+  use-candidate  activate a LOCAL UNSIGNED candidate frontend (--restore to go back)
   list     list installed frontends under ~/.soroq/frontends/
   path     print the resolved installed frontend bin/flutter
   doctor   verify the installed frontend (revision, soroq_metadata.dart, recorded hash)`)
@@ -399,6 +402,24 @@ func reverifyInstalledFrontend(version, versionDir string) (frontendManifest, bo
 	}
 	sigBytes, err := os.ReadFile(filepath.Join(versionDir, "manifest.sig"))
 	if err != nil {
+		// A CANDIDATE frontend is local and unsigned by construction (see `soroq frontend
+		// use-candidate`), so there is no detached signature to verify. Requiring one here made every
+		// release against a candidate fail at baseline persistence, AFTER a full successful build.
+		//
+		// It is still verified, just against what a candidate actually asserts: the manifest must
+		// declare candidate:true and signed:false. A manifest that claims to be signed but has no
+		// signature is a contradiction and stays refused, and a signed frontend missing its signature
+		// is still an error -- neither is silently downgraded.
+		if cm, cerr := verifyCandidateFrontend(versionDir); cerr == nil {
+			manifest, perr := parseFrontendManifest(manifestBytes)
+			if perr != nil {
+				return frontendManifest{}, false, perr
+			}
+			fmt.Fprintf(os.Stderr,
+				"soroq: frontend %s is an UNSIGNED CANDIDATE (patchset %s); provenance is recorded as candidate\n",
+				cm.Version, short(cm.PatchsetSHA256))
+			return manifest, true, nil
+		}
 		return frontendManifest{}, false, fmt.Errorf("read cached manifest.sig: %w", err)
 	}
 	if err := signing.VerifyToolchainManifestSignature(manifestBytes, strings.TrimSpace(string(sigBytes)), pinnedToolchainPublicKeyHex()); err != nil {

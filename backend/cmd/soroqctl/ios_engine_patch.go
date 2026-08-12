@@ -28,9 +28,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"soroq/backend/internal/domain"
+	"soroq/backend/internal/serving"
+	"soroq/backend/internal/signing"
 )
 
 // --- engine bundle (--engine-bundle) immutable descriptor (engine.json) ---
@@ -38,20 +41,24 @@ import (
 // engineBundleManifest is the immutable engine.json inside an --engine-bundle dir. Every value is
 // verified before a release is registered; missing/mismatched/debug/unoptimized engines are refused.
 type engineBundleManifest struct {
-	Schema           string            `json:"schema"`            // "soroq.ios_engine.v1"
-	FlutterCommit    string            `json:"flutter_commit"`    // pinned flutter/flutter sha
-	DartRevision     string            `json:"dart_revision"`     // pinned dart sha
-	SoroqPatchHashes map[string]string `json:"soroq_patch_hashes"`// patch-file -> sha256
-	Arch             string            `json:"arch"`              // arm64
-	BuildMode        string            `json:"build_mode"`        // profile | release (NOT debug)
-	IsDebug          bool              `json:"is_debug"`          // MUST be false
-	Tier             string            `json:"tier"`              // "experimental_profile" | "production"
+	Schema           string            `json:"schema"`             // soroq.ios_engine.v1 | soroq.ios_engine.v2
+	FlutterCommit    string            `json:"flutter_commit"`     // pinned flutter/flutter sha
+	DartRevision     string            `json:"dart_revision"`      // pinned dart sha
+	SoroqPatchHashes map[string]string `json:"soroq_patch_hashes"` // patch-file -> sha256
+	Arch             string            `json:"arch"`               // arm64
+	BuildMode        string            `json:"build_mode"`         // profile | release (NOT debug)
+	IsDebug          bool              `json:"is_debug"`           // MUST be false
+	Tier             string            `json:"tier"`               // "experimental_profile" | "production"
 	// path -> sha256, all relative to the bundle root; each is hashed + compared on verify.
-	Artifacts map[string]string `json:"artifacts"` // flutter_framework, xcframework, dart2bytecode, gen_snapshot, vm_platform, dartaotruntime
+	Artifacts map[string]string `json:"artifacts"` // flutter_framework, dart2bytecode, flutter_compile_interface, gen_snapshot, vm_platform, dartaotruntime
 }
 
-const engineBundleSchema = "soroq.ios_engine.v1"
+const engineBundleSchemaV1 = "soroq.ios_engine.v1"
+const engineBundleSchema = "soroq.ios_engine.v2"
 const androidEngineBundleSchema = "soroq.android_engine.v1"
+const engineLaneBaselineSchemaV1 = "soroq.ios_engine_baseline.v1"
+const engineLaneBaselineSchema = "soroq.ios_engine_baseline.v2"
+const engineLaneBundleDescriptorSchema = "soroq.ios_engine.v1"
 
 // engineLaneSpec parameterizes verifyEngineBundle per platform: the accepted engine.json schema + the
 // minimal required-artifact set. iOS is the proven default; Android (T012) reuses the SAME verify logic
@@ -69,6 +76,12 @@ var iosEngineLaneSpec = engineLaneSpec{
 	frameworkArtifact: "flutter_framework",
 }
 
+var iosEngineLaneSpecV1 = engineLaneSpec{
+	schema:            engineBundleSchemaV1,
+	requiredArtifacts: requiredEngineArtifactsV1,
+	frameworkArtifact: "flutter_framework",
+}
+
 var androidEngineLaneSpec = engineLaneSpec{
 	schema:            androidEngineBundleSchema,
 	requiredArtifacts: requiredAndroidEngineArtifacts,
@@ -79,12 +92,14 @@ var androidEngineLaneSpec = engineLaneSpec{
 // verify EITHER an iOS or an Android cached bundle without the caller pre-declaring the platform).
 func engineLaneSpecForSchema(schema string) (engineLaneSpec, error) {
 	switch strings.TrimSpace(schema) {
+	case engineBundleSchemaV1:
+		return iosEngineLaneSpecV1, nil
 	case engineBundleSchema:
 		return iosEngineLaneSpec, nil
 	case androidEngineBundleSchema:
 		return androidEngineLaneSpec, nil
 	default:
-		return engineLaneSpec{}, fmt.Errorf("engine bundle schema %q is not a recognized soroq engine schema (want %q or %q)", schema, engineBundleSchema, androidEngineBundleSchema)
+		return engineLaneSpec{}, fmt.Errorf("engine bundle schema %q is not recognized (want %q, %q, or %q)", schema, engineBundleSchemaV1, engineBundleSchema, androidEngineBundleSchema)
 	}
 }
 
@@ -134,9 +149,18 @@ func cachedToolchainBundleDir(version string) (string, error) {
 	return filepath.Join(home, ".soroq", "toolchains", version, "ios"), nil
 }
 
-// requiredEngineArtifacts must all be present + hash-matched for a usable iOS engine bundle.
-var requiredEngineArtifacts = []string{
+// v1 is the device-proven R3 bundle and remains installable/usable for legacy
+// pure-Dart patches. v2 adds the version-matched Flutter compile interface.
+var requiredEngineArtifactsV1 = []string{
 	"flutter_framework", "dart2bytecode", "gen_snapshot", "vm_platform", "dartaotruntime",
+}
+
+// requiredEngineArtifacts must all be present + hash-matched for a usable v2 iOS engine bundle.
+// flutter_compile_interface is the version-matched CFE API summary that lets a
+// patch import Flutter's public foundation/widgets/material/cupertino barrels
+// without recompiling framework source against a tree-shaken app.dill.
+var requiredEngineArtifacts = []string{
+	"flutter_framework", "dart2bytecode", "flutter_compile_interface", "gen_snapshot", "vm_platform", "dartaotruntime",
 }
 
 // requiredAndroidEngineArtifacts is the Android-lane minimal hostable set (T012). It MUST equal the
@@ -151,17 +175,17 @@ var requiredAndroidEngineArtifacts = []string{
 
 // verifiedEngine is the result of a successful verifyEngineBundle.
 type verifiedEngine struct {
-	BundleDir     string
-	Manifest      engineBundleManifest
-	FrameworkSHA  string // = artifacts["flutter_framework"]
-	ToolPath      func(name string) string
-	Experimental  bool
+	BundleDir    string
+	Manifest     engineBundleManifest
+	FrameworkSHA string // = artifacts["flutter_framework"]
+	ToolPath     func(name string) string
+	Experimental bool
 }
 
 // verifyEngineBundle parses + verifies the engine bundle at dir. It REFUSES: unrecognized schema, debug
 // or non-profile/release build, missing required artifacts, and any artifact whose on-disk sha256 does
 // not match engine.json. The required-artifact set + framework artifact are chosen from the engine.json
-// schema (iOS soroq.ios_engine.v1 OR Android soroq.android_engine.v1), so the SAME refusal logic guards
+// schema (iOS v1/v2 OR Android v1), so the SAME refusal logic guards
 // both lanes. Returns the verified engine or a precise error (no partial trust).
 func verifyEngineBundle(dir string) (*verifiedEngine, error) {
 	dir = filepath.Clean(dir)
@@ -246,9 +270,11 @@ func runVerifyEngineBundleCmd(args []string) error {
 
 // engineLaneManifest is the EXACT JSON the device app parses: top-level bytecodeSha256 + patches[].
 type engineLaneManifest struct {
-	Version        int                 `json:"version"`
-	BytecodeSha256 string              `json:"bytecodeSha256"`
-	Patches        []engineLanePatch   `json:"patches"`
+	Version            int               `json:"version"`
+	RuntimeID          string            `json:"runtime_id"`
+	BytecodeSha256     string            `json:"bytecodeSha256"`
+	EntrypointContract string            `json:"entrypointContract,omitempty"`
+	Patches            []engineLanePatch `json:"patches"`
 }
 type engineLanePatch struct {
 	Index    int    `json:"index"`
@@ -332,20 +358,25 @@ func runReleaseIOSEngine(args []string) error {
 		}
 	}
 	baseline := engineLaneBaseline{
-		Schema:            "soroq.ios_engine_baseline.v1",
-		ReleaseID:         strings.TrimSpace(*releaseID),
-		AppID:             strings.TrimSpace(*appID),
-		FlutterCommit:     ve.Manifest.FlutterCommit,
-		DartRevision:      ve.Manifest.DartRevision,
-		FrameworkSHA256:   ve.FrameworkSHA,
-		Dart2bytecodeSHA:  ve.Manifest.Artifacts["dart2bytecode"],
-		GenSnapshotSHA:    ve.Manifest.Artifacts["gen_snapshot"],
-		AppDillSHA256:     appDillSHA,
-		PatchableSHA256:   patchableSHA,
-		Arch:              normalizedDefaultString(ve.Manifest.Arch, "arm64"),
-		BuildMode:         ve.Manifest.BuildMode,
-		ToolchainVersion:  strings.TrimSpace(*toolchainVersion),
-		Experimental:      ve.Experimental,
+		Schema:              engineLaneBaselineSchema,
+		EngineBundleSchema:  ve.Manifest.Schema,
+		ReleaseID:           strings.TrimSpace(*releaseID),
+		AppID:               strings.TrimSpace(*appID),
+		FlutterCommit:       ve.Manifest.FlutterCommit,
+		DartRevision:        ve.Manifest.DartRevision,
+		FrameworkSHA256:     ve.FrameworkSHA,
+		Dart2bytecodeSHA:    ve.Manifest.Artifacts["dart2bytecode"],
+		CompileInterfaceSHA: ve.Manifest.Artifacts["flutter_compile_interface"],
+		GenSnapshotSHA:      ve.Manifest.Artifacts["gen_snapshot"],
+		AppDillSHA256:       appDillSHA,
+		PatchableSHA256:     patchableSHA,
+		Arch:                normalizedDefaultString(ve.Manifest.Arch, "arm64"),
+		BuildMode:           ve.Manifest.BuildMode,
+		ToolchainVersion:    strings.TrimSpace(*toolchainVersion),
+		Experimental:        ve.Experimental,
+	}
+	if ve.Manifest.Schema == engineBundleSchemaV1 {
+		baseline.Schema = engineLaneBaselineSchemaV1
 	}
 	outPath := strings.TrimSpace(*out)
 	if outPath == "" {
@@ -399,8 +430,11 @@ func runReleaseIOSEngine(args []string) error {
 		}
 	}
 	if useAPI {
-		fmt.Printf("control-plane app+release ensured on %s (device kHostBase -> %s/v1/engine/%s/%s)\n",
-			strings.TrimRight(*apiBase, "/"), strings.TrimRight(*apiBase, "/"), url.PathEscape(baseline.AppID), url.PathEscape(normalizedDefaultString(*channel, "stable")))
+		// The operator base registers; a DEVICE reads from the device-serve host, which is a different
+		// origin on the hosted deployment and 401s if the two are conflated.
+		fmt.Printf("control-plane app+release ensured on %s (device kHostBase -> %s)\n",
+			strings.TrimRight(*apiBase, "/"),
+			serving.EngineChannelURL(*apiBase, url.PathEscape(baseline.AppID), url.PathEscape(normalizedDefaultString(*channel, "stable"))))
 	}
 	return nil
 }
@@ -411,20 +445,21 @@ func runReleaseIOSEngine(args []string) error {
 // The actual archive + code-signing is NEVER faked here: when the signing identity / Xcode project is
 // absent the build_status is "gated" with the precise missing input.
 type engineLaneArchiveHandoff struct {
-	Schema           string `json:"schema"` // soroq.ios_engine_archive_handoff.v1
-	Kind             string `json:"kind"`   // ios_engine
-	ReleaseID        string `json:"release_id"`
-	AppID            string `json:"app_id"`
-	FlutterCommit    string `json:"flutter_commit"`
-	DartRevision     string `json:"dart_revision"`
-	FrameworkSHA256  string `json:"framework_sha256"`
-	GenSnapshotSHA   string `json:"gen_snapshot_sha256"`
-	AppDillSHA256    string `json:"app_dill_sha256"`
-	ToolchainVersion string `json:"toolchain_version,omitempty"`
-	EngineBundleDir  string `json:"engine_bundle_dir"`
-	BuildMode        string `json:"build_mode"`
-	Tier             string `json:"tier"`
-	Experimental     bool   `json:"experimental"`
+	Schema              string `json:"schema"` // soroq.ios_engine_archive_handoff.v1
+	Kind                string `json:"kind"`   // ios_engine
+	ReleaseID           string `json:"release_id"`
+	AppID               string `json:"app_id"`
+	FlutterCommit       string `json:"flutter_commit"`
+	DartRevision        string `json:"dart_revision"`
+	FrameworkSHA256     string `json:"framework_sha256"`
+	CompileInterfaceSHA string `json:"flutter_compile_interface_sha256"`
+	GenSnapshotSHA      string `json:"gen_snapshot_sha256"`
+	AppDillSHA256       string `json:"app_dill_sha256"`
+	ToolchainVersion    string `json:"toolchain_version,omitempty"`
+	EngineBundleDir     string `json:"engine_bundle_dir"`
+	BuildMode           string `json:"build_mode"`
+	Tier                string `json:"tier"`
+	Experimental        bool   `json:"experimental"`
 	// The owner/Xcode-gated build. build_status ∈ {gated, ready}. We do NOT execute xcodebuild here.
 	BuildStatus      string `json:"build_status"`
 	GatedOn          string `json:"gated_on,omitempty"`
@@ -438,23 +473,24 @@ type engineLaneArchiveHandoff struct {
 // (signing identity + Xcode project) without ever faking a build.
 func writeEngineArchiveHandoff(path, bundleDir string, ve *verifiedEngine, b engineLaneBaseline, signingIdentity, xcodeProject string) (*engineLaneArchiveHandoff, error) {
 	h := engineLaneArchiveHandoff{
-		Schema:           "soroq.ios_engine_archive_handoff.v1",
-		Kind:             "ios_engine",
-		ReleaseID:        b.ReleaseID,
-		AppID:            b.AppID,
-		FlutterCommit:    b.FlutterCommit,
-		DartRevision:     b.DartRevision,
-		FrameworkSHA256:  b.FrameworkSHA256,
-		GenSnapshotSHA:   b.GenSnapshotSHA,
-		AppDillSHA256:    b.AppDillSHA256,
-		ToolchainVersion: b.ToolchainVersion,
-		EngineBundleDir:  bundleDir,
-		BuildMode:        b.BuildMode,
-		Tier:             tierLabel(ve.Experimental),
-		Experimental:     ve.Experimental,
-		SigningIdentity:  signingIdentity,
-		XcodeProject:     xcodeProject,
-		BuildCommandHint: "xcodebuild -workspace <ios/Runner.xcworkspace> -scheme Runner -configuration Release -archivePath <out>.xcarchive archive CODE_SIGN_IDENTITY=<signing-identity>; then -exportArchive to an IPA. The custom Flutter.framework comes from the resolved engine bundle (EngineBundleDir).",
+		Schema:              "soroq.ios_engine_archive_handoff.v1",
+		Kind:                "ios_engine",
+		ReleaseID:           b.ReleaseID,
+		AppID:               b.AppID,
+		FlutterCommit:       b.FlutterCommit,
+		DartRevision:        b.DartRevision,
+		FrameworkSHA256:     b.FrameworkSHA256,
+		CompileInterfaceSHA: b.CompileInterfaceSHA,
+		GenSnapshotSHA:      b.GenSnapshotSHA,
+		AppDillSHA256:       b.AppDillSHA256,
+		ToolchainVersion:    b.ToolchainVersion,
+		EngineBundleDir:     bundleDir,
+		BuildMode:           b.BuildMode,
+		Tier:                tierLabel(ve.Experimental),
+		Experimental:        ve.Experimental,
+		SigningIdentity:     signingIdentity,
+		XcodeProject:        xcodeProject,
+		BuildCommandHint:    "xcodebuild -workspace <ios/Runner.xcworkspace> -scheme Runner -configuration Release -archivePath <out>.xcarchive archive CODE_SIGN_IDENTITY=<signing-identity>; then -exportArchive to an IPA. The custom Flutter.framework comes from the resolved engine bundle (EngineBundleDir).",
 	}
 	// The build is GATED unless BOTH the signing identity and the Xcode project are present AND
 	// xcodebuild exists on this host. We never run it here — it is owner/Xcode-gated by policy — but
@@ -561,25 +597,38 @@ func isAlreadyExistsErr(err error) bool {
 
 // engineLaneBaseline is the immutable record `release ios-engine` writes (engine + app.dill identity).
 type engineLaneBaseline struct {
-	Schema           string `json:"schema"`
-	ReleaseID        string `json:"release_id"`
-	AppID            string `json:"app_id"`
-	FlutterCommit    string `json:"flutter_commit"`
-	DartRevision     string `json:"dart_revision"`
-	FrameworkSHA256  string `json:"framework_sha256"`
-	Dart2bytecodeSHA string `json:"dart2bytecode_sha256"`
-	GenSnapshotSHA   string `json:"gen_snapshot_sha256"`
-	AppDillSHA256    string `json:"app_dill_sha256"`
-	PatchableSHA256  string `json:"patchable_manifest_sha256,omitempty"`
-	Arch             string `json:"arch"`
-	BuildMode        string `json:"build_mode"`
-	ToolchainVersion string `json:"toolchain_version,omitempty"`
-	Experimental     bool   `json:"experimental"`
+	Schema              string `json:"schema"`
+	EngineBundleSchema  string `json:"engine_bundle_schema,omitempty"`
+	ReleaseID           string `json:"release_id"`
+	AppID               string `json:"app_id"`
+	FlutterCommit       string `json:"flutter_commit"`
+	DartRevision        string `json:"dart_revision"`
+	FrameworkSHA256     string `json:"framework_sha256"`
+	Dart2bytecodeSHA    string `json:"dart2bytecode_sha256"`
+	CompileInterfaceSHA string `json:"flutter_compile_interface_sha256"`
+	GenSnapshotSHA      string `json:"gen_snapshot_sha256"`
+	AppDillSHA256       string `json:"app_dill_sha256"`
+	PatchableSHA256     string `json:"patchable_manifest_sha256,omitempty"`
+	Arch                string `json:"arch"`
+	BuildMode           string `json:"build_mode"`
+	ToolchainVersion    string `json:"toolchain_version,omitempty"`
+	Experimental        bool   `json:"experimental"`
 }
 
 func (b engineLaneBaseline) equals(o engineLaneBaseline) bool {
-	return b.FrameworkSHA256 == o.FrameworkSHA256 && b.AppDillSHA256 == o.AppDillSHA256 &&
-		b.Dart2bytecodeSHA == o.Dart2bytecodeSHA && b.GenSnapshotSHA == o.GenSnapshotSHA
+	bEngineSchema := normalizedDefaultString(b.EngineBundleSchema, engineBundleSchemaV1)
+	oEngineSchema := normalizedDefaultString(o.EngineBundleSchema, engineBundleSchemaV1)
+	return b.Schema == o.Schema && bEngineSchema == oEngineSchema &&
+		b.ReleaseID == o.ReleaseID && b.AppID == o.AppID &&
+		b.FlutterCommit == o.FlutterCommit && b.DartRevision == o.DartRevision &&
+		strings.EqualFold(b.FrameworkSHA256, o.FrameworkSHA256) &&
+		strings.EqualFold(b.Dart2bytecodeSHA, o.Dart2bytecodeSHA) &&
+		strings.EqualFold(b.CompileInterfaceSHA, o.CompileInterfaceSHA) &&
+		strings.EqualFold(b.GenSnapshotSHA, o.GenSnapshotSHA) &&
+		strings.EqualFold(b.AppDillSHA256, o.AppDillSHA256) &&
+		strings.EqualFold(b.PatchableSHA256, o.PatchableSHA256) &&
+		b.Arch == o.Arch && b.BuildMode == o.BuildMode &&
+		b.ToolchainVersion == o.ToolchainVersion && b.Experimental == o.Experimental
 }
 
 // --- patch ios-engine: compile a Dart patch + emit the device-proven static-host bundle ---
@@ -589,19 +638,22 @@ func (b engineLaneBaseline) equals(o engineLaneBaseline) bool {
 // device app (the app fetches the raw manifest.json/manifest.sig/bytecode); it records the engine +
 // app.dill identity the patch was built against, so the bundle is unambiguously an engine-lane patch.
 type engineLaneBundleDescriptor struct {
-	Schema          string `json:"schema"` // soroq.ios_engine.v1
-	Kind            string `json:"kind"`   // ios_engine (explicit; distinct from config_ota_only / runtime_managed_dart)
-	ReleaseID       string `json:"release_id"`
-	AppID           string `json:"app_id"`
-	Version         int    `json:"version"`
-	Index           int    `json:"index"`
-	BytecodeFile    string `json:"bytecode_file"`
-	BytecodeSHA256  string `json:"bytecode_sha256"`
-	FrameworkSHA256 string `json:"framework_sha256"`
-	AppDillSHA256   string `json:"app_dill_sha256"`
-	PubFingerprint  string `json:"public_key_fingerprint"`
-	Experimental    bool   `json:"experimental"`
-	HostURL         string `json:"host_url,omitempty"` // device kHostBase when published via --api
+	Schema              string `json:"schema"` // provenance descriptor schema; device does not consume it
+	Kind                string `json:"kind"`   // ios_engine (explicit; distinct from config_ota_only / runtime_managed_dart)
+	ReleaseID           string `json:"release_id"`
+	AppID               string `json:"app_id"`
+	Version             int    `json:"version"`
+	Index               int    `json:"index"`
+	Indices             []int  `json:"indices,omitempty"`
+	EntrypointContract  string `json:"entrypoint_contract,omitempty"`
+	BytecodeFile        string `json:"bytecode_file"`
+	BytecodeSHA256      string `json:"bytecode_sha256"`
+	FrameworkSHA256     string `json:"framework_sha256"`
+	CompileInterfaceSHA string `json:"flutter_compile_interface_sha256"`
+	AppDillSHA256       string `json:"app_dill_sha256"`
+	PubFingerprint      string `json:"public_key_fingerprint"`
+	Experimental        bool   `json:"experimental"`
+	HostURL             string `json:"host_url,omitempty"` // device kHostBase when published via --api
 }
 
 func runPatchIOSEngine(args []string) error {
@@ -614,19 +666,29 @@ func runPatchIOSEngine(args []string) error {
 	packageConfig := fs.String("package-config", "", "path to .dart_tool/package_config.json for dart2bytecode --packages")
 	patchableManifest := fs.String("patchable-manifest", "", "optional --soroq_manifest patchable-fn list; verified against the baseline when provided")
 	index := fs.Int("index", 0, "patch index within the module (resolved to soroqPatchTable[index] on device)")
+	indicesCSV := fs.String("indices", "", "ADVANCED: comma-separated patch indices from one source library; when neither --index nor --indices is given, every patchable function in --patch is selected")
 	version := fs.Int("version", 0, "manifest version (use a FRESH number per patch; modules load once per process)")
 	bytecodeName := fs.String("bytecode-name", "pv_patch.bytecode", "output bytecode filename inside the bundle")
 	seedBase64 := fs.String("seed-base64", "", "Ed25519 manifest signing seed (base64; NEVER persisted to state/logs/bundles/git)")
 	out := fs.String("out", "", "output dir for the static-host bundle (manifest.json, manifest.sig, <bytecode>); optional when --api is used")
-	allowMissing := fs.Bool("allow-experimental-missing", false, "EXPERIMENTAL: permit a patch that references a symbol absent from the deployed AOT (the item-4 StateError fail-safe path); NOT a generic missing-symbol bypass")
+	allowMissing := fs.Bool("allow-experimental-missing", false, "DEPRECATED diagnostic-mode flag; never bypasses compiler errors and never proves that the immutable base retained a symbol")
 	apiBase := fs.String("api", "", "Soroq API base; publishes the engine bundle through the control plane (kind=ios_engine, served at /v1/engine/{app}/{channel})")
-	runtimeID := fs.String("runtime-id", "", "engine runtime compatibility id for the control-plane patch (required with --api)")
+	runtimeID := fs.String("runtime-id", "", "engine runtime compatibility id bound into the signed manifest (required)")
 	channel := fs.String("channel", "stable", "release channel for the control-plane patch")
 	patchID := fs.String("patch-id", "", "control-plane patch id (required with --api)")
 	rollout := fs.Int("rollout", 100, "initial rollout percentage (1-100) for staged/canary delivery; 100 = all devices, partial buckets by device client id (to pause a published patch to 0%, use the rollout command)")
 	format := fs.String("format", "text", "output format: text or json")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	indexExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "index" {
+			indexExplicit = true
+		}
+	})
+	if indexExplicit && strings.TrimSpace(*indicesCSV) != "" {
+		return errors.New("use either --index or --indices, not both")
 	}
 	required := []struct {
 		name, val string
@@ -646,7 +708,10 @@ func runPatchIOSEngine(args []string) error {
 	if !useAPI && strings.TrimSpace(*out) == "" {
 		return errors.New("provide --out (static-host bundle) and/or --api (publish through the Soroq control plane)")
 	}
-	if useAPI && (strings.TrimSpace(*runtimeID) == "" || strings.TrimSpace(*patchID) == "") {
+	if strings.TrimSpace(*runtimeID) == "" {
+		return errors.New("--runtime-id is required so the signed patch is bound to one base runtime")
+	}
+	if useAPI && strings.TrimSpace(*patchID) == "" {
 		return errors.New("--api requires --runtime-id and --patch-id (the control-plane patch identity)")
 	}
 	if *rollout < 1 || *rollout > 100 {
@@ -713,7 +778,21 @@ func runPatchIOSEngine(args []string) error {
 	}
 	bytecodeFile := filepath.Base(strings.TrimSpace(*bytecodeName))
 	bytecodePath := filepath.Join(workDir, bytecodeFile)
-	if err := compilePatchBytecode(ve, *appDill, *packageConfig, *patchDart, bytecodePath, *allowMissing); err != nil {
+	prepared, err := prepareRuntimePatchSource(runtimePatchSourceRequest{
+		PatchDart:         *patchDart,
+		PackageConfig:     *packageConfig,
+		PatchableManifest: *patchableManifest,
+		Index:             *index,
+		IndexExplicit:     indexExplicit,
+		IndicesCSV:        *indicesCSV,
+	})
+	if err != nil {
+		return err
+	}
+	if prepared.Cleanup != nil {
+		defer prepared.Cleanup()
+	}
+	if err := compilePatchBytecode(ve, *appDill, prepared, bytecodePath, *allowMissing); err != nil {
 		return err
 	}
 	bytecodeSHA, err := sha256File(bytecodePath)
@@ -726,10 +805,16 @@ func runPatchIOSEngine(args []string) error {
 	}
 
 	// 6. build + sign the manifest the device app verifies (top-level bytecodeSha256 + patches[]).
+	manifestPatches := make([]engineLanePatch, 0, len(prepared.Indices))
+	for _, patchIndex := range prepared.Indices {
+		manifestPatches = append(manifestPatches, engineLanePatch{Index: patchIndex, Bytecode: bytecodeFile})
+	}
 	manifest := engineLaneManifest{
-		Version:        *version,
-		BytecodeSha256: bytecodeSHA,
-		Patches:        []engineLanePatch{{Index: *index, Bytecode: bytecodeFile}},
+		Version:            *version,
+		RuntimeID:          strings.TrimSpace(*runtimeID),
+		BytecodeSha256:     bytecodeSHA,
+		EntrypointContract: prepared.EntrypointContract,
+		Patches:            manifestPatches,
 	}
 	manifestBytes, err := json.Marshal(manifest)
 	if err != nil {
@@ -741,18 +826,21 @@ func runPatchIOSEngine(args []string) error {
 	}
 
 	descriptor := engineLaneBundleDescriptor{
-		Schema:          engineBundleSchema,
-		Kind:            "ios_engine",
-		ReleaseID:       baseline.ReleaseID,
-		AppID:           baseline.AppID,
-		Version:         *version,
-		Index:           *index,
-		BytecodeFile:    bytecodeFile,
-		BytecodeSHA256:  bytecodeSHA,
-		FrameworkSHA256: baseline.FrameworkSHA256,
-		AppDillSHA256:   baseline.AppDillSHA256,
-		PubFingerprint:  pubFP,
-		Experimental:    ve.Experimental,
+		Schema:              engineLaneBundleDescriptorSchema,
+		Kind:                "ios_engine",
+		ReleaseID:           baseline.ReleaseID,
+		AppID:               baseline.AppID,
+		Version:             *version,
+		Index:               prepared.Indices[0],
+		Indices:             prepared.Indices,
+		EntrypointContract:  prepared.EntrypointContract,
+		BytecodeFile:        bytecodeFile,
+		BytecodeSHA256:      bytecodeSHA,
+		FrameworkSHA256:     baseline.FrameworkSHA256,
+		CompileInterfaceSHA: baseline.CompileInterfaceSHA,
+		AppDillSHA256:       baseline.AppDillSHA256,
+		PubFingerprint:      pubFP,
+		Experimental:        ve.Experimental,
 	}
 
 	// 7a. static-host bundle (--out): Ed25519-hex sig over the EXACT manifest bytes.
@@ -814,21 +902,49 @@ func runRollbackIOSEngine(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// SEED FROM THE ENVIRONMENT, NOT ARGV. A signing seed passed as a flag is readable by any process
+	// on the machine via `ps`, and lands in shell history. The canonical `soroq rollback ios` therefore
+	// hands it over through SOROQ_ENGINE_SIGNING_SEED instead. The flag stays supported for existing
+	// callers, but the environment is preferred when the flag is absent.
 	if strings.TrimSpace(*seedBase64) == "" {
-		return errors.New("--seed-base64 is required")
+		*seedBase64 = strings.TrimSpace(os.Getenv("SOROQ_ENGINE_SIGNING_SEED"))
+	}
+	if strings.TrimSpace(*seedBase64) == "" {
+		return errors.New("no signing seed: set SOROQ_ENGINE_SIGNING_SEED or pass --seed-base64")
 	}
 	useAPI := strings.TrimSpace(*apiBase) != ""
 	if !useAPI && strings.TrimSpace(*out) == "" {
 		return errors.New("provide --out (static-host bundle) and/or --api (publish through the Soroq control plane)")
 	}
-	if useAPI && (strings.TrimSpace(*appID) == "" || strings.TrimSpace(*releaseID) == "" || strings.TrimSpace(*runtimeID) == "" || strings.TrimSpace(*patchID) == "") {
+	if strings.TrimSpace(*runtimeID) == "" {
+		return errors.New("--runtime-id is required so the signed rollback is bound to one base runtime")
+	}
+	if useAPI && (strings.TrimSpace(*appID) == "" || strings.TrimSpace(*releaseID) == "" || strings.TrimSpace(*patchID) == "") {
 		return errors.New("--api requires --app-id, --release-id, --runtime-id and --patch-id")
 	}
 	// version 0 / empty patches = rollback to base (matches soroq_ota.dart).
-	manifest := engineLaneManifest{Version: 0, BytecodeSha256: "", Patches: []engineLanePatch{}}
+	manifest := engineLaneManifest{Version: 0, RuntimeID: strings.TrimSpace(*runtimeID), BytecodeSha256: "", Patches: []engineLanePatch{}}
 	manifestBytes, err := json.Marshal(manifest)
 	if err != nil {
 		return err
+	}
+	// ASSERT BEFORE SIGNING. A rollback reverts a user's app, so it is as security-sensitive as the
+	// patch it reverts and must be checked before a signature vouches for it -- not after it is
+	// served. This is the single shared assertion (internal/signing); the tree previously had a
+	// second, unused rollback signer that owned these checks while the production path had none.
+	// The binding exists only when publishing through the control plane; a local `--out` emit has no
+	// target to bind to. The manifest SHAPE is asserted in both modes.
+	var rollbackBinding *signing.EngineRollbackBinding
+	if useAPI {
+		rollbackBinding = &signing.EngineRollbackBinding{
+			AppID:     strings.TrimSpace(*appID),
+			Channel:   normalizedDefaultString(*channel, "stable"),
+			ReleaseID: strings.TrimSpace(*releaseID),
+			RuntimeID: strings.TrimSpace(*runtimeID),
+		}
+	}
+	if err := signing.AssertEngineRollbackManifest(manifestBytes, rollbackBinding); err != nil {
+		return fmt.Errorf("refusing to sign a malformed rollback: %w", err)
 	}
 	sigHex, pubFP, err := signEngineManifest(manifestBytes, *seedBase64)
 	if err != nil {
@@ -933,7 +1049,9 @@ func publishEngineBundleViaAPI(apiBase, patchID, appID, releaseID, runtimeID, ch
 	if err := uploadPatchBundleBytes(apiRoot, patch.ID, bundleZip); err != nil {
 		return "", fmt.Errorf("upload engine bundle: %w", err)
 	}
-	return fmt.Sprintf("%s/v1/engine/%s/%s", apiRoot, url.PathEscape(appID), url.PathEscape(resolvedChannel)), nil
+	// apiRoot is the operator/write host. What a DEVICE fetches is the device-serve host, which is a
+	// separate origin on the hosted deployment; returning apiRoot here would advertise a URL that 401s.
+	return serving.EngineChannelURL(apiRoot, url.PathEscape(appID), url.PathEscape(resolvedChannel)), nil
 }
 
 // loadEngineLaneBaseline reads + validates the immutable baseline written by release ios-engine.
@@ -946,8 +1064,15 @@ func loadEngineLaneBaseline(path string) (engineLaneBaseline, error) {
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return b, fmt.Errorf("--baseline: parse: %w", err)
 	}
-	if strings.TrimSpace(b.ReleaseID) == "" || strings.TrimSpace(b.AppDillSHA256) == "" || strings.TrimSpace(b.FrameworkSHA256) == "" {
+	if strings.TrimSpace(b.ReleaseID) == "" || strings.TrimSpace(b.AppDillSHA256) == "" ||
+		strings.TrimSpace(b.FrameworkSHA256) == "" {
 		return b, errors.New("--baseline is missing release_id / framework_sha256 / app_dill_sha256 (regenerate with release ios-engine)")
+	}
+	if b.EngineBundleSchema == "" {
+		b.EngineBundleSchema = engineBundleSchemaV1
+	}
+	if b.Schema == engineLaneBaselineSchema && strings.TrimSpace(b.CompileInterfaceSHA) == "" {
+		return b, errors.New("v2 --baseline is missing flutter_compile_interface_sha256 (regenerate with release ios-engine)")
 	}
 	return b, nil
 }
@@ -955,12 +1080,24 @@ func loadEngineLaneBaseline(path string) (engineLaneBaseline, error) {
 // engineMatchesBaseline refuses to patch unless the engine bundle is byte-identical (by hash) to the
 // one the baseline was registered against — engine SHA skew is rejected, not silently tolerated.
 func engineMatchesBaseline(ve *verifiedEngine, b engineLaneBaseline) error {
+	wantSchema := strings.TrimSpace(b.EngineBundleSchema)
+	if wantSchema == "" {
+		wantSchema = engineBundleSchemaV1
+	}
+	if ve.Manifest.Schema != wantSchema {
+		return fmt.Errorf("engine bundle schema %q does not match registered baseline schema %q", ve.Manifest.Schema, wantSchema)
+	}
 	checks := []struct {
 		field, got, want string
 	}{
 		{"flutter framework", ve.FrameworkSHA, b.FrameworkSHA256},
 		{"dart2bytecode", ve.Manifest.Artifacts["dart2bytecode"], b.Dart2bytecodeSHA},
 		{"gen_snapshot", ve.Manifest.Artifacts["gen_snapshot"], b.GenSnapshotSHA},
+	}
+	if wantSchema == engineBundleSchema {
+		checks = append(checks, struct{ field, got, want string }{
+			"flutter compile interface", ve.Manifest.Artifacts["flutter_compile_interface"], b.CompileInterfaceSHA,
+		})
 	}
 	for _, c := range checks {
 		if !strings.EqualFold(strings.TrimSpace(c.got), strings.TrimSpace(c.want)) {
@@ -970,36 +1107,407 @@ func engineMatchesBaseline(ve *verifiedEngine, b engineLaneBaseline) error {
 	return nil
 }
 
-// compilePatchBytecode runs the bundle's fixed dart2bytecode against the deployed app.dill. A patch
-// that references a symbol absent from the deployed AOT is DEFAULT-REJECTED (the item-4 fail-safe);
-// only the explicit --allow-experimental-missing override (NOT a generic switch) lets it through.
-func compilePatchBytecode(ve *verifiedEngine, appDill, packageConfig, patchDart, outBytecode string, allowMissing bool) error {
+type runtimePatchSourceRequest struct {
+	PatchDart         string
+	PackageConfig     string
+	PatchableManifest string
+	Index             int
+	IndexExplicit     bool
+	IndicesCSV        string
+}
+
+type runtimePatchIdentity struct {
+	Index      int
+	LibraryURI string
+	Class      string
+	Symbol     string
+	SourcePath string
+}
+
+type preparedRuntimePatchSource struct {
+	SourcePath         string
+	CompilerInput      string
+	PackageConfig      string
+	FileSystemScheme   string
+	FileSystemRoots    []string
+	Indices            []int
+	EntrypointContract string
+	Cleanup            func()
+}
+
+const indexedSelectorEntrypointContract = "indexed_selector_v1"
+
+type dartPackageConfig struct {
+	Packages []struct {
+		Name       string `json:"name"`
+		RootURI    string `json:"rootUri"`
+		PackageURI string `json:"packageUri"`
+	} `json:"packages"`
+}
+
+// prepareRuntimePatchSource turns a normal customer patch library into a loadable dynamic module
+// without modifying the customer's file. The VM loader requires a no-arg, named
+// `dynamicModuleEntrypoint`; ordinary app code does not contain one. We append a generated entrypoint
+// to a temporary multi-root overlay under a distinct synthetic library URI, returning a direct
+// index->tear-off selector. The immutable base library stays loaded exactly once and the project
+// checkout remains byte-for-byte untouched.
+func prepareRuntimePatchSource(req runtimePatchSourceRequest) (preparedRuntimePatchSource, error) {
+	var zero preparedRuntimePatchSource
+	patchPath, err := filepath.Abs(strings.TrimSpace(req.PatchDart))
+	if err != nil {
+		return zero, err
+	}
+	packageConfigPath, err := filepath.Abs(strings.TrimSpace(req.PackageConfig))
+	if err != nil {
+		return zero, err
+	}
+	patchBytes, err := os.ReadFile(patchPath)
+	if err != nil {
+		return zero, fmt.Errorf("read --patch: %w", err)
+	}
+	if _, err := os.Stat(packageConfigPath); err != nil {
+		return zero, fmt.Errorf("read --package-config: %w", err)
+	}
+
+	// Advanced legacy modules that already own the runtime entrypoint remain supported. The public
+	// product path never asks a developer to add it; it is synthesized below.
+	hasEntrypoint := strings.Contains(string(patchBytes), "dynamicModuleEntrypoint")
+	manifestPath := strings.TrimSpace(req.PatchableManifest)
+	if manifestPath == "" {
+		if !hasEntrypoint {
+			return zero, errors.New("the patch has no dynamicModuleEntrypoint and no --patchable-manifest was provided; use the public `soroq patch ios --engine` flow so the CLI can generate the runtime entrypoint")
+		}
+		return preparedRuntimePatchSource{
+			SourcePath: patchPath, CompilerInput: patchPath, PackageConfig: packageConfigPath,
+			Indices: []int{req.Index},
+		}, nil
+	}
+
+	identities, projectRoot, err := readRuntimePatchIdentities(manifestPath, packageConfigPath)
+	if err != nil {
+		return zero, err
+	}
+	selected, err := selectRuntimePatchIdentities(identities, patchPath, req)
+	if err != nil {
+		return zero, err
+	}
+	indices := make([]int, 0, len(selected))
+	for _, identity := range selected {
+		indices = append(indices, identity.Index)
+	}
+	libraryURI := selected[0].LibraryURI
+	for _, identity := range selected[1:] {
+		if identity.LibraryURI != libraryURI {
+			return zero, errors.New("one runtime module can currently replace multiple functions only when they are declared in the same Dart library; publish each changed library as a separate patch")
+		}
+	}
+
+	overlayRoot, err := os.MkdirTemp("", "soroq-runtime-patch-overlay-")
+	if err != nil {
+		return zero, err
+	}
+	cleanup := func() { _ = os.RemoveAll(overlayRoot) }
+	relSource, err := filepath.Rel(projectRoot, patchPath)
+	if err != nil || relSource == "." || strings.HasPrefix(relSource, ".."+string(filepath.Separator)) || relSource == ".." {
+		cleanup()
+		return zero, fmt.Errorf("patch source %s is outside the package-config project root %s", patchPath, projectRoot)
+	}
+	// Root the generated overlay under a synthetic segment that no package in the
+	// package_config maps to. This makes the emitted module a LOOSE library whose
+	// URI differs from the base's already-in-dill `package:<app>/<lib>.dart`. Without
+	// the prefix the overlay sits at the package's own lib/ path, so the CFE tries to
+	// recompile the in-dill library (crashing on the double definition) and, even if
+	// it compiled, loadDynamicModule would refuse a module that redeclares an
+	// already-loaded package URI. relSource is preserved under the prefix so the
+	// file's own layout (same-file helpers, parts) resolves consistently.
+	const syntheticSegment = "_soroq_dynamic_module"
+	moduleRel := filepath.Join(syntheticSegment, relSource)
+	overlaySource := filepath.Join(overlayRoot, moduleRel)
+	if err := os.MkdirAll(filepath.Dir(overlaySource), 0o755); err != nil {
+		cleanup()
+		return zero, err
+	}
+	generated := patchBytes
+	if !hasEntrypoint {
+		generated, err = appendRuntimeEntrypoint(patchBytes, selected)
+		if err != nil {
+			cleanup()
+			return zero, err
+		}
+	}
+	if err := os.WriteFile(overlaySource, generated, 0o600); err != nil {
+		cleanup()
+		return zero, err
+	}
+	packageConfigRel, err := filepath.Rel(projectRoot, packageConfigPath)
+	if err != nil || strings.HasPrefix(packageConfigRel, ".."+string(filepath.Separator)) || packageConfigRel == ".." {
+		cleanup()
+		return zero, fmt.Errorf("package config %s is outside project root %s", packageConfigPath, projectRoot)
+	}
+	const scheme = "soroq-patch"
+	virtualPackages := scheme + ":///" + filepath.ToSlash(packageConfigRel)
+	// Compile the replacement functions under a DISTINCT synthetic module library
+	// identity instead of the base's real `package:<app>/<lib>.dart` URI. The base
+	// library is already loaded into the running isolate from --import-dill; a
+	// dynamic module that redeclares that exact URI is refused by the VM's
+	// loadDynamicModule ("library '<uri>' is already loaded"). Redirection is keyed
+	// by the stable soroqPatchTable index (see the app-side activator + selector
+	// contract), so the replacement library's identity is intentionally independent
+	// of the base-function identity — a device-proven property (the single-function
+	// standalone-library control loaded and redirected on-device). Emitting under
+	// `soroq-patch:///<relSource>` keeps the module's imports/typing resolved against
+	// the same package_config + import-dill while giving it a URI absent from the
+	// immutable base, so the loader accepts it.
+	syntheticModuleURI := scheme + ":///" + filepath.ToSlash(moduleRel)
+	return preparedRuntimePatchSource{
+		SourcePath:       overlaySource,
+		CompilerInput:    syntheticModuleURI,
+		PackageConfig:    virtualPackages,
+		FileSystemScheme: scheme,
+		FileSystemRoots:  []string{overlayRoot, projectRoot},
+		Indices:          indices,
+		EntrypointContract: func() string {
+			if hasEntrypoint {
+				return ""
+			}
+			return indexedSelectorEntrypointContract
+		}(),
+		Cleanup: cleanup,
+	}, nil
+}
+
+func readRuntimePatchIdentities(manifestPath, packageConfigPath string) ([]runtimePatchIdentity, string, error) {
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("read --patchable-manifest: %w", err)
+	}
+	configBytes, err := os.ReadFile(packageConfigPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("read --package-config: %w", err)
+	}
+	var cfg dartPackageConfig
+	if err := json.Unmarshal(configBytes, &cfg); err != nil {
+		return nil, "", fmt.Errorf("parse --package-config: %w", err)
+	}
+	configDir := filepath.Dir(packageConfigPath)
+	projectRoot := filepath.Dir(configDir)
+	var identities []runtimePatchIdentity
+	for _, line := range strings.Split(string(manifestBytes), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "::")
+		if len(parts) != 3 || !strings.HasPrefix(parts[0], "package:") ||
+			(parts[1] != "" && !validPatchIdentifier(parts[1])) || !validPatchIdentifier(parts[2]) {
+			return nil, "", fmt.Errorf("invalid patchable identity %q", line)
+		}
+		libraryURI := parts[0]
+		withoutScheme := strings.TrimPrefix(libraryURI, "package:")
+		packageName, packagePath, ok := strings.Cut(withoutScheme, "/")
+		if !ok || packageName == "" || packagePath == "" || strings.Contains(packagePath, "..") {
+			return nil, "", fmt.Errorf("invalid package library URI %q", libraryURI)
+		}
+		var sourcePath string
+		for _, pkg := range cfg.Packages {
+			if pkg.Name != packageName {
+				continue
+			}
+			root, err := resolvePackageConfigPath(configDir, pkg.RootURI)
+			if err != nil {
+				return nil, "", err
+			}
+			packageDir := filepath.Join(root, filepath.FromSlash(pkg.PackageURI))
+			sourcePath = filepath.Clean(filepath.Join(packageDir, filepath.FromSlash(packagePath)))
+			break
+		}
+		if sourcePath == "" {
+			return nil, "", fmt.Errorf("patchable identity %q names package %q, which is absent from --package-config", line, packageName)
+		}
+		identities = append(identities, runtimePatchIdentity{
+			Index: len(identities), LibraryURI: libraryURI, Class: parts[1], Symbol: parts[2], SourcePath: sourcePath,
+		})
+	}
+	if len(identities) == 0 {
+		return nil, "", errors.New("--patchable-manifest contains no identities")
+	}
+	return identities, projectRoot, nil
+}
+
+func resolvePackageConfigPath(configDir, raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("invalid package rootUri %q: %w", raw, err)
+	}
+	if u.IsAbs() {
+		if u.Scheme != "file" {
+			return "", fmt.Errorf("unsupported package rootUri scheme %q", u.Scheme)
+		}
+		return filepath.FromSlash(u.Path), nil
+	}
+	return filepath.Clean(filepath.Join(configDir, filepath.FromSlash(raw))), nil
+}
+
+func selectRuntimePatchIdentities(all []runtimePatchIdentity, patchPath string, req runtimePatchSourceRequest) ([]runtimePatchIdentity, error) {
+	var requested []int
+	if strings.TrimSpace(req.IndicesCSV) != "" {
+		seen := map[int]bool{}
+		for _, raw := range strings.Split(req.IndicesCSV, ",") {
+			i, err := strconv.Atoi(strings.TrimSpace(raw))
+			if err != nil || i < 0 {
+				return nil, fmt.Errorf("invalid --indices value %q", raw)
+			}
+			if !seen[i] {
+				requested = append(requested, i)
+				seen[i] = true
+			}
+		}
+	} else if req.IndexExplicit {
+		requested = []int{req.Index}
+	} else {
+		for _, identity := range all {
+			if sameFile(identity.SourcePath, patchPath) {
+				requested = append(requested, identity.Index)
+			}
+		}
+	}
+	if len(requested) == 0 {
+		return nil, fmt.Errorf("--patch %s does not contain any function listed in --patchable-manifest", patchPath)
+	}
+	selected := make([]runtimePatchIdentity, 0, len(requested))
+	for _, i := range requested {
+		if i < 0 || i >= len(all) {
+			return nil, fmt.Errorf("patch index %d is outside the patchable table (0..%d)", i, len(all)-1)
+		}
+		if !sameFile(all[i].SourcePath, patchPath) {
+			return nil, fmt.Errorf("patch index %d refers to %s, not --patch %s", i, all[i].SourcePath, patchPath)
+		}
+		selected = append(selected, all[i])
+	}
+	return selected, nil
+}
+
+func sameFile(a, b string) bool {
+	aa, errA := filepath.Abs(a)
+	bb, errB := filepath.Abs(b)
+	return errA == nil && errB == nil && filepath.Clean(aa) == filepath.Clean(bb)
+}
+
+func validPatchIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || r == '$' || (i > 0 && r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func appendRuntimeEntrypoint(source []byte, selected []runtimePatchIdentity) ([]byte, error) {
+	if len(selected) == 0 {
+		return nil, errors.New("cannot generate a runtime entrypoint without a selected patchable function")
+	}
+	var b strings.Builder
+	b.Write(source)
+	if len(source) > 0 && source[len(source)-1] != '\n' {
+		b.WriteByte('\n')
+	}
+	b.WriteString("\n// GENERATED BY SOROQ IN A TEMPORARY COMPILER OVERLAY; the customer source is untouched.\n")
+	b.WriteString("@pragma('vm:entry-point')\n@pragma('dyn-module:entry-point')\n")
+	// Return a FUNCTION directly. A collection literal here is not safe: a
+	// tree-shaken AOT base may not have allocate-finalized the dynamic module's
+	// exact generic Map/List instantiation, causing loadModule to fail before the
+	// controller can inspect it. The direct selector tear-off uses the same
+	// runtime representation as the already device-proven one-function contract.
+	b.WriteString("Object? dynamicModuleEntrypoint() => _soroqReplacementForIndex;\n\n")
+	b.WriteString("Object? _soroqReplacementForIndex(int index) {\n")
+	b.WriteString("  switch (index) {\n")
+	for _, identity := range selected {
+		ref := identity.Symbol
+		if identity.Class != "" {
+			ref = identity.Class + "." + identity.Symbol
+		}
+		fmt.Fprintf(&b, "    case %d:\n      return %s;\n", identity.Index, ref)
+	}
+	// No exception allocation here: the immutable base may not retain an
+	// otherwise-unused error constructor. The controller treats null as a
+	// fail-closed selector miss.
+	b.WriteString("    default:\n      return null;\n")
+	b.WriteString("  }\n}\n")
+	return []byte(b.String()), nil
+}
+
+// compilePatchBytecode runs the bundle's fixed dart2bytecode against the deployed app.dill. Compiler
+// diagnostics are rejected. The device loader remains the authoritative retained-symbol gate and must
+// activate transactionally; a compile-time interface can describe APIs that a particular base AOT did
+// not retain, so successful compilation is never claimed as runtime-retention proof.
+func compilePatchBytecode(ve *verifiedEngine, appDill string, patch preparedRuntimePatchSource, outBytecode string, allowMissing bool) error {
 	dartaotruntime := ve.ToolPath("dartaotruntime")
 	dart2bytecode := ve.ToolPath("dart2bytecode")
+	compileInterface := ve.ToolPath("flutter_compile_interface")
 	vmPlatform := ve.ToolPath("vm_platform")
-	for _, p := range []string{dartaotruntime, dart2bytecode, vmPlatform, appDill, packageConfig, patchDart} {
+	inputs := []string{dartaotruntime, dart2bytecode, vmPlatform, appDill, patch.SourcePath}
+	if ve.Manifest.Schema == engineBundleSchema {
+		inputs = append(inputs, compileInterface)
+	} else {
+		compileInterface = ""
+	}
+	for _, p := range inputs {
 		if _, err := os.Stat(p); err != nil {
 			return fmt.Errorf("missing input %s: %w", filepath.Base(p), err)
 		}
 	}
-	cmd := exec.Command(dartaotruntime, dart2bytecode,
-		"--platform", vmPlatform,
-		"--import-dill", appDill,
-		"--packages", packageConfig,
-		"-o", outBytecode,
-		patchDart,
-	)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	cmd := exec.Command(dartaotruntime, patchCompileArgs(
+		dart2bytecode, vmPlatform, appDill, compileInterface, patch, outBytecode,
+	)...)
+	// dart2bytecode/front_end diagnostics are not guaranteed to use stderr.
+	// Capture both streams so a compiler refusal never degrades into an empty
+	// `exit status 254` message for the developer.
+	var diagnostics bytes.Buffer
+	cmd.Stdout = &diagnostics
+	cmd.Stderr = &diagnostics
 	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
+		msg := strings.TrimSpace(diagnostics.String())
 		if isMissingSymbolError(msg) && !allowMissing {
-			return fmt.Errorf("patch references a symbol absent from the deployed AOT (default-reject — this is the item-4 StateError fail-safe). "+
-				"Pass --allow-experimental-missing ONLY to deliberately ship that fail-safe path. dart2bytecode: %s", msg)
+			return fmt.Errorf("patch compiler could not resolve a referenced symbol from the supplied base/interface; compilation was refused. "+
+				"This is distinct from the runtime loader's retained-symbol gate. dart2bytecode: %s", msg)
 		}
 		return fmt.Errorf("dart2bytecode failed: %v: %s", err, msg)
 	}
 	return nil
+}
+
+// runtimePatchImportPrefix is the slash-separated prefix dart2bytecode adds to the
+// import-dill (base) library URIs inside the compiled module, so module references
+// to base libraries stay distinct from the base's already-loaded libraries at
+// load/canonicalization time. Matches the device-proven soroq_redirect harness.
+const runtimePatchImportPrefix = "import/prefix"
+
+func patchCompileArgs(dart2bytecode, vmPlatform, appDill, compileInterface string, patch preparedRuntimePatchSource, outBytecode string) []string {
+	args := []string{dart2bytecode,
+		"--platform", vmPlatform,
+		"--import-dill", appDill,
+	}
+	if strings.TrimSpace(compileInterface) != "" {
+		args = append(args, "--compile-interface", compileInterface)
+	}
+	if patch.FileSystemScheme != "" {
+		args = append(args, "--filesystem-scheme", patch.FileSystemScheme)
+		for _, root := range patch.FileSystemRoots {
+			args = append(args, "--filesystem-root", root)
+		}
+	}
+	// [soroq] Prefix import-dill library URIs in the emitted module so its imported
+	// base-library namespace cannot collide with libraries already loaded in the
+	// isolate. This prevents repeat/in-process module loads from being rejected as
+	// "already loaded". It is an identity/isolation rule, not a const-object hack:
+	// real Flutter nested const widgets are delivered once the immutable base is
+	// built with the matching --dynamic-interface retention contract.
+	args = append(args, "--prefix-library-uris", runtimePatchImportPrefix)
+	return append(args, "--packages", patch.PackageConfig, "-o", outBytecode, patch.CompilerInput)
 }
 
 func isMissingSymbolError(msg string) bool {

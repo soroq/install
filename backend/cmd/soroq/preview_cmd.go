@@ -18,6 +18,7 @@ import (
 
 	androidrelease "soroq/backend/internal/androidrelease"
 	"soroq/backend/internal/domain"
+	"soroq/backend/internal/serving"
 )
 
 type previewAndroidSummary struct {
@@ -69,23 +70,24 @@ platforms:
 }
 
 // previewIOSEngineSummary is the device-equivalent view of the engine lane: exactly what an iOS device
-// fetches from /v1/engine/{app}/{channel}. It reports the served manifest version, whether it is a
+// fetches from /v1/engine/{app}/{channel}?runtime_id=.... It reports the served manifest version, whether it is a
 // version-0 rollback, and (optionally) a device-equivalent signature verification.
 type previewIOSEngineSummary struct {
-	APIBase          string `json:"api_base"`
-	AppID            string `json:"app_id"`
-	Channel          string `json:"channel"`
-	ClientID         string `json:"client_id,omitempty"`
-	Track            string `json:"track,omitempty"`
-	HostBase         string `json:"host_base"`
-	PatchAvailable   bool   `json:"patch_available"`
-	ManifestVersion  int    `json:"manifest_version"`
-	IsRollback       bool   `json:"is_rollback"`
-	BytecodeSha256   string `json:"bytecode_sha256,omitempty"`
-	PatchCount       int    `json:"patch_count"`
-	SignaturePresent bool   `json:"signature_present"`
-	SignatureVerified *bool `json:"signature_verified,omitempty"`
-	Experimental     bool   `json:"experimental"`
+	APIBase           string `json:"api_base"`
+	AppID             string `json:"app_id"`
+	RuntimeID         string `json:"runtime_id"`
+	Channel           string `json:"channel"`
+	ClientID          string `json:"client_id,omitempty"`
+	Track             string `json:"track,omitempty"`
+	HostBase          string `json:"host_base"`
+	PatchAvailable    bool   `json:"patch_available"`
+	ManifestVersion   int    `json:"manifest_version"`
+	IsRollback        bool   `json:"is_rollback"`
+	BytecodeSha256    string `json:"bytecode_sha256,omitempty"`
+	PatchCount        int    `json:"patch_count"`
+	SignaturePresent  bool   `json:"signature_present"`
+	SignatureVerified *bool  `json:"signature_verified,omitempty"`
+	Experimental      bool   `json:"experimental"`
 }
 
 // runPreviewIOSEngine fetches the device-equivalent engine manifest (and its detached sig) and reports
@@ -97,13 +99,14 @@ func runPreviewIOSEngine(args []string) error {
 	fs.SetOutput(os.Stdout)
 	apiBase := fs.String("api", defaultAPIBase(), "control plane base URL (or a local soroqd)")
 	appID := fs.String("app-id", "", "app id")
+	runtimeID := fs.String("runtime-id", "", "immutable base runtime id")
 	channel := fs.String("channel", "stable", "release channel")
 	clientID := fs.String("cid", "", "optional device client id for staged-rollout bucketing")
 	track := fs.String("track", "", "optional patch track to preview")
 	pubkeyHex := fs.String("pubkey-hex", "", "optional 32-byte Ed25519 public key (hex) to replicate the device manifest verify over the served bytes")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq preview ios-engine --app-id com.example.app [--channel stable] [--api http://localhost:8080] [--cid device-123] [--track stable] [--pubkey-hex <ed25519-pub-hex>] [--json]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq preview ios-engine --app-id com.example.app --runtime-id <runtime-id> [--channel stable] [--api http://localhost:8080] [--cid device-123] [--track stable] [--pubkey-hex <ed25519-pub-hex>] [--json]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -115,13 +118,21 @@ func runPreviewIOSEngine(args []string) error {
 	if resolvedAppID == "" {
 		return errors.New("--app-id is required")
 	}
+	resolvedRuntimeID := strings.TrimSpace(*runtimeID)
+	if resolvedRuntimeID == "" {
+		return errors.New("--runtime-id is required")
+	}
 	resolvedChannel := strings.TrimSpace(*channel)
 	if resolvedChannel == "" {
 		resolvedChannel = "stable"
 	}
-	hostBase := strings.TrimRight(*apiBase, "/") + "/v1/engine/" + url.PathEscape(resolvedAppID) + "/" + url.PathEscape(resolvedChannel)
+	// Preview exists to read the EXACT bytes a device reads, and engineGet sends no credentials — so it
+	// must target the device-serve host. Deriving this from the operator/write base would 401 on the
+	// hosted deployment and make preview unusable precisely where it matters.
+	hostBase := serving.EngineChannelURL(*apiBase, url.PathEscape(resolvedAppID), url.PathEscape(resolvedChannel))
 	query := ""
 	q := url.Values{}
+	q.Set("runtime_id", resolvedRuntimeID)
 	if strings.TrimSpace(*clientID) != "" {
 		q.Set("cid", strings.TrimSpace(*clientID))
 	}
@@ -135,6 +146,7 @@ func runPreviewIOSEngine(args []string) error {
 	summary := previewIOSEngineSummary{
 		APIBase:      strings.TrimRight(*apiBase, "/"),
 		AppID:        resolvedAppID,
+		RuntimeID:    resolvedRuntimeID,
 		Channel:      resolvedChannel,
 		ClientID:     strings.TrimSpace(*clientID),
 		Track:        strings.TrimSpace(*track),
@@ -158,6 +170,7 @@ func runPreviewIOSEngine(args []string) error {
 
 	var m struct {
 		Version        int    `json:"version"`
+		RuntimeID      string `json:"runtime_id"`
 		BytecodeSha256 string `json:"bytecodeSha256"`
 		Patches        []struct {
 			Index    int    `json:"index"`
@@ -166,6 +179,13 @@ func runPreviewIOSEngine(args []string) error {
 	}
 	if err := json.Unmarshal(manifestBytes, &m); err != nil {
 		return fmt.Errorf("parse served engine manifest: %w", err)
+	}
+	if m.RuntimeID != resolvedRuntimeID {
+		return fmt.Errorf(
+			"served engine manifest runtime_id %q does not match requested runtime_id %q",
+			m.RuntimeID,
+			resolvedRuntimeID,
+		)
 	}
 	summary.ManifestVersion = m.Version
 	summary.IsRollback = m.Version == 0 && len(m.Patches) == 0
@@ -224,6 +244,7 @@ func reportPreviewIOSEngine(summary previewIOSEngineSummary, jsonOut bool) error
 	}
 	fmt.Fprintln(os.Stdout, "Soroq iOS engine-lane preview (EXPERIMENTAL — Dart-code OTA via the soroq interpreter-in-engine)")
 	fmt.Fprintf(os.Stdout, "app_id: %s\n", summary.AppID)
+	fmt.Fprintf(os.Stdout, "runtime_id: %s\n", summary.RuntimeID)
 	fmt.Fprintf(os.Stdout, "channel: %s\n", summary.Channel)
 	fmt.Fprintf(os.Stdout, "host_base: %s\n", summary.HostBase)
 	fmt.Fprintf(os.Stdout, "patch_available: %s\n", yesNo(summary.PatchAvailable))

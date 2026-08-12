@@ -57,15 +57,18 @@ flutter:
 	}
 	installDir := filepath.Join(dir, ".soroq", "dynamic_modules")
 
-	changed, err := ensurePubspecPathDependency(pubspec, "dynamic_modules", installDir)
+	absInstallDir, err := filepath.Abs(installDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, changed, err := pubspecWithPathDependency(original, "dynamic_modules", absInstallDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !changed {
 		t.Fatalf("expected changed=true on first insert")
 	}
-	got, _ := os.ReadFile(pubspec)
-	text := string(got)
+	_ = pubspec
 
 	absInstall, _ := filepath.Abs(installDir)
 	depBlock := text[strings.Index(text, "dependencies:"):strings.Index(text, "dependency_overrides:")]
@@ -78,8 +81,8 @@ flutter:
 		t.Fatalf("dynamic_modules leaked into dependency_overrides:\n%s", text)
 	}
 
-	// Idempotent: a second call is a no-op.
-	changed2, err := ensurePubspecPathDependency(pubspec, "dynamic_modules", installDir)
+	// Idempotent: a second application is a no-op.
+	_, changed2, err := pubspecWithPathDependency(text, "dynamic_modules", absInstallDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,44 +139,5 @@ func TestAssertManifestMatchesBaseline_Match(t *testing.T) {
 	}
 	if err := assertManifestMatchesBaseline(manifestPath, baselinePath); err != nil {
 		t.Fatalf("expected match, got %v", err)
-	}
-}
-
-// TestEnsureDynamicModulesInstalled_ExtractsAndWires drives the full installer with a stubbed pub get.
-func TestEnsureDynamicModulesInstalled_ExtractsAndWires(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	project := t.TempDir()
-	if err := os.WriteFile(filepath.Join(project, "pubspec.yaml"),
-		[]byte("name: demo_app\n\ndependencies:\n  flutter:\n    sdk: flutter\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	pubGetCalls := 0
-	orig := runFlutterPubGet
-	runFlutterPubGet = func(dir string) error { pubGetCalls++; return nil }
-	defer func() { runFlutterPubGet = orig }()
-
-	installDir, err := ensureDynamicModulesInstalled(project)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(installDir, "lib", "dynamic_modules.dart")); err != nil {
-		t.Fatalf("extracted lib missing: %v", err)
-	}
-	pubspec, _ := os.ReadFile(filepath.Join(installDir, "pubspec.yaml"))
-	if strings.Contains(string(pubspec), "resolution: workspace") {
-		t.Fatalf("extracted pubspec should be sanitized (no workspace resolution)")
-	}
-	if pubGetCalls != 1 {
-		t.Fatalf("expected 1 pub get on first install, got %d", pubGetCalls)
-	}
-
-	// Idempotent second run: version stamp matches, pubspec already wired -> no pub get.
-	if _, err := ensureDynamicModulesInstalled(project); err != nil {
-		t.Fatal(err)
-	}
-	if pubGetCalls != 1 {
-		t.Fatalf("expected no additional pub get on idempotent run, got %d", pubGetCalls)
 	}
 }
