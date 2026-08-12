@@ -240,6 +240,12 @@ func runReleaseAndroid(args []string) error {
 	configureCLIOutput(*verbose, *quiet, *jsonOut)
 	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
+	if err := guardUnverifiedBuildFlags(flutterBuildArgs); err != nil {
+		return err
+	}
+	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
+		return err
+	}
 
 	status, err := inspectProject(*projectDir)
 	if err != nil {
@@ -268,6 +274,7 @@ func runReleaseAndroid(args []string) error {
 	// soroqBuilt is true ONLY when SOROQ ran the build below. On the --artifact bypass (soroq did NOT
 	// build and resolves no toolchain) it stays false, so NO soroq.lock pin is written for that release.
 	soroqBuilt := false
+	var soroqBuildStartedAt time.Time
 	if resolvedArtifactPath == "" && *buildBeforeDiscover {
 		if envErr := androidReleaseEnvGuardFn(resolvedToolchainVersion, flutterBuildArgs); envErr != nil {
 			return envErr
@@ -310,6 +317,7 @@ func runReleaseAndroid(args []string) error {
 				return reportIdempotentRelease(preflight, status.ProjectDir, *jsonOut)
 			}
 		}
+		soroqBuildStartedAt = time.Now()
 		if err := androidReleaseBuildFn(status.ProjectDir, *buildArtifactType, resolvedToolchainVersion, flutterBuildArgs); err != nil {
 			return err
 		}
@@ -321,6 +329,10 @@ func runReleaseAndroid(args []string) error {
 			return errors.New("no Android release artifact found; run `soroq release android` with a working Flutter toolchain or pass --artifact")
 		}
 		if err != nil {
+			return err
+		}
+		// Soroq built; the file it just found must be one THIS build produced.
+		if err := guardStaleDiscoveredArtifact(resolvedArtifactPath, soroqBuildStartedAt); err != nil {
 			return err
 		}
 	}
@@ -476,6 +488,12 @@ func runReleaseIOS(args []string) error {
 	configureCLIOutput(*verbose, *quiet, *jsonOut)
 	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
+	if err := guardUnverifiedBuildFlags(flutterBuildArgs); err != nil {
+		return err
+	}
+	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
+		return err
+	}
 
 	status, err := inspectProject(*projectDir)
 	if err != nil {

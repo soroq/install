@@ -15,9 +15,118 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func catalogArtifactServer(t *testing.T, signer interface {
+	SignToolchainManifest([]byte) (string, error)
+}, missingToolchain bool, compatible bool) (*httptest.Server, catalogDoc) {
+	t.Helper()
+	const frontendVersion = "frontend-I"
+	const toolchainVersion = "toolchain-I"
+	var frontendBytes, toolchainBytes []byte
+	var frontendSig, toolchainSig string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/frontends/" + frontendVersion:
+			w.Write(frontendBytes)
+		case "/v1/frontends/" + frontendVersion + "/manifest.sig":
+			w.Write([]byte(frontendSig))
+		case "/v1/toolchains/" + toolchainVersion:
+			if missingToolchain {
+				http.NotFound(w, r)
+				return
+			}
+			w.Write(toolchainBytes)
+		case "/v1/toolchains/" + toolchainVersion + "/manifest.sig":
+			if missingToolchain {
+				http.NotFound(w, r)
+				return
+			}
+			w.Write([]byte(toolchainSig))
+		case "/archives/frontend", "/archives/toolchain":
+			w.Header().Set("Content-Range", "bytes 0-0/1")
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write([]byte{'x'})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	compat := []string{"other-toolchain"}
+	if compatible {
+		compat = []string{toolchainVersion}
+	}
+	frontendBytes, _ = json.Marshal(frontendManifest{
+		Schema: frontendManifestSchema, SoroqFrontendVersion: frontendVersion,
+		FlutterRevision: expectedFlutterRevision, CompatibleToolchainIDs: compat,
+		Archive: frontendManifestArchive{URL: srv.URL + "/archives/frontend", SHA256: strings.Repeat("a", 64), CompressedBytes: 1},
+	})
+	toolchainBytes, _ = json.Marshal(cliManifest{
+		Schema: toolchainManifestSchema, SoroqToolchainVersion: toolchainVersion,
+		Platform: "ios", Arch: "arm64", BuildMode: "profile", Tier: "experimental_profile",
+		FlutterRevision: expectedFlutterRevision, DartRevision: expectedDartRevision,
+		Archive: cliManifestArchive{URL: srv.URL + "/archives/toolchain", SHA256: strings.Repeat("b", 64), CompressedBytes: 1},
+	})
+	var err error
+	frontendSig, err = signer.SignToolchainManifest(frontendBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolchainSig, err = signer.SignToolchainManifest(toolchainBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, catalogDoc{Schema: catalogSchema, Platforms: map[string]catalogPlatform{
+		"ios": {FrontendVersion: frontendVersion, ToolchainVersion: toolchainVersion},
+	}}
+}
+
+func TestCatalogReferencePreflightVerifiesPairAndArchiveReachability(t *testing.T) {
+	signer := setupTestSigner(t)
+	srv, doc := catalogArtifactServer(t, signer, false, true)
+	got, err := preflightCatalogReferences(srv.URL, doc, []string{"ios"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["ios"].Toolchain.BuildMode != "profile" || got["ios"].Toolchain.Tier != "experimental_profile" {
+		t.Fatalf("verified tier identity lost: %+v", got["ios"].Toolchain)
+	}
+}
+
+func TestCatalogReferencePreflightRefusesMissingToolchainBeforeInstall(t *testing.T) {
+	signer := setupTestSigner(t)
+	srv, doc := catalogArtifactServer(t, signer, true, true)
+	_, err := preflightCatalogReferences(srv.URL, doc, []string{"ios"})
+	if err == nil || !strings.Contains(err.Error(), "toolchain-I") || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("expected missing referenced toolchain refusal, got %v", err)
+	}
+}
+
+func TestCatalogReferencePreflightRefusesUnboundPair(t *testing.T) {
+	signer := setupTestSigner(t)
+	srv, doc := catalogArtifactServer(t, signer, false, false)
+	_, err := preflightCatalogReferences(srv.URL, doc, []string{"ios"})
+	if err == nil || !strings.Contains(err.Error(), "does not declare toolchain") {
+		t.Fatalf("expected frontend/toolchain binding refusal, got %v", err)
+	}
+}
+
+func TestCatalogReferencePreflightRefusesArchiveSizeMismatch(t *testing.T) {
+	signer := setupTestSigner(t)
+	srv, _ := catalogArtifactServer(t, signer, false, true)
+
+	// The fixture server truthfully reports one byte. Re-signing manifests is intentionally avoided here:
+	// exercise the bounded archive probe directly against a signed-size disagreement.
+	err := probeSignedArchive(srv.URL+"/archives/frontend", 2)
+	if err == nil || !strings.Contains(err.Error(), "does not match signed size") {
+		t.Fatalf("expected signed archive-size refusal, got %v", err)
+	}
+}
 
 // TestCatalogClientResolvesValidEntry (case 1) — a properly-signed soroq.catalog.v1 catalog verifies, parses,
 // and resolves a per-platform {frontend_version, toolchain_version} pair via the CLI's own client pipeline.

@@ -260,7 +260,7 @@ func toolchainInstalledChecks() []doctorCheck {
 func toolchainAvailabilityCheck(base, version string) doctorCheck {
 	manifestBytes, err := httpGetBytes(base + "/v1/toolchains/" + url.PathEscape(version))
 	if err != nil {
-		return doctorCheck{Name: "Toolchain availability", Status: "warn",
+		return doctorCheck{Name: "Toolchain availability", Status: "error",
 			Message: fmt.Sprintf("%s not available at %s: %v", version, base, err)}
 	}
 	sigBytes, err := httpGetBytes(base + "/v1/toolchains/" + url.PathEscape(version) + "/manifest.sig")
@@ -279,6 +279,12 @@ func toolchainAvailabilityCheck(base, version string) doctorCheck {
 	if err := checkToolchainIdentity(m); err != nil {
 		return doctorCheck{Name: "Toolchain availability", Status: "warn",
 			Message: fmt.Sprintf("%s available but incompatible: %v", version, err)}
+	}
+	if strings.EqualFold(strings.TrimSpace(m.Platform), "ios") &&
+		(!strings.EqualFold(strings.TrimSpace(m.BuildMode), "release") ||
+			!strings.EqualFold(strings.TrimSpace(m.Tier), "production")) {
+		return doctorCheck{Name: "Toolchain availability", Status: "warn",
+			Message: fmt.Sprintf("%s is signature-valid and compatible, but build_mode=%s tier=%s is experimental and NOT an App-Store-production engine", version, m.BuildMode, m.Tier)}
 	}
 	return doctorCheck{Name: "Toolchain availability", Status: "ok",
 		Message: fmt.Sprintf("%s available + signature-valid + compatible (%s/%s tier=%s)", version, m.Platform, m.Arch, m.Tier)}

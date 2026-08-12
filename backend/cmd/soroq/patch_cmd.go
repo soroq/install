@@ -498,6 +498,12 @@ func runPatchAndroid(args []string) error {
 	configureCLIOutput(*verbose, *quiet, *jsonOut)
 	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
+	if err := guardUnverifiedBuildFlags(flutterBuildArgs); err != nil {
+		return err
+	}
+	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
+		return err
+	}
 	resolvedTrack, resolvedRollout, err := resolvePatchTrackAndRollout(*track, *rollout, flagWasSet(fs, "rollout"))
 	if err != nil {
 		return err
