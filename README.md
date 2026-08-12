@@ -11,7 +11,7 @@ private control-plane/store/S3 code are excluded). From a clean checkout:
 ```bash
 cd backend
 make build        # stamps ./VERSION -> ./soroq + ./soroqctl
-./soroq version   # -> soroq v0.2.5
+./soroq version   # -> soroq v0.2.6
 # or plainly:
 go build ./cmd/soroq
 go build ./cmd/soroqctl
@@ -44,7 +44,7 @@ Then add Soroq to your current shell (the installer also prints your profile fil
 
 ```bash
 export PATH="$HOME/.soroq/bin:$PATH"
-soroq version   # -> soroq v0.2.5
+soroq version   # -> soroq v0.2.6
 ```
 
 The installer detects your OS/CPU, downloads the matching archive from this repo's GitHub
@@ -60,8 +60,8 @@ xattr -dr com.apple.quarantine "$HOME/.soroq/bin/soroq" "$HOME/.soroq/bin/soroqc
 ### Next steps
 
 ```bash
-soroq frontend install soroq-flutter-frontend-f74781f6-6903c161 --api https://api.soroq.dev
-soroq toolchain doctor
+soroq setup --platforms=android,ios
+soroq doctor
 ```
 
 See the docs: <https://soroq.dev/getting-started>.
@@ -86,7 +86,7 @@ Each archive contains `soroq` + `soroqctl`, no secrets, no local paths, no priva
 Pin a version:
 
 ```bash
-SOROQ_INSTALL_VERSION=v0.2.5 sh install.sh
+SOROQ_INSTALL_VERSION=v0.2.6 sh install.sh
 ```
 
 Install somewhere else:

@@ -223,9 +223,10 @@ func runReleaseAndroid(args []string) error {
 	manifestKeyID := fs.String("manifest-key-id", "", "optional manifest signing key id for this release")
 	uploadArtifact := fs.Bool("upload-artifact", true, "upload the APK/AAB to the control plane so future patch commands can run from hosted release state")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
-	verbose := fs.Bool("verbose", false, "stream raw flutter build output (default: quiet; summarized + logged to .soroq/logs)")
+	verbose := fs.Bool("verbose", false, "stream raw Flutter build output (default: phase timeline plus durable log)")
+	quiet := fs.Bool("quiet", false, "suppress build progress while preserving final command output")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq release android [--artifact build/app/outputs/bundle/release/app-release.aab] [--build=false] [--artifact-type aab|apk] [--toolchain <version>] [--project-dir .] [--api https://api.soroq.dev] [--release-id my-release] [--version 1.2.3+45] [--arch arm64-v8a] [--channel stable] [--manifest-key-id prod-primary] [--upload-artifact=true] [--json] [--verbose] [-- <flutter build flags>]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq release android [--artifact build/app/outputs/bundle/release/app-release.aab] [--build=false] [--artifact-type aab|apk] [--toolchain <version>] [--project-dir .] [--api https://api.soroq.dev] [--release-id my-release] [--version 1.2.3+45] [--arch arm64-v8a] [--channel stable] [--manifest-key-id prod-primary] [--upload-artifact=true] [--json] [--verbose|--quiet] [-- <flutter build flags>]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -233,9 +234,11 @@ func runReleaseAndroid(args []string) error {
 		}
 		return err
 	}
-	if *verbose {
-		cliVerboseRequested = true
+	if err := validateCLIOutputFlags(*verbose, *quiet, *jsonOut); err != nil {
+		return err
 	}
+	configureCLIOutput(*verbose, *quiet, *jsonOut)
+	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
 
 	status, err := inspectProject(*projectDir)
@@ -455,10 +458,11 @@ func runReleaseIOS(args []string) error {
 	manifestKeyID := fs.String("manifest-key-id", "", "optional manifest signing key id for this release")
 	build := fs.Bool("build", false, "build the iOS app (.app + app.dill) from the cached Soroq toolchain via flutter build ios --local-engine before/without config registration; requires --toolchain. Analog of `release android --build`.")
 	toolchainVersion := fs.String("toolchain", "", "resolve the iOS engine from the cached toolchain at ~/.soroq/toolchains/<version>/ios (installed by `soroq toolchain install`); required with --build. Consistent with `patch ios-engine --toolchain`.")
-	verbose := fs.Bool("verbose", false, "stream raw flutter build output (default: quiet; summarized + logged to .soroq/logs)")
+	verbose := fs.Bool("verbose", false, "stream raw Flutter build output (default: phase timeline plus durable log)")
+	quiet := fs.Bool("quiet", false, "suppress build progress while preserving final command output")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq release ios [--project-dir .] [--api https://api.soroq.dev] [--release-id my-ios-release] [--version 1.2.3+45] [--runtime-id ios-config-runtime] [--arch arm64] [--channel stable] [--manifest-key-id prod-primary] [--build --toolchain <version>] [--verbose] [--json] [-- <flutter build flags>]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq release ios [--project-dir .] [--api https://api.soroq.dev] [--release-id my-ios-release] [--version 1.2.3+45] [--runtime-id ios-config-runtime] [--arch arm64] [--channel stable] [--manifest-key-id prod-primary] [--build --toolchain <version>] [--verbose|--quiet] [--json] [-- <flutter build flags>]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -466,9 +470,11 @@ func runReleaseIOS(args []string) error {
 		}
 		return err
 	}
-	if *verbose {
-		cliVerboseRequested = true
+	if err := validateCLIOutputFlags(*verbose, *quiet, *jsonOut); err != nil {
+		return err
 	}
+	configureCLIOutput(*verbose, *quiet, *jsonOut)
+	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
 
 	status, err := inspectProject(*projectDir)

@@ -284,34 +284,88 @@ func androidArtifactTypeForCommand(artifactPath string) string {
 }
 
 func runSoroqBuildCommand(cmd *exec.Cmd, projectDir string, label string, platform string) error {
-	if soroqVerboseBuildOutput() {
-		fmt.Fprintln(os.Stderr, label+"...")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
+	started := cliNow()
+	logFile, logPath, err := openSoroqBuildLog(projectDir, platform, cmd.Args)
+	if err != nil {
+		return fmt.Errorf("prepare %s build log: %w", platform, err)
 	}
-
-	fmt.Fprintln(os.Stderr, label+"...")
-	output, err := cmd.CombinedOutput()
-	logPath, logErr := writeSoroqBuildLog(projectDir, platform, cmd.Args, output)
-	for _, line := range summarizeSoroqBuildOutput(output, err == nil) {
-		fmt.Fprintln(os.Stderr, line)
+	progress := startCLIProgress(label)
+	settings := currentCLIOutputSettings()
+	sink := &buildOutputSink{log: logFile, progress: progress, verbose: settings.Verbose}
+	stdout := &redactingLineWriter{sink: sink, stream: os.Stdout}
+	stderr := &redactingLineWriter{sink: sink, stream: os.Stderr}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	runErr := waitForCLICommand(cmd, func() {
+		if cmd.Process == nil {
+			return
+		}
+		_ = cmd.Process.Signal(os.Interrupt)
+	}, func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	stdout.Flush()
+	stderr.Flush()
+	output := sink.output()
+	writeErr := sink.logError()
+	syncErr := logFile.Sync()
+	closeErr := logFile.Close()
+	duration := cliNow().Sub(started).Round(time.Second)
+	if duration < 0 {
+		duration = 0
 	}
-	if err == nil && logErr == nil && logPath != "" {
+	progress.Finish(runErr == nil, "log: "+logPath)
+	for _, line := range summarizeSoroqBuildOutput(output, runErr == nil) {
+		if !settings.Quiet && !settings.JSON && !settings.Verbose {
+			fmt.Fprintln(os.Stderr, line)
+		}
+	}
+	if runErr == nil && !settings.Quiet && !settings.JSON {
 		fmt.Fprintf(os.Stderr, "Build log: %s\n", logPath)
 	}
-	if err != nil {
-		if logErr == nil && logPath != "" {
-			fmt.Fprintf(os.Stderr, "Full build log: %s\n", logPath)
-		}
-		return err
+	if runErr != nil {
+		return fmt.Errorf("build command failed after %s; full log: %s; rerun with --verbose for raw output: %w", duration, logPath, runErr)
+	}
+	if writeErr != nil {
+		return fmt.Errorf("build succeeded but writing build log %s failed: %w", logPath, writeErr)
+	}
+	if syncErr != nil {
+		return fmt.Errorf("build succeeded but syncing build log %s failed: %w", logPath, syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("build succeeded but closing build log %s failed: %w", logPath, closeErr)
 	}
 	return nil
 }
 
+func openSoroqBuildLog(projectDir string, platform string, args []string) (*os.File, string, error) {
+	logsDir := filepath.Join(projectDir, ".soroq", "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		return nil, "", err
+	}
+	platform = strings.TrimSpace(platform)
+	if platform == "" {
+		platform = "build"
+	}
+	logPath := filepath.Join(logsDir, time.Now().UTC().Format("20060102T150405.000000000Z")+"-"+platform+"-build.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(args) > 0 {
+		if _, err := fmt.Fprintf(logFile, "$ %s\n\n", redactCLIText(strings.Join(args, " "))); err != nil {
+			_ = logFile.Close()
+			return nil, "", err
+		}
+	}
+	return logFile, logPath, nil
+}
+
 // cliVerboseRequested is set by a command's --verbose flag. It ORs with the SOROQ_VERBOSE
-// env var so raw subprocess output (flutter / xcode / pub) is streamed either way; default
-// is quiet (summarized + logged to .soroq/logs).
+// env var so raw subprocess output (flutter / xcode / pub) is streamed either way; the
+// default is a phase timeline with redacted output retained in .soroq/logs.
 var cliVerboseRequested bool
 
 func soroqVerboseBuildOutput() bool {
@@ -335,18 +389,18 @@ func writeSoroqBuildLog(projectDir string, platform string, args []string, outpu
 	if platform == "" {
 		platform = "build"
 	}
-	logPath := filepath.Join(logsDir, time.Now().UTC().Format("20060102T150405Z")+"-"+platform+"-build.log")
+	logPath := filepath.Join(logsDir, time.Now().UTC().Format("20060102T150405.000000000Z")+"-"+platform+"-build.log")
 	var builder strings.Builder
 	if len(args) > 0 {
 		builder.WriteString("$ ")
-		builder.WriteString(strings.Join(args, " "))
+		builder.WriteString(redactCLIText(strings.Join(args, " ")))
 		builder.WriteString("\n\n")
 	}
-	builder.Write(output)
+	builder.WriteString(redactCLIText(string(output)))
 	if !strings.HasSuffix(builder.String(), "\n") {
 		builder.WriteByte('\n')
 	}
-	return logPath, os.WriteFile(logPath, []byte(builder.String()), 0o644)
+	return logPath, os.WriteFile(logPath, []byte(builder.String()), 0o600)
 }
 
 func summarizeSoroqBuildOutput(output []byte, success bool) []string {

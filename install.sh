@@ -6,6 +6,7 @@ VERSION="${SOROQ_INSTALL_VERSION:-latest}"
 INSTALL_DIR="${SOROQ_INSTALL_DIR:-$HOME/.soroq/bin}"
 BINARY_NAME="soroq"
 GITHUB_TOKEN_VALUE="${SOROQ_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+BASE_URL_OVERRIDE="${SOROQ_INSTALL_BASE_URL:-}"
 
 # Managed-block markers for the idempotent PATH entry the installer appends to the
 # active shell profile. Do not change these once shipped — re-runs match on them.
@@ -64,7 +65,7 @@ fail() {
   say "${BOLD}What to try next${RESET}" >&2
   say "  - Re-run with verbose curl output: curl -fsSL <install-url> -o install.sh && sh install.sh" >&2
   say "  - Private repo? set SOROQ_GITHUB_TOKEN to a GitHub token that can read ${REPO}" >&2
-  say "  - Pin a version: SOROQ_INSTALL_VERSION=<version> sh install.sh   (e.g. v0.2.5)" >&2
+  say "  - Pin a version: SOROQ_INSTALL_VERSION=<version> sh install.sh   (e.g. v0.2.6)" >&2
   say "  - Change install path: SOROQ_INSTALL_DIR=/usr/local/bin sh install.sh" >&2
   exit 1
 }
@@ -94,15 +95,21 @@ download() {
   output="$2"
   label="$3"
 
+  curl_transport="--proto =https --tlsv1.2"
+  case "$url" in
+    http://127.0.0.1:* | http://localhost:*) curl_transport="" ;;
+    http://*) fail "Refusing insecure download URL outside loopback: $url" ;;
+  esac
+
   if command -v curl >/dev/null 2>&1; then
     if [ -n "$GITHUB_TOKEN_VALUE" ]; then
-      if ! curl --proto '=https' --tlsv1.2 -fsSL \
+      if ! curl $curl_transport -fsSL \
         -H "Authorization: Bearer $GITHUB_TOKEN_VALUE" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         "$url" -o "$output"; then
         fail "Could not download $label from $url. Check that the release exists and your GitHub token can read ${REPO}."
       fi
-    elif ! curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$output"; then
+    elif ! curl $curl_transport -fsSL "$url" -o "$output"; then
       fail "Could not download $label from $url. Check that the release exists and your network can reach GitHub."
     fi
   elif command -v wget >/dev/null 2>&1; then
@@ -394,7 +401,9 @@ case "$os" in
   *) fail "The Soroq CLI ships macOS (darwin) and Linux binaries for the hard-OTA beta. '$os' is not supported yet (Windows is pending). See https://github.com/soroq/install for current status." ;;
 esac
 
-if [ "$VERSION" = "latest" ]; then
+if [ -n "$BASE_URL_OVERRIDE" ]; then
+  base_url="${BASE_URL_OVERRIDE%/}"
+elif [ "$VERSION" = "latest" ]; then
   base_url="https://github.com/${REPO}/releases/latest/download"
 else
   base_url="https://github.com/${REPO}/releases/download/${VERSION}"
@@ -546,4 +555,4 @@ if [ "$GLOBAL_LINK_DIR" != "/usr/local/bin" ]; then
 fi
 
 say ""
-say "${DIM}Next: soroq frontend install soroq-flutter-frontend-f74781f6-6903c161 --api https://api.soroq.dev  then  soroq toolchain doctor${RESET}"
+say "${DIM}Next: soroq setup --platforms=android,ios  then  soroq doctor${RESET}"
