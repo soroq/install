@@ -23,6 +23,14 @@ import (
 // can stub the SOROQ build step and exercise the soroq.lock pin-write path without a real Flutter build.
 var androidReleaseBuildFn = runFlutterAndroidReleaseBuild
 
+// androidReleaseEnvGuardFn resolves the Android engine source WITHOUT touching the network, so a
+// broken toolchain still fails before any control-plane request. The duplicate-release preflight sits
+// behind it: a developer with no usable engine must hear about the engine, not about a release id.
+var androidReleaseEnvGuardFn = func(toolchainVersion string, flutterPassthroughArgs []string) error {
+	_, err := resolveAndroidEngineSource(toolchainVersion, flutterPassthroughArgs)
+	return err
+}
+
 type releaseAndroidSummary struct {
 	ProjectDir      string                      `json:"project_dir"`
 	Snapshot        *androidrelease.Snapshot    `json:"snapshot"`
@@ -47,6 +55,21 @@ func runRelease(args []string) error {
 	if len(args) == 0 {
 		releaseUsage()
 		return errAlreadyPrinted
+	}
+
+	// CANONICAL multi-platform form: `soroq release --platforms=android,ios`. Checked before the
+	// positional switch so the platform-specific subcommands stay exactly as they were.
+	if platforms, rest, err := parsePlatforms(args); err != nil {
+		return err
+	} else if len(platforms) > 0 {
+		// Refuse an ambiguous combined invocation BEFORE any lane starts, so a rejected command
+		// leaves nothing built and nothing registered.
+		if err := validateCombinedPlatformFlags("release", platforms, rest); err != nil {
+			return err
+		}
+		return runPerPlatform("release", platforms, func(p string) error {
+			return releasePlatform(p, rest)
+		})
 	}
 
 	switch args[0] {
@@ -81,7 +104,8 @@ func runRelease(args []string) error {
 }
 
 func releaseUsage() {
-	fmt.Fprintln(os.Stdout, `usage: soroq release <platform> [flags]
+	fmt.Fprintln(os.Stdout, `usage: soroq release --platforms=android,ios                (canonical)
+   or: soroq release <platform> [flags]                     (platform-specific)
 
 platforms:
   android  register a built Android APK/AAB as a Soroq release
@@ -242,6 +266,47 @@ func runReleaseAndroid(args []string) error {
 	// build and resolves no toolchain) it stays false, so NO soroq.lock pin is written for that release.
 	soroqBuilt := false
 	if resolvedArtifactPath == "" && *buildBeforeDiscover {
+		if envErr := androidReleaseEnvGuardFn(resolvedToolchainVersion, flutterBuildArgs); envErr != nil {
+			return envErr
+		}
+		// Check the control plane BEFORE spending ten to fifteen minutes in Gradle. A duplicate
+		// release cannot be accepted no matter how long the build takes, and the two ways out
+		// (reuse it, or bump the version) are both cheaper to describe now than after the wait.
+		if preflightConfig, cfgErr := resolveProjectCommandConfig(status, channelOverrideForPreflight(fs, *channel)); cfgErr == nil {
+			preflightVersion := strings.TrimSpace(*version)
+			if preflightVersion == "" {
+				preflightVersion, _ = inferFlutterProjectVersion(filepath.Join(status.ProjectDir, "pubspec.yaml"))
+			}
+			preflight := preflightRelease(
+				releasePreflightInputs{
+					AppID:     preflightConfig.AppID,
+					Channel:   preflightConfig.Channel,
+					Platform:  "android",
+					Version:   preflightVersion,
+					Arch:      strings.TrimSpace(*arch),
+					ReleaseID: strings.TrimSpace(*releaseID),
+				},
+				releasePreflightDeps{
+					ListReleases: func(appID string) ([]domain.Release, error) {
+						return getJSONDecode[[]domain.Release](strings.TrimRight(*apiBase, "/") +
+							"/v1/releases?app_id=" + url.QueryEscape(appID))
+					},
+					HostedArtifactDigest: func(id string) string {
+						return hostedReleaseArtifactDigest(*apiBase, id)
+					},
+					LocalSnapshotDigest: func(id string) string {
+						return localReleaseSnapshotDigest(status.ProjectDir, id)
+					},
+				})
+			switch preflight.Verdict {
+			case releasePreflightConflict:
+				return releaseConflictError(preflight, status.ProjectDir)
+			case releasePreflightIdempotent:
+				// Nothing to do: the control plane already holds these exact bytes. Report it as a
+				// success rather than rebuilding an artifact that would be discarded.
+				return reportIdempotentRelease(preflight, status.ProjectDir, *jsonOut)
+			}
+		}
 		if err := androidReleaseBuildFn(status.ProjectDir, *buildArtifactType, resolvedToolchainVersion, flutterBuildArgs); err != nil {
 			return err
 		}
@@ -281,6 +346,11 @@ func runReleaseAndroid(args []string) error {
 	if strings.TrimSpace(snapshot.Metadata.Soroq.RuntimeID) == "" {
 		return fmt.Errorf("artifact %s is missing bundled soroq.runtime_id metadata", snapshot.Artifact.Path)
 	}
+	// The shipped trust anchor and runtime id must be the ones this project currently defines --
+	// Flutter's asset cache can otherwise carry a stale soroq_metadata.json into the artifact.
+	if err := verifyArtifactMetadataMatchesProject(status.ProjectDir, snapshot); err != nil {
+		return err
+	}
 
 	resolvedVersion, err := resolveReleaseVersion(snapshot.Metadata, *version)
 	if err != nil {
@@ -295,9 +365,10 @@ func runReleaseAndroid(args []string) error {
 		resolvedReleaseID = defaultReleaseID(projectConfig.AppID, resolvedVersion, resolvedArch)
 	}
 	resolvedManifestKeyID := strings.TrimSpace(*manifestKeyID)
-	if resolvedManifestKeyID == "" {
-		resolvedManifestKeyID = firstManifestSigningKeyID(snapshot.Metadata)
-	}
+	// Bundled manifest_trust keys are app/device verification keys. They are not
+	// necessarily members of the control plane's manifest-signing keyring. When
+	// the caller does not explicitly select a server key, leave this empty and
+	// let the control plane resolve its configured default.
 
 	req := domain.CreateReleaseRequest{
 		ID:                   resolvedReleaseID,
@@ -322,7 +393,7 @@ func runReleaseAndroid(args []string) error {
 		}
 		releaseArtifact = &artifact
 	}
-	if err := rememberAndroidRelease(status.ProjectDir, *apiBase, snapshot, release, resolvedManifestKeyID); err != nil {
+	if err := rememberAndroidRelease(status.ProjectDir, *apiBase, snapshot, release); err != nil {
 		return err
 	}
 	// P3: pin the toolchain that built this release into the committed project-root soroq.lock, but
@@ -454,7 +525,7 @@ func runReleaseIOS(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := rememberIOSRelease(status.ProjectDir, *apiBase, release, strings.TrimSpace(*manifestKeyID)); err != nil {
+	if err := rememberIOSRelease(status.ProjectDir, *apiBase, release); err != nil {
 		return err
 	}
 
@@ -499,7 +570,7 @@ func defaultIOSConfigRuntimeID(appID string, channel string) string {
 	return slugifyReleaseID("ios-config-v1-" + strings.TrimSpace(appID) + "-" + strings.TrimSpace(channel))
 }
 
-func rememberIOSRelease(projectDir string, apiBase string, release domain.Release, manifestKeyID string) error {
+func rememberIOSRelease(projectDir string, apiBase string, release domain.Release) error {
 	state, err := loadProjectCLIState(projectDir)
 	if err != nil {
 		return err
@@ -513,7 +584,7 @@ func rememberIOSRelease(projectDir string, apiBase string, release domain.Releas
 		RuntimeID:            release.RuntimeID,
 		Version:              release.Version,
 		Arch:                 release.Arch,
-		ManifestSigningKeyID: manifestKeyID,
+		ManifestSigningKeyID: strings.TrimSpace(release.ManifestSigningKeyID),
 	}
 	return saveProjectCLIState(projectDir, state)
 }
@@ -636,7 +707,7 @@ func preferredAndroidABI(abis []string) string {
 	return abis[0]
 }
 
-func rememberAndroidRelease(projectDir string, apiBase string, snapshot *androidrelease.Snapshot, release domain.Release, manifestKeyID string) error {
+func rememberAndroidRelease(projectDir string, apiBase string, snapshot *androidrelease.Snapshot, release domain.Release) error {
 	state, err := loadProjectCLIState(projectDir)
 	if err != nil {
 		return err
@@ -655,7 +726,7 @@ func rememberAndroidRelease(projectDir string, apiBase string, snapshot *android
 		Version:              release.Version,
 		Arch:                 release.Arch,
 		ArtifactPath:         stashedArtifactPath,
-		ManifestSigningKeyID: manifestKeyID,
+		ManifestSigningKeyID: strings.TrimSpace(release.ManifestSigningKeyID),
 	}
 	return saveProjectCLIState(projectDir, state)
 }

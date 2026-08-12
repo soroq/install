@@ -43,3 +43,21 @@ bool soroqRedirectToPatch(
 /// [soroq] Path A — roll back a redirected function to its original AOT body.
 bool soroqRollbackPatch(Object baseReceiver, Object baseFunction) =>
     internal.soroqRollbackPatch(baseReceiver, baseFunction);
+
+/// [soroq] Freehand — apply a transactional desired-state TRANSITION of redirect
+/// slots by STABLE IDENTITY (no tear-off, no customer-object construction; instance
+/// methods, getters/setters/operators supported).
+///
+/// [newFlatSpecs] is a fixed-length `List<String>` of N base->patch redirects to SET
+/// (8 fields/spec); [staleFlatBaseIds] is a fixed-length `List<String>` of M base
+/// slots to CLEAR (4 fields/id). Class fields are empty for a top-level declaration;
+/// VM member names are exact (`build`, `get:label`, `+`); kinds are `function` /
+/// `static-method` / `instance-member`. All new + stale identities are validated and
+/// duplicate/overlapping ids rejected before any slot changes; on any failure it
+/// throws (zero slots changed). Clears stale then sets new under one program-lock
+/// transaction. Returns the number of new redirects committed. Call after
+/// [loadModuleFromBytes] has registered the module's library. Covers activate (empty
+/// stale), rollback (empty new), warm v1->v2 (new=v2, stale=v1-v2). OTA infrastructure.
+int soroqTransitionBatchByIdentity(
+        List<String> newFlatSpecs, List<String> staleFlatBaseIds) =>
+    internal.soroqTransitionBatchByIdentity(newFlatSpecs, staleFlatBaseIds);

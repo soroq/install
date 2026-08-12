@@ -143,6 +143,72 @@ func TestDetectCodePatchAssetDrift_PureCodeChange_NoDrift(t *testing.T) {
 	}
 }
 
+// Dependency-add root cause: adding a Dart dependency (e.g. riverpod) with NO `flutter: assets:`
+// changes ONLY the generated NOTICES.Z license aggregation (Flutter concatenates every dep's LICENSE)
+// plus libapp.so. NOTICES.Z is license metadata for the About>Licenses screen, not a widget-rendered
+// asset, so this must NOT count as drift — otherwise every dependency-bearing code patch is refused.
+func TestDetectCodePatchAssetDrift_LicenseMetadataOnly_NoDrift(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	base := filepath.Join(tempDir, "base.apk")
+	candidate := filepath.Join(tempDir, "candidate.apk")
+	metadata := metadataForGuard()
+	writeArtifactZip(t, base, map[string]string{
+		"assets/flutter_assets/soroq/soroq_metadata.json": metadata,
+		"assets/flutter_assets/NOTICES.Z":                 "base-aggregated-licenses",
+		"lib/arm64-v8a/libapp.so":                         "base-libapp",
+	})
+	writeArtifactZip(t, candidate, map[string]string{
+		"assets/flutter_assets/soroq/soroq_metadata.json": metadata,
+		"assets/flutter_assets/NOTICES.Z":                 "candidate-licenses-now-includes-riverpod",
+		"lib/arm64-v8a/libapp.so":                         "candidate-libapp-with-riverpod",
+	})
+
+	drift, err := DetectCodePatchAssetDrift(base, candidate)
+	if err != nil {
+		t.Fatalf("DetectCodePatchAssetDrift() error = %v", err)
+	}
+	if drift.HasDrift() {
+		t.Fatalf("a NOTICES.Z-only (dependency-add) change must NOT be asset drift, got %v", drift.Paths())
+	}
+}
+
+// The license carve-out must NOT mask a REAL asset shipped by (or alongside) the new dependency: a
+// changed NOTICES.Z next to a genuine new image/font must still be refused, naming the real asset.
+func TestDetectCodePatchAssetDrift_LicenseMetadataPlusRealAsset_StillDrifts(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	base := filepath.Join(tempDir, "base.apk")
+	candidate := filepath.Join(tempDir, "candidate.apk")
+	metadata := metadataForGuard()
+	writeArtifactZip(t, base, map[string]string{
+		"assets/flutter_assets/soroq/soroq_metadata.json": metadata,
+		"assets/flutter_assets/NOTICES.Z":                 "base-licenses",
+		"lib/arm64-v8a/libapp.so":                         "base-libapp",
+	})
+	writeArtifactZip(t, candidate, map[string]string{
+		"assets/flutter_assets/soroq/soroq_metadata.json":  metadata,
+		"assets/flutter_assets/NOTICES.Z":                  "candidate-licenses",
+		"assets/flutter_assets/packages/some_pkg/logo.png": "real-new-package-image",
+		"assets/flutter_assets/AssetManifest.json":         `{"packages/some_pkg/logo.png":["packages/some_pkg/logo.png"]}`,
+		"lib/arm64-v8a/libapp.so":                          "candidate-libapp",
+	})
+
+	drift, err := DetectCodePatchAssetDrift(base, candidate)
+	if err != nil {
+		t.Fatalf("DetectCodePatchAssetDrift() error = %v", err)
+	}
+	if !drift.HasDrift() {
+		t.Fatalf("a real package image alongside NOTICES.Z must still drift")
+	}
+	if !containsPath(drift.Paths(), "packages/some_pkg/logo.png") {
+		t.Fatalf("expected the real package image in drift paths, got %v", drift.Paths())
+	}
+	if containsPath(drift.Paths(), "NOTICES.Z") {
+		t.Fatalf("NOTICES.Z must not be reported as drift, got %v", drift.Paths())
+	}
+}
+
 func containsPath(paths []string, substr string) bool {
 	for _, p := range paths {
 		if strings.Contains(p, substr) {

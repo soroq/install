@@ -72,6 +72,9 @@ func TestReleaseAndroidWithoutToolchainPinsActiveToolchainAtProjectRoot(t *testi
 	// Stub the SOROQ build so no real Flutter run happens; it writes a discoverable candidate artifact
 	// and captures the toolchain it was invoked with (must be the active.json default).
 	var builtWithToolchain string
+	prevGuard := androidReleaseEnvGuardFn
+	androidReleaseEnvGuardFn = func(string, []string) error { return nil }
+	t.Cleanup(func() { androidReleaseEnvGuardFn = prevGuard })
 	prevBuild := androidReleaseBuildFn
 	androidReleaseBuildFn = func(pd string, artifactType string, toolchainVersion string, extraArgs []string) error {
 		builtWithToolchain = toolchainVersion
@@ -89,6 +92,10 @@ func TestReleaseAndroidWithoutToolchainPinsActiveToolchainAtProjectRoot(t *testi
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/releases":
+			// Duplicate-release preflight: this project has published nothing yet.
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]domain.Release{})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
 			var req domain.CreateReleaseRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -167,6 +174,10 @@ func TestReleaseAndroidArtifactBypassWritesNoPin(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/releases":
+			// Duplicate-release preflight: this project has published nothing yet.
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]domain.Release{})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/releases":
 			var req domain.CreateReleaseRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)

@@ -153,20 +153,35 @@ func runReleaseIOSEngineBuild(args []string) error {
 	if err := requireIOSEngineEnabled(projectDir); err != nil {
 		return err
 	}
+	// [soroq] freehand: engine enabled but NO ios_engine.patchable list -> automatic discovery via the
+	// patched frontend's build-DAG target (no lib/ scaffold, no hand-listed functions). Indexed/manual
+	// bases (with a patchable list) fall through to the existing scaffolded flow below.
+	if freehand, ferr := isFreehandIOSBuild(projectDir); ferr != nil {
+		return ferr
+	} else if freehand {
+		return runReleaseIOSEngineBuildFreehand(head, passthrough, projectDir, toolchain)
+	}
 	// Self-heal a missing manifest_trust before scaffolding/building so a fresh iOS engine-lane build
 	// never fails with the fork's `Expected soroq.yaml to define "manifest_trust"`. Idempotent: a valid
 	// existing block is preserved untouched; an invalid one surfaces an actionable error.
 	if _, err := ensureManifestTrust(projectDir); err != nil {
 		return err
 	}
-	if _, err := ensureDynamicModulesInstalled(projectDir); err != nil {
-		return fmt.Errorf("install dynamic_modules: %w", err)
+	// Resolve Soroq's own packages in an isolated workspace. The customer's pubspec.yaml and
+	// pubspec.lock are never touched; only .dart_tool/package_config.json (build output) is written.
+	if _, err := prepareSoroqBuildResolution(projectDir); err != nil {
+		return fmt.Errorf("prepare Soroq build resolution: %w", err)
 	}
 	manifestPath, err := generateIOSEngineScaffold(projectDir)
 	if err != nil {
 		return fmt.Errorf("generate iOS engine scaffold: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "soroq release ios --engine --build: generated %s + lib/soroq_patch_table.g.dart + lib/soroq_activator.dart\n", manifestPath)
+	dynamicInterfacePath, err := generateIOSEngineDynamicInterface(projectDir)
+	if err != nil {
+		return fmt.Errorf("generate iOS engine dynamic interface: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "soroq release ios --engine --build: generated %s + lib/soroq_patch_table.g.dart + lib/soroq_activator.dart + %s\n", manifestPath, dynamicInterfacePath)
+	passthrough = iosEngineBuildPassthrough(dynamicInterfacePath, passthrough)
 
 	appDill, buildErr := buildIOSAppDill(projectDir, toolchain, passthrough)
 	if appDill == "" {
@@ -191,6 +206,15 @@ func runReleaseIOSEngineBuild(args []string) error {
 	return runEngineLaneDelegate("release", delegateArgs)
 }
 
+// iosEngineBuildPassthrough puts Soroq's base-retention contract before any
+// developer-supplied Flutter options. Returning a fresh slice avoids mutating
+// the caller's arguments and makes the exact public-CLI wiring testable.
+func iosEngineBuildPassthrough(dynamicInterfacePath string, developerArgs []string) []string {
+	out := make([]string, 0, len(developerArgs)+1)
+	out = append(out, "--extra-front-end-options=--dynamic-interface="+dynamicInterfacePath)
+	return append(out, developerArgs...)
+}
+
 // runPatchIOSEngineScaffolded implements `soroq patch ios --engine`: regenerate the patchable manifest
 // from the CURRENT soroq.yaml, REQUIRE it byte-matches the base release's manifest (recorded as
 // patchable_manifest_sha256 in the baseline), then delegate to soroqctl forwarding the regenerated
@@ -204,8 +228,26 @@ func runPatchIOSEngineScaffolded(args []string) error {
 	if err := requireIOSEngineEnabled(projectDir); err != nil {
 		return err
 	}
-	if _, err := ensureDynamicModulesInstalled(projectDir); err != nil {
-		return fmt.Errorf("install dynamic_modules: %w", err)
+	// Resolve Soroq's own packages in an isolated workspace BEFORE dispatching, because both flows
+	// compile against the result. The customer's pubspec.yaml and pubspec.lock are never touched; only
+	// .dart_tool/package_config.json and Soroq's own pinned lock (under .soroq/) are written.
+	//
+	// The freehand branch used to return before reaching this, so a freehand patch compiled against
+	// whatever package_config happened to be in the project. After a developer ran `flutter pub get` --
+	// which repoints package_config at THEIR Flutter -- the candidate was compiled with their framework
+	// sources against the toolchain's dart:ui, and the patch failed with a wall of errors from inside
+	// Flutter's own semantics.dart ("SemanticsFlags has no getter hasCheckedState"). Nothing in that
+	// output pointed at the real cause, and re-running the release could not fix it because the baseline
+	// is immutable.
+	if _, err := prepareSoroqBuildResolution(projectDir); err != nil {
+		return fmt.Errorf("prepare Soroq build resolution: %w", err)
+	}
+	// [soroq] freehand: engine enabled but NO ios_engine.patchable list -> automatic kernel-diff patch
+	// flow (no scaffold, no lib/ files). Indexed/manual bases fall through to the existing scaffolded flow.
+	if freehand, ferr := isFreehandIOSBuild(projectDir); ferr != nil {
+		return ferr
+	} else if freehand {
+		return runPatchIOSEngineFreehand(head, passthrough, projectDir)
 	}
 	manifestPath, err := generateIOSEngineScaffold(projectDir)
 	if err != nil {
@@ -337,6 +379,37 @@ func runEngineLaneDelegate(verb string, args []string) error {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			// soroqctl already printed the diagnostic; surface a non-zero exit without double-printing.
+			return errAlreadyPrinted
+		}
+		return fmt.Errorf("invoke soroqctl: %w", err)
+	}
+	return nil
+}
+
+// runEngineLaneDelegateWithEnv is runEngineLaneDelegate plus extra environment entries, so a secret can
+// reach the delegate WITHOUT passing through argv. argv is world-readable via `ps` and lands in shell
+// history; a child's environment is not listed by default. Used by the canonical rollback to hand over
+// the project signing seed.
+//
+// `args` here already begins with "ios-engine", matching how callers construct the delegated command.
+func runEngineLaneDelegateWithEnv(verb string, args []string, extraEnv []string) error {
+	bin, err := resolveSoroqctl()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(bin, append([]string{verb}, args...)...)
+	// Strip "ios-engine" before deriving the base env, so it sees the same flag list as the plain path.
+	flagArgs := args
+	if len(flagArgs) > 0 && flagArgs[0] == "ios-engine" {
+		flagArgs = flagArgs[1:]
+	}
+	cmd.Env = append(engineLaneDelegateEnv(flagArgs), extraEnv...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			return errAlreadyPrinted
 		}
 		return fmt.Errorf("invoke soroqctl: %w", err)

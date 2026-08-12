@@ -7,9 +7,13 @@ package main
 // NOT on pub.dev (publish_to: none) and only compiles against the SOROQ-patched dart-sdk the hosted
 // toolchain provides. To make a fresh developer buildable WITHOUT a repo checkout or a repo-relative
 // path dependency, the CLI ships the package's load-bearing source EMBEDDED in the binary and extracts
-// it to a stable per-user absolute path (~/.soroq/dynamic_modules), then wires it into the app's
-// pubspec.yaml as a PLAIN dependency (never a dependency_override; absolute path so it resolves from
-// any working directory). The developer never configures this.
+// it to a stable per-user path (~/.soroq/dynamic_modules), content-addressed by the embedded source sha.
+//
+// It is made RESOLVABLE by soroq_package_config.go, which resolves it in a throwaway workspace and
+// installs the result as build output. This file used to wire it into the customer's pubspec.yaml
+// instead; that put a machine-specific absolute path into a committed file and rewrote pubspec.lock,
+// which left the developer's own Flutter unable to resolve the project. Nothing here touches the
+// customer's pubspec any more — pubspecWithPathDependency is applied only to the workspace COPY.
 //
 // Embed scope: only lib/dynamic_modules.dart (the sole consumed source; the package's test/ + bin/
 // trees are build-time fixtures for the package itself and are intentionally excluded to keep the CLI
@@ -20,9 +24,7 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
-	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -46,23 +48,6 @@ environment:
   sdk: '^3.12.0-0'
 `
 
-// runFlutterPubGet runs `flutter pub get` in projectDir. Overridable in tests.
-var runFlutterPubGet = func(projectDir string) error {
-	flutterBin, err := resolveSoroqFlutterBin()
-	if err != nil {
-		if path, lookErr := exec.LookPath("flutter"); lookErr == nil {
-			flutterBin = path
-		} else {
-			return fmt.Errorf("flutter not found for `flutter pub get`; install Flutter or run it manually in %s: %w", projectDir, err)
-		}
-	}
-	cmd := exec.Command(flutterBin, "pub", "get")
-	cmd.Dir = projectDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
 func embeddedDynamicModulesLib() ([]byte, error) {
 	return embeddedDynamicModulesFS.ReadFile(embeddedDynamicModulesLibPath)
 }
@@ -83,39 +68,6 @@ func dynamicModulesInstallDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".soroq", "dynamic_modules"), nil
-}
-
-// ensureDynamicModulesInstalled extracts the embedded dynamic_modules package to ~/.soroq/dynamic_modules
-// (idempotent: skipped when the on-disk version stamp already matches the embedded lib sha) and ensures
-// the app pubspec at projectDir has a PLAIN `dependencies: dynamic_modules: {path: <abs>}` entry, then
-// runs `flutter pub get` when anything changed. Returns the absolute install dir.
-func ensureDynamicModulesInstalled(projectDir string) (string, error) {
-	installDir, err := dynamicModulesInstallDir()
-	if err != nil {
-		return "", err
-	}
-	embeddedSHA, err := embeddedDynamicModulesLibSHA256()
-	if err != nil {
-		return "", err
-	}
-
-	extracted, err := extractDynamicModulesIfStale(installDir, embeddedSHA)
-	if err != nil {
-		return "", err
-	}
-
-	pubspecPath := filepath.Join(projectDir, "pubspec.yaml")
-	changed, err := ensurePubspecPathDependency(pubspecPath, "dynamic_modules", installDir)
-	if err != nil {
-		return "", err
-	}
-
-	if extracted || changed {
-		if err := runFlutterPubGet(projectDir); err != nil {
-			return "", fmt.Errorf("flutter pub get after wiring dynamic_modules: %w", err)
-		}
-	}
-	return installDir, nil
 }
 
 // extractDynamicModulesIfStale writes the embedded package to installDir when the version stamp is
@@ -143,33 +95,6 @@ func extractDynamicModulesIfStale(installDir, embeddedSHA string) (bool, error) 
 		return false, err
 	}
 	if err := os.WriteFile(stampPath, []byte(embeddedSHA+"\n"), 0o644); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// ensurePubspecPathDependency guarantees the app pubspec has a PLAIN path dependency
-// `<depName>:\n    path: <absPath>` under the top-level `dependencies:` map (never under
-// dependency_overrides). Idempotent: returns changed=false when it is already present with the same
-// absolute path. It edits the raw text to preserve the rest of the pubspec verbatim.
-func ensurePubspecPathDependency(pubspecPath, depName, absPath string) (bool, error) {
-	absPath, err := filepath.Abs(absPath)
-	if err != nil {
-		return false, err
-	}
-	raw, err := os.ReadFile(pubspecPath)
-	if err != nil {
-		return false, fmt.Errorf("read pubspec.yaml at %s: %w", pubspecPath, err)
-	}
-	text := string(raw)
-	newText, changed, err := pubspecWithPathDependency(text, depName, absPath)
-	if err != nil {
-		return false, err
-	}
-	if !changed {
-		return false, nil
-	}
-	if err := os.WriteFile(pubspecPath, []byte(newText), 0o644); err != nil {
 		return false, err
 	}
 	return true, nil

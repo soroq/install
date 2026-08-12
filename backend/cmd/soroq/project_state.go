@@ -118,7 +118,7 @@ func runFlutterAndroidReleaseBuild(projectDir string, artifactType string, toolc
 	if androidABIs := soroqAndroidABIsForTargetPlatforms(effectiveExtraArgs); androidABIs != "" {
 		cmd.Env = appendDefaultEnv(cmd.Env, "SOROQ_ANDROID_ABIS", androidABIs)
 	}
-	if err := runSoroqBuildCommand(cmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with Soroq Flutter"); err != nil {
+	if err := runSoroqBuildCommand(cmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with Soroq Flutter", "android"); err != nil {
 		return errors.New("flutter " + strings.Join(args, " ") + " failed: " + err.Error())
 	}
 	return nil
@@ -255,7 +255,7 @@ func runProjectSoroqAndroidBuildScript(projectDir string, target string, toolcha
 	} else if repoRoot := discoverSoroqRepoRoot(projectDir); repoRoot != "" && strings.TrimSpace(os.Getenv("SOROQ_REPO_ROOT")) == "" {
 		cmd.Env = append(cmd.Env, "SOROQ_REPO_ROOT="+repoRoot)
 	}
-	if err := runSoroqBuildCommand(cmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with project helper"); err != nil {
+	if err := runSoroqBuildCommand(cmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with project helper", "android"); err != nil {
 		return true, errors.New(buildScriptPath + " failed: " + err.Error())
 	}
 	return true, nil
@@ -283,7 +283,7 @@ func androidArtifactTypeForCommand(artifactPath string) string {
 	}
 }
 
-func runSoroqBuildCommand(cmd *exec.Cmd, projectDir string, label string) error {
+func runSoroqBuildCommand(cmd *exec.Cmd, projectDir string, label string, platform string) error {
 	if soroqVerboseBuildOutput() {
 		fmt.Fprintln(os.Stderr, label+"...")
 		cmd.Stdout = os.Stdout
@@ -293,7 +293,7 @@ func runSoroqBuildCommand(cmd *exec.Cmd, projectDir string, label string) error 
 
 	fmt.Fprintln(os.Stderr, label+"...")
 	output, err := cmd.CombinedOutput()
-	logPath, logErr := writeSoroqBuildLog(projectDir, cmd.Args, output)
+	logPath, logErr := writeSoroqBuildLog(projectDir, platform, cmd.Args, output)
 	for _, line := range summarizeSoroqBuildOutput(output, err == nil) {
 		fmt.Fprintln(os.Stderr, line)
 	}
@@ -326,12 +326,16 @@ func soroqVerboseBuildOutput() bool {
 	}
 }
 
-func writeSoroqBuildLog(projectDir string, args []string, output []byte) (string, error) {
+func writeSoroqBuildLog(projectDir string, platform string, args []string, output []byte) (string, error) {
 	logsDir := filepath.Join(projectDir, ".soroq", "logs")
 	if err := os.MkdirAll(logsDir, 0o755); err != nil {
 		return "", err
 	}
-	logPath := filepath.Join(logsDir, time.Now().UTC().Format("20060102T150405Z")+"-android-build.log")
+	platform = strings.TrimSpace(platform)
+	if platform == "" {
+		platform = "build"
+	}
+	logPath := filepath.Join(logsDir, time.Now().UTC().Format("20060102T150405Z")+"-"+platform+"-build.log")
 	var builder strings.Builder
 	if len(args) > 0 {
 		builder.WriteString("$ ")
@@ -882,21 +886,6 @@ func discoverAndroidArtifacts(projectDir string) ([]discoveredArtifact, error) {
 		return artifacts[i].ModTime.After(artifacts[j].ModTime)
 	})
 	return artifacts, nil
-}
-
-func firstManifestSigningKeyID(metadata androidrelease.BundledMetadata) string {
-	if metadata.Soroq.ManifestTrust == nil {
-		return ""
-	}
-	for _, key := range metadata.Soroq.ManifestTrust.Keys {
-		if key.ID == nil {
-			continue
-		}
-		if keyID := strings.TrimSpace(*key.ID); keyID != "" {
-			return keyID
-		}
-	}
-	return ""
 }
 
 func flagWasSet(fs *flag.FlagSet, name string) bool {

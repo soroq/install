@@ -71,6 +71,20 @@ func runPatch(args []string) error {
 		return errAlreadyPrinted
 	}
 
+	// CANONICAL multi-platform form: `soroq patch --platforms=android,ios --rollout 100`.
+	if platforms, rest, err := parsePlatforms(args); err != nil {
+		return err
+	} else if len(platforms) > 0 {
+		// Refuse an ambiguous combined invocation BEFORE any lane starts, so a rejected command
+		// leaves nothing built and nothing registered.
+		if err := validateCombinedPlatformFlags("patch", platforms, rest); err != nil {
+			return err
+		}
+		return runPerPlatform("patch", platforms, func(p string) error {
+			return patchPlatform(p, rest)
+		})
+	}
+
 	switch args[0] {
 	case "android":
 		return runPatchAndroid(args[1:])
@@ -119,7 +133,8 @@ func iosPatchLaneNote(carriesCode bool) string {
 }
 
 func patchUsage() {
-	fmt.Fprintln(os.Stdout, `usage: soroq patch <target> [flags]
+	fmt.Fprintln(os.Stdout, `usage: soroq patch --platforms=android,ios --rollout 100        (canonical)
+   or: soroq patch <target> [flags]                        (platform-specific)
 
 targets:
   android  publish a hosted Android patch from a shipped base artifact and a local candidate artifact
@@ -672,9 +687,9 @@ func runPatchAndroid(args []string) error {
 	if resolvedManifestKeyID == "" && selectedHostedRelease != nil {
 		resolvedManifestKeyID = strings.TrimSpace(selectedHostedRelease.ManifestSigningKeyID)
 	}
-	if resolvedManifestKeyID == "" {
-		resolvedManifestKeyID = firstManifestSigningKeyID(baseSnapshot.Metadata)
-	}
+	// Do not infer a control-plane signing key from the artifact's device trust
+	// list. An empty request intentionally asks the server to use the release's
+	// signing key (or its configured default).
 	resolvedAllowEmpty := *allowEmpty || (candidateFromLastRelease && !flagWasSet(fs, "candidate-artifact"))
 
 	baseSnapshotPath := filepath.Join(workDir, "base-snapshot.json")
@@ -706,6 +721,16 @@ func runPatchAndroid(args []string) error {
 		// drifted and what to do. (Fix A ships the full icon font in the base, so an icon-only change
 		// does not alter the font and therefore does not trip this guard.) Scoped to auto-mode: an
 		// explicit --kind experimental_native_aot is the caller deliberately choosing the code lane.
+		// Dependency gate (applies in BOTH auto and explicit --kind modes, unlike the asset guard below):
+		// refuse a dependency change that pulls in native code, a plugin registration, or a real asset,
+		// naming the responsible package. Returns the license-metadata delta the code lane does not carry.
+		licenseDelta, err := assertAndroidDependencyDeliverable(status.ProjectDir, resolvedBaseArtifactPath, resolvedCandidateArtifactPath)
+		if err != nil {
+			return err
+		}
+		if w := licenseDelta.Warning(); w != "" {
+			fmt.Fprintln(os.Stderr, w)
+		}
 		if requestedPatchKind == "" {
 			drift, err := androidpatch.DetectCodePatchAssetDrift(resolvedBaseArtifactPath, resolvedCandidateArtifactPath)
 			if err != nil {

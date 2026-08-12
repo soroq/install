@@ -190,11 +190,11 @@ func completeIOSLocalEngineLayout(iosBundleDir, flutterBin string) error {
 	// materialize those packed SOROQ bytes here INSTEAD of symlinking the stock ones. See
 	// notes/t030-ios-app-build-leg.md.
 	stockLinks := map[string]string{
-		filepath.Join(hostOut, "dart-sdk"):                             filepath.Join(cacheDir, "dart-sdk"),
-		filepath.Join(hostOut, "frontend_server_aot.dart.snapshot"):    filepath.Join(darwinHostEngine, "frontend_server_aot.dart.snapshot"),
-		filepath.Join(hostOut, "gen", "const_finder.dart.snapshot"):    filepath.Join(darwinHostEngine, "const_finder.dart.snapshot"),
-		filepath.Join(hostOut, "flutter_patched_sdk"):                  filepath.Join(commonEngine, "flutter_patched_sdk"),
-		filepath.Join(targetOut, "flutter_patched_sdk"):                filepath.Join(commonEngine, "flutter_patched_sdk"),
+		filepath.Join(hostOut, "dart-sdk"):                          filepath.Join(cacheDir, "dart-sdk"),
+		filepath.Join(hostOut, "frontend_server_aot.dart.snapshot"): filepath.Join(darwinHostEngine, "frontend_server_aot.dart.snapshot"),
+		filepath.Join(hostOut, "gen", "const_finder.dart.snapshot"): filepath.Join(darwinHostEngine, "const_finder.dart.snapshot"),
+		filepath.Join(hostOut, "flutter_patched_sdk"):               filepath.Join(commonEngine, "flutter_patched_sdk"),
+		filepath.Join(targetOut, "flutter_patched_sdk"):             filepath.Join(commonEngine, "flutter_patched_sdk"),
 	}
 	for dst, src := range stockLinks {
 		if _, err := os.Stat(src); err != nil {
@@ -346,9 +346,30 @@ func buildIOSAppDill(projectDir, toolchainVersion string, extraArgs []string) (s
 		"--local-engine-src-path=" + iosBundleDir,
 		"--no-codesign",
 		"--no-tree-shake-icons",
+		// Soroq already installed a package_config resolved against the FRONTEND SDK. Letting Flutter
+		// run its own pub get here would both discard that and rewrite the customer's pubspec.lock.
+		"--no-pub",
 	}
-	if fileExists(manifestPath) {
+	// Indexed/manual bases pass the soroq.yaml-scaffolded manifest to gen_snapshot here. FREEHAND bases
+	// must NOT: the build-DAG target generates + injects the manifest, and passing a project-root
+	// manifest would be a configuration conflict. A stale soroq_app_manifest.txt is therefore ignored
+	// in freehand mode.
+	freehandMode, _ := isFreehandIOSBuild(projectDir)
+	if fileExists(manifestPath) && !freehandMode {
 		args = append(args, "--extra-gen-snapshot-options=--soroq_manifest="+manifestPath)
+	}
+	// Ask the SAME gen_snapshot invocation that produces the shipped snapshot to also emit a V8 heap
+	// profile of it. This is the ONLY authoritative source for what the base actually retained: the
+	// --soroq_manifest list is build-time ELIGIBILITY, and most of its entries do not survive
+	// tree-shaking (663 of 2,981 on base 5658149d), so it cannot answer whether a patch's reference will
+	// resolve at load. Deriving retention from a profile emitted by a separate, reconstructed build would
+	// leave a representativeness gap; deriving it from this one closes it permanently.
+	if profilePath := freehandRetentionProfilePath(projectDir); freehandMode && profilePath != "" {
+		if err := os.MkdirAll(filepath.Dir(profilePath), 0o755); err == nil {
+			// A stale profile from a previous build must never be mistaken for this build's output.
+			_ = os.Remove(profilePath)
+			args = append(args, "--extra-gen-snapshot-options=--write_v8_snapshot_profile_to="+profilePath)
+		}
 	}
 	args = append(args, extraArgs...)
 
@@ -356,7 +377,7 @@ func buildIOSAppDill(projectDir, toolchainVersion string, extraArgs []string) (s
 	cmd.Dir = projectDir
 	cmd.Stdin = os.Stdin
 	cmd.Env = soroqFlutterBuildEnv(os.Environ())
-	buildErr := runSoroqBuildCommand(cmd, projectDir, "Building iOS app with the Soroq toolchain (--local-engine "+iosLocalEngineTargetName+")")
+	buildErr := runSoroqBuildCommand(cmd, projectDir, "Building iOS app with the Soroq toolchain (--local-engine "+iosLocalEngineTargetName+")", "ios")
 
 	// Capture app.dill even on a tail failure: it is produced before the Xcode/codesign tail.
 	appDill, dillErr := locateFreshestAppDill(projectDir)

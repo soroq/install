@@ -67,6 +67,32 @@ func ensureManifestTrust(projectDir string) (publicKeyHex string, err error) {
 	return scaffoldManifestTrust(projectDir, soroqPath, configBytes)
 }
 
+// ensureProjectManifestSigningKey returns the public half of the exact project seed used by the
+// hosted freehand publisher. This is the iOS engine-lane trust anchor.
+//
+// It is deliberately independent of manifest_trust.keys[0]. That key belongs to the bundled
+// manifest-trust/runtime-identity domain and may be a hosted or previously provisioned key. Using it
+// as the iOS pin while publish signs with .soroq/manifest_signing_key.seed makes every device reject
+// the otherwise-valid signature before it downloads bytecode.
+func ensureProjectManifestSigningKey(projectDir string) (publicKeyHex string, err error) {
+	seedPath := filepath.Join(projectDir, filepath.FromSlash(manifestSigningSeedRelPath))
+	publicKeyBase64, err := loadOrGenerateManifestSeed(seedPath)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureGitignoreLine(projectDir, ".soroq/"); err != nil {
+		return "", err
+	}
+	publicKey, err := base64.RawURLEncoding.DecodeString(publicKeyBase64)
+	if err != nil {
+		return "", fmt.Errorf("decode project manifest-signing public key: %w", err)
+	}
+	if len(publicKey) != 32 {
+		return "", fmt.Errorf("project manifest-signing public key is %d bytes, want 32", len(publicKey))
+	}
+	return hex.EncodeToString(publicKey), nil
+}
+
 // validateExistingManifestTrust checks a present manifest_trust block WITHOUT modifying soroq.yaml. It
 // returns an actionable error naming the exact missing/bad field. Validity requires an integer
 // keyset_version and a non-empty keys list where every key has a non-empty id and a decodable
@@ -94,6 +120,28 @@ func validateExistingManifestTrust(trust *androidrelease.ManifestTrust) (string,
 		if _, derr := base64.RawURLEncoding.DecodeString(strings.TrimSpace(k.PublicKey)); derr != nil {
 			return "", fmt.Errorf(`soroq.yaml manifest_trust.keys[%d] "public_key" is not valid unpadded base64url: %v`+fix, i, derr)
 		}
+	}
+	// Two entries under one id make the anchor ambiguous, and whichever one a verifier happens to
+	// pick, the other is wrong. This is reachable in practice: regenerating the project seed used to
+	// append a second `<app>-project-signing` key while leaving the original -- whose private half no
+	// longer existed -- still trusted. Fail closed rather than ship an anchor nobody can reason about.
+	seen := make(map[string]string, len(trust.Keys))
+	for i, k := range trust.Keys {
+		id := strings.TrimSpace(*k.ID)
+		publicKey := strings.TrimSpace(k.PublicKey)
+		previous, dup := seen[id]
+		if !dup {
+			seen[id] = publicKey
+			continue
+		}
+		if previous == publicKey {
+			return "", fmt.Errorf("soroq.yaml manifest_trust.keys[%d] repeats key id %q; remove the duplicate entry"+fix, i, id)
+		}
+		return "", fmt.Errorf(
+			"soroq.yaml manifest_trust.keys[%d] reuses key id %q for a DIFFERENT public key (%s vs %s); "+
+				"a key id must identify exactly one key. Delete the stale entry — if you regenerated "+
+				".soroq/manifest_signing_key.seed, the older key has no private half left and cannot sign anything"+fix,
+			i, id, shortDigest(previous), shortDigest(publicKey))
 	}
 	decoded, _ := base64.RawURLEncoding.DecodeString(strings.TrimSpace(trust.Keys[0].PublicKey))
 	return hex.EncodeToString(decoded), nil
@@ -242,4 +290,99 @@ func ensureGitignoreLine(projectDir, line string) error {
 	}
 	out.WriteString(line + "\n")
 	return os.WriteFile(gitignorePath, []byte(out.String()), 0o644)
+}
+
+// ensureProjectSigningKey materialises the project's own Ed25519 signing seed when absent and adds its
+// PUBLIC key to soroq.yaml's manifest_trust list. The seed is written 0600 and never printed; only the
+// public half reaches soroq.yaml. An existing seed is reused and soroq.yaml is left untouched, so a
+// re-run cannot orphan a key that already signed shipped patches.
+//
+// Called from `soroq init` rather than from ensureManifestTrust, which must never modify soroq.yaml —
+// its whole contract is to validate what is already there.
+func ensureProjectSigningKey(projectDir string) error {
+	soroqPath := filepath.Join(projectDir, "soroq.yaml")
+	seedPath := filepath.Join(projectDir, filepath.FromSlash(manifestSigningSeedRelPath))
+	if fileExists(seedPath) {
+		return nil
+	}
+	publicKeyBase64, err := loadOrGenerateManifestSeed(seedPath)
+	if err != nil {
+		return err
+	}
+	if err := ensureGitignoreLine(projectDir, ".soroq/"); err != nil {
+		return err
+	}
+	configBytes, err := os.ReadFile(soroqPath)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(configBytes), publicKeyBase64) {
+		return nil
+	}
+	appID := strings.TrimSpace(parseTopLevelYaml(configBytes)["app_id"])
+	if appID == "" {
+		appID = "primary"
+	}
+	return writeFileAtomic(soroqPath,
+		[]byte(appendManifestTrustKey(string(configBytes), appID+"-project-signing", publicKeyBase64)))
+}
+
+// appendManifestTrustKey adds one key entry to an existing manifest_trust.keys list, preserving every
+// key already present -- EXCEPT one that already claims the same id, which is replaced in place.
+//
+// A key id identifies a key. Two entries sharing one id but carrying different public keys make the
+// trust anchor ambiguous: which one a verifier honours depends on its iteration order, and one of the
+// two is guaranteed to be wrong. That is not hypothetical -- regenerating the project seed (deleting
+// .soroq/manifest_signing_key.seed and re-running init) appended a second `<app>-project-signing`
+// entry while leaving the first in place, so the app shipped trusting a key whose private half no
+// longer existed anywhere. A dead trust anchor is strictly worse than no anchor: it cannot sign
+// anything, but it still widens what the device will accept.
+//
+// Replacement is deterministic: same id -> same slot, new public key.
+func appendManifestTrustKey(content, keyID, publicKeyBase64 string) string {
+	if replaced, ok := replaceManifestTrustKey(content, keyID, publicKeyBase64); ok {
+		return replaced
+	}
+	entry := "    - id: " + keyID + "\n      public_key: " + publicKeyBase64 + "\n"
+	idx := strings.Index(content, "\n  keys:\n")
+	if idx < 0 {
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		return content + "manifest_trust:\n  keyset_version: 1\n  keys:\n" + entry
+	}
+	insertAt := idx + len("\n  keys:\n")
+	return content[:insertAt] + entry + content[insertAt:]
+}
+
+// replaceManifestTrustKey rewrites the public_key of the entry whose id matches, in place, and reports
+// whether it found one. It edits only the matched entry's public_key line so unrelated keys, comments
+// and formatting survive untouched.
+func replaceManifestTrustKey(content, keyID, publicKeyBase64 string) (string, bool) {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "- id:") {
+			continue
+		}
+		if strings.TrimSpace(strings.TrimPrefix(trimmed, "- id:")) != keyID {
+			continue
+		}
+		// The public_key belongs to this entry until the next list item or a dedent.
+		for j := i + 1; j < len(lines); j++ {
+			next := strings.TrimSpace(lines[j])
+			if next == "" {
+				continue
+			}
+			if strings.HasPrefix(next, "- ") || !startsWithIndent(lines[j]) {
+				break
+			}
+			if strings.HasPrefix(next, "public_key:") {
+				indent := lines[j][:len(lines[j])-len(strings.TrimLeft(lines[j], " \t"))]
+				lines[j] = indent + "public_key: " + publicKeyBase64
+				return strings.Join(lines, "\n"), true
+			}
+		}
+	}
+	return content, false
 }

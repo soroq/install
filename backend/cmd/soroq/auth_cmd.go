@@ -17,16 +17,16 @@ import (
 )
 
 type authConfig struct {
-	SchemaVersion        int       `json:"schema_version"`
-	CredentialKind       string    `json:"credential_kind,omitempty"`
-	APIBase              string    `json:"api_base,omitempty"`
-	HostedSurfaceURL     string    `json:"hosted_surface_url,omitempty"`
-	OperatorEmail        string    `json:"operator_email,omitempty"`
-	OperatorToken        string    `json:"operator_token,omitempty"`
-	FirebaseIDToken      string    `json:"firebase_id_token,omitempty"`
-	FirebaseRefreshToken string    `json:"firebase_refresh_token,omitempty"`
-	FirebaseAPIKey       string    `json:"firebase_api_key,omitempty"`
-	FirebaseProjectID    string    `json:"firebase_project_id,omitempty"`
+	SchemaVersion        int    `json:"schema_version"`
+	CredentialKind       string `json:"credential_kind,omitempty"`
+	APIBase              string `json:"api_base,omitempty"`
+	HostedSurfaceURL     string `json:"hosted_surface_url,omitempty"`
+	OperatorEmail        string `json:"operator_email,omitempty"`
+	OperatorToken        string `json:"operator_token,omitempty"`
+	FirebaseIDToken      string `json:"firebase_id_token,omitempty"`
+	FirebaseRefreshToken string `json:"firebase_refresh_token,omitempty"`
+	FirebaseAPIKey       string `json:"firebase_api_key,omitempty"`
+	FirebaseProjectID    string `json:"firebase_project_id,omitempty"`
 	// CLIToken holds the browser-login (OAuth+PKCE) bearer token when the macOS
 	// Keychain is unavailable; when TokenInKeychain is true the raw token lives in
 	// the Keychain (service "soroq-cli-token:<api_base>") and this stays empty.
@@ -377,7 +377,9 @@ func runLogout(args []string) error {
 			if revokeAPIBase == "" {
 				revokeAPIBase = strings.TrimRight(strings.TrimSpace(config.APIBase), "/")
 			}
-			if token := resolveCLITokenValue(config); token != "" {
+			// Best effort on the LOGOUT path: if the token cannot be read we cannot revoke it
+			// server-side, but local state must still be cleared, so this must not block logout.
+			if token, terr := resolveCLITokenValue(config); terr == nil && token != "" {
 				_ = revokeCLIToken(revokeAPIBase, token)
 			}
 			if config.TokenInKeychain {
@@ -493,6 +495,62 @@ func verificationAppsURL(apiBase string, creds operatorCredentials) string {
 	return base + "/v1/apps"
 }
 
+// describeCredentialSource names WHERE the credential the CLI just sent came from, without ever
+// revealing its value.
+//
+// A rejected credential otherwise surfaces as a bare "control plane returned 401", which does not say
+// which of several possible credentials was used — and the environment variable is the one that causes
+// this, because it SILENTLY OVERRIDES a perfectly good stored login. A stale token exported in one
+// shell (often as a workaround) then makes every later command fail as if the developer were not logged
+// in, and `soroq login` does not fix it. Naming the source turns that into a one-line diagnosis.
+func describeCredentialSource(creds operatorCredentials) string {
+	kind := strings.TrimSpace(creds.CredentialKind)
+	if kind == "" {
+		kind = "unknown"
+	}
+	switch creds.Source {
+	case "environment":
+		envVar := "SOROQ_OPERATOR_TOKEN"
+		if strings.TrimSpace(os.Getenv("SOROQ_CONTROL_PLANE_OPERATOR_TOKEN")) != "" {
+			envVar = "SOROQ_CONTROL_PLANE_OPERATOR_TOKEN"
+		}
+		return fmt.Sprintf("an operator token from the ENVIRONMENT variable %s", envVar)
+	case "config":
+		where := strings.TrimSpace(creds.ConfigPath)
+		if where == "" {
+			where = "the stored login"
+		}
+		if strings.TrimSpace(creds.Email) != "" {
+			return fmt.Sprintf("the stored %s login for %s (%s)", kind, creds.Email, where)
+		}
+		return fmt.Sprintf("the stored %s login (%s)", kind, where)
+	default:
+		return "no credential (not logged in)"
+	}
+}
+
+// authFailureError turns a rejected-credential HTTP status into an actionable, source-aware refusal.
+// Returns nil for any status that is not an authentication/authorization failure.
+func authFailureError(status int, creds operatorCredentials, apiBase, action string) error {
+	if status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s was rejected by %s (HTTP %d).\n", action, strings.TrimRight(apiBase, "/"), status)
+	fmt.Fprintf(&b, "  credential used: %s\n", describeCredentialSource(creds))
+	if creds.Source == "environment" {
+		b.WriteString("  This environment variable OVERRIDES your stored login, so `soroq login` will not\n")
+		b.WriteString("  change it. If it is stale, unset it and re-run:\n")
+		b.WriteString("    unset SOROQ_OPERATOR_TOKEN SOROQ_CONTROL_PLANE_OPERATOR_TOKEN\n")
+	} else {
+		b.WriteString("  Run `soroq whoami` to check it, or `soroq login` to re-authenticate.\n")
+	}
+	if status == http.StatusForbidden {
+		b.WriteString("  A 403 means the credential is valid but not authorized for this app or control plane.")
+	}
+	return fmt.Errorf("%s", strings.TrimRight(b.String(), "\n"))
+}
+
 func applyCredentialsHeaders(req *http.Request, creds operatorCredentials) {
 	if strings.TrimSpace(creds.Token) != "" {
 		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(creds.Token))
@@ -530,7 +588,18 @@ func currentOperatorCredentials(configPath string) (operatorCredentials, error) 
 	case credentialKindFirebase:
 		token = strings.TrimSpace(config.FirebaseIDToken)
 	case credentialKindCLIToken:
-		token = resolveCLITokenValue(config)
+		var terr error
+		token, terr = resolveCLITokenValue(config)
+		if terr != nil {
+			return operatorCredentials{}, terr
+		}
+		// A config that DECLARES a cli_token but yields nothing is broken, not anonymous. Refusing here
+		// keeps an unauthenticated request from being sent on its behalf.
+		if strings.TrimSpace(token) == "" {
+			return operatorCredentials{}, fmt.Errorf(
+				"%s declares credential_kind=%q but no token could be recovered; run `soroq login` again",
+				configPathForError(configPath), credentialKindCLIToken)
+		}
 	}
 	return operatorCredentials{
 		Token:                token,
@@ -685,16 +754,28 @@ func resolveSoroqConfigPath(configPath string) (string, error) {
 // resolveCLITokenValue returns the raw cli_token for a stored config, reading it
 // from the macOS Keychain when the token was stored there, or from the config
 // file in the plaintext (0600) fallback. Returns "" when it cannot be recovered.
-func resolveCLITokenValue(config authConfig) string {
+// resolveCLITokenValue returns the stored CLI token, FAILING CLOSED.
+//
+// It used to swallow a Keychain read error and return "". An empty token then flowed through credential
+// resolution and out to the network as an UNAUTHENTICATED request, so a locked or denied Keychain
+// surfaced as a bare 401 from the control plane — indistinguishable from "you are not logged in", after
+// an expensive build had already run. A credential that cannot be read is an error, not an absence.
+func resolveCLITokenValue(config authConfig) (string, error) {
 	if config.TokenInKeychain {
 		apiBase := strings.TrimRight(strings.TrimSpace(config.APIBase), "/")
 		token, err := keychainReadFn(apiBase)
 		if err != nil {
-			return ""
+			return "", fmt.Errorf("stored CLI token could not be read from the macOS Keychain for %s: %w\n"+
+				"  Unlock the login keychain and allow access, or run `soroq login` again to re-store it.",
+				apiBase, err)
 		}
-		return strings.TrimSpace(token)
+		token = strings.TrimSpace(token)
+		if token == "" {
+			return "", fmt.Errorf("the Keychain entry for %s is empty; run `soroq login` again", apiBase)
+		}
+		return token, nil
 	}
-	return strings.TrimSpace(config.CLIToken)
+	return strings.TrimSpace(config.CLIToken), nil
 }
 
 func loadAuthConfig(path string) (authConfig, error) {
@@ -730,4 +811,43 @@ func saveAuthConfig(path string, config authConfig) error {
 		return err
 	}
 	return os.Rename(tmpPath, path)
+}
+
+// configPathForError renders the config path for a user-facing error without ever touching its content.
+func configPathForError(configPath string) string {
+	if strings.TrimSpace(configPath) != "" {
+		return configPath
+	}
+	if p, err := resolveSoroqConfigPath(""); err == nil {
+		return p
+	}
+	return "the Soroq config"
+}
+
+// requireOperatorCredentials resolves credentials for a request and REFUSES when the result carries no
+// bearer. Callers use it before doing expensive work, so an unauthenticated request is never built,
+// never sent, and never fails after a multi-minute compile.
+//
+// It also refuses to hand a credential to a host it was not issued for: forwarding a production bearer
+// to an arbitrary --api target would leak it to whoever runs that endpoint.
+func requireOperatorCredentials(configPath, targetAPIBase, action string) (operatorCredentials, error) {
+	creds, err := currentOperatorCredentialsForRequest(configPath, targetAPIBase)
+	if err != nil {
+		return operatorCredentials{}, err
+	}
+	if strings.TrimSpace(creds.Token) == "" {
+		return operatorCredentials{}, fmt.Errorf(
+			"%s requires operator authentication and no usable credential was found; run `soroq login`",
+			action)
+	}
+	// Env-provided credentials carry no issuing host, so they are trusted as given. A STORED credential
+	// names the control plane it was issued for and must not travel anywhere else.
+	if creds.Source == "config" && strings.TrimSpace(creds.APIBase) != "" &&
+		!apiTargetMatchesCredential(targetAPIBase, creds.APIBase) {
+		return operatorCredentials{}, fmt.Errorf(
+			"stored credentials were issued for %s but this command targets %s; refusing to send them "+
+				"to a different control plane. Pass --api %s, or run `soroq login` against %s.",
+			creds.APIBase, targetAPIBase, creds.APIBase, targetAPIBase)
+	}
+	return creds, nil
 }

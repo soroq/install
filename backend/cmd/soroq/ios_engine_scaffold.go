@@ -479,8 +479,8 @@ class EngineActivator implements SoroqEngineActivator {
       loadModuleFromBytes(bytecode);
 
   @override
-  void redirect(int index, Object? module) =>
-      soroqRedirectToPatch(_owner, soroqPatchTable[index], module!);
+  bool redirect(int index, Object? replacement) =>
+      soroqRedirectToPatch(_owner, soroqPatchTable[index], replacement!);
 
   @override
   void rollbackToBase() {
