@@ -40,7 +40,7 @@ $env:SOROQ_INSTALL_DIR = "$HOME\.soroq\bin"
 
 # Put the bin dir on PATH for this session:
 $env:PATH = "$HOME\.soroq\bin;$env:PATH"
-soroq version   # expect: soroq v0.2.5
+soroq version   # expect: soroq v0.2.6
 ```
 
 ---
@@ -95,7 +95,7 @@ soroq whoami --api https://api.soroq.dev   # expect: an unauthenticated / no-cre
 ### G5 — Frontend install
 
 ```powershell
-soroq frontend install soroq-flutter-frontend-f74781f6-6903c161 --api https://api.soroq.dev
+soroq setup --platforms=android
 soroq frontend list
 soroq frontend doctor
 ```
@@ -106,9 +106,8 @@ soroq frontend doctor
 ### G6 — Toolchain install + doctor
 
 ```powershell
-soroq toolchain install soroq-android-3.44.2-release-12d3315131f5 --api https://api.soroq.dev
 soroq toolchain list
-soroq toolchain doctor
+soroq doctor
 ```
 
 - **PASS if** the toolchain downloads, verifies (signature + archive hash + `verifyEngineBundle`),

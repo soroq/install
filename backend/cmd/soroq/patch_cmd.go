@@ -480,9 +480,11 @@ func runPatchAndroid(args []string) error {
 	patchKindRaw := fs.String("kind", "auto", "patch kind: auto, asset, code, or experimental_native_aot")
 	codeDeltaStrategy := fs.String("code-delta-strategy", "default", "code delta strategy for code patches: default or v15")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	verbose := fs.Bool("verbose", false, "stream raw Flutter build output (default: phase timeline plus durable log)")
+	quiet := fs.Bool("quiet", false, "suppress build progress while preserving final command output")
 	allowEmpty := fs.Bool("allow-empty", false, "publish an empty patch when no overlay asset changes are detected")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq patch android [--release-version latest|1.2.3+45] [--base-artifact .soroq/releases/my-release/app-release.aab] [--candidate-artifact build/app/outputs/bundle/release/app-release.aab] [--release-id my-release] [--build=false] [--artifact-type aab|apk] [--toolchain <version>] [--project-dir .] [--api https://api.soroq.dev] [--patch-id my-patch] [--channel stable] [--track stable|staging|beta] [--kind auto|asset|code] [--rollout 100] [--activation next_cold_start] [--manifest-key-id prod-primary] [--allow-empty] [--json] [-- <flutter build flags>]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq patch android [--release-version latest|1.2.3+45] [--base-artifact .soroq/releases/my-release/app-release.aab] [--candidate-artifact build/app/outputs/bundle/release/app-release.aab] [--release-id my-release] [--build=false] [--artifact-type aab|apk] [--toolchain <version>] [--project-dir .] [--api https://api.soroq.dev] [--patch-id my-patch] [--channel stable] [--track stable|staging|beta] [--kind auto|asset|code] [--rollout 100] [--activation next_cold_start] [--manifest-key-id prod-primary] [--allow-empty] [--json] [--verbose|--quiet] [-- <flutter build flags>]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -490,6 +492,11 @@ func runPatchAndroid(args []string) error {
 		}
 		return err
 	}
+	if err := validateCLIOutputFlags(*verbose, *quiet, *jsonOut); err != nil {
+		return err
+	}
+	configureCLIOutput(*verbose, *quiet, *jsonOut)
+	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
 	resolvedTrack, resolvedRollout, err := resolvePatchTrackAndRollout(*track, *rollout, flagWasSet(fs, "rollout"))
 	if err != nil {

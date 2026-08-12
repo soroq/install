@@ -83,6 +83,37 @@ jobs:
           done
           echo "OK: frontend/toolchain publish are operator-only and blocked in the public build."
 
+      - name: Fresh install.sh smoke against verified local release assets
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/install-smoke-stage"
+          serve="${RUNNER_TEMP}/install-smoke-serve"
+          home="${RUNNER_TEMP}/install-smoke-home"
+          version="$(cat backend/VERSION)"
+          mkdir -p "$stage" "$serve" "$home"
+          (
+            cd backend
+            CGO_ENABLED=0 go build -trimpath -ldflags "-X main.buildVersion=${version}" -o "$stage/soroq" ./cmd/soroq
+            CGO_ENABLED=0 go build -trimpath -ldflags "-X main.buildVersion=${version}" -o "$stage/soroqctl" ./cmd/soroqctl
+          )
+          tar -C "$stage" -czf "$serve/soroq_linux_amd64.tar.gz" soroq soroqctl
+          (cd "$serve" && sha256sum soroq_linux_amd64.tar.gz > checksums.txt)
+          python3 -m http.server 18080 --bind 127.0.0.1 --directory "$serve" >"${RUNNER_TEMP}/install-http.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18080/checksums.txt >/dev/null && break
+            sleep 0.2
+          done
+          HOME="$home" NO_COLOR=1 \
+            SOROQ_INSTALL_BASE_URL=http://127.0.0.1:18080 \
+            SOROQ_INSTALL_VERSION="$version" \
+            SOROQ_INSTALL_DIR="$home/.soroq/bin" \
+            sh install.sh
+          test "$("$home/.soroq/bin/soroq" version)" = "soroq ${version}"
+          test -x "$home/.soroq/bin/soroqctl"
+          echo "OK: clean installer fetched, checksum-verified, and ran both ${version} binaries."
+
   windows:
     name: windows (informational)
     runs-on: windows-latest
