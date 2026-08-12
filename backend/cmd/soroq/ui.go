@@ -193,11 +193,14 @@ func cliColorEnabled(writer io.Writer) bool {
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
+// `ticket` is in this list because an artifact ticket IS a bearer credential: it is what authorises a
+// device to fetch a manifest or bundle. A ticket pasted into an issue or CI log is a usable grant
+// until it expires, so it must never survive into CLI output or a retained build log.
 var sensitiveCLIValuePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(authorization\s*:\s*(?:bearer|basic)\s+)[^\s]+`),
 	regexp.MustCompile(`(?i)((?:SOROQ_[A-Z0-9_]*(?:TOKEN|SEED|SECRET|PASSWORD|ACCESS_KEY)[A-Z0-9_]*)|(?:ACCESS_KEY|PASSWORD|SECRET|TOKEN|SEED))=([^\s'";\\]+)`),
 	regexp.MustCompile(`(?i)(--[a-z0-9-]*(?:token|seed|secret|password|access-key)[a-z0-9-]*)(?:=|\s+)([^\s'";\\]+)`),
-	regexp.MustCompile(`(?i)([?&](?:access_token|token|signature|sig|seed|secret|password|code_verifier)=)[^&\s]+`),
+	regexp.MustCompile(`(?i)([?&](?:access_token|token|signature|sig|seed|secret|password|code_verifier|ticket)=)[^&\s]+`),
 	regexp.MustCompile(`(?i)("(?:access_token|token|signature|seed|secret|password|code_verifier)"\s*:\s*")[^"]*(")`),
 }
 

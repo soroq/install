@@ -199,3 +199,27 @@ func TestWaitForCLICommandEscalatesInterruptToKill(t *testing.T) {
 		t.Fatalf("interrupts = %d, kills = %d, want 1 each", interrupts, kills)
 	}
 }
+
+// An artifact ticket IS a bearer credential: it is what authorises fetching a manifest or bundle. The
+// runtime logs the full download URL, so a ticket reaching CLI output or a retained build log is a
+// usable grant until it expires. It was NOT redacted before this test existed.
+func TestRedactCLITextRemovesArtifactTickets(t *testing.T) {
+	const ticket = "eyJwYXRjaF9pZCI6InAtMSJ9.SIGNATUREPART"
+	for _, line := range []string{
+		"Downloading patch manifest: https://api.soroq.dev/v1/patches/p-1/manifest?ticket=" + ticket,
+		"GET https://api.soroq.dev/v1/patches/p-1/bundle?ticket=" + ticket + "&retry=1",
+	} {
+		got := redactCLIText(line)
+		if strings.Contains(got, ticket) {
+			t.Errorf("artifact ticket survived redaction:\n  in:  %s\n  out: %s", line, got)
+		}
+		if !strings.Contains(got, "ticket=[REDACTED]") {
+			t.Errorf("expected the ticket value to be replaced, got: %s", got)
+		}
+	}
+	// The rest of the URL must remain, or the log stops being useful for diagnosis.
+	got := redactCLIText("GET https://api.soroq.dev/v1/patches/p-1/bundle?ticket=" + ticket)
+	if !strings.Contains(got, "/v1/patches/p-1/bundle") {
+		t.Errorf("redaction removed diagnostic context it did not need to: %s", got)
+	}
+}

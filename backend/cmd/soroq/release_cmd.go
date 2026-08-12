@@ -714,9 +714,30 @@ func resolveReleaseArchForArtifact(artifactType string, abis []string, override 
 		return abis[0], nil
 	default:
 		if artifactType == "aab" {
+			// An AAB legitimately covers every ABI: Play splits it per-device at delivery.
 			return "universal", nil
 		}
-		return preferredAndroidABI(abis), nil
+		// A fat APK binds the release to ONE architecture while every ABI inside it shares a single
+		// runtime_id -- patch selection keys on runtime_id and channel, not arch. Devices running the
+		// other ABIs therefore sit on this release and are offered patches built from this slice.
+		//
+		// Preferring arm64 is a deliberate, tested default and is kept: it is right for the overwhelming
+		// majority of shipped Flutter apps. What was wrong is that it happened SILENTLY, so a developer
+		// shipping a genuinely multi-ABI APK had no way to notice. Say it plainly instead of changing it.
+		chosen := preferredAndroidABI(abis)
+		uncovered := make([]string, 0, len(abis))
+		for _, abi := range abis {
+			if abi != chosen {
+				uncovered = append(uncovered, abi)
+			}
+		}
+		fmt.Fprintf(os.Stderr,
+			"warning: this APK contains %d ABIs (%s); the release is bound to %s.\n"+
+				"  Patches are selected by runtime id, not architecture, so devices running %s would be offered\n"+
+				"  code built for %s. Pass --arch to choose explicitly, or ship an app bundle\n"+
+				"  (--artifact-type aab) so Play delivers a per-ABI split.\n",
+			len(abis), strings.Join(abis, ", "), chosen, strings.Join(uncovered, ", "), chosen)
+		return chosen, nil
 	}
 }
 
