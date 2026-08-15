@@ -133,6 +133,26 @@ func splitFlutterPassthrough(args []string) (head []string, passthrough []string
 // register the immutable engine-lane baseline through the soroqctl delegate (passing the built app.dill
 // + the generated patchable manifest, so the baseline persists the manifest sha). Fresh-developer path:
 // no repo checkout, no dependency_overrides, no hand-paths.
+// Production boundaries, indirected so tests can COUNT them.
+//
+// A refusal test that only snapshots the filesystem proves nothing about a network call, a delegate
+// invocation or an analyzer install that leaves no trace in the project. Each boundary below is
+// therefore a variable a test can replace with a counter, and the refusal tests assert every counter
+// is zero.
+var (
+	engineLaneEnsureManifestTrustFn = ensureManifestTrust
+	engineLanePrepareResolutionFn   = prepareSoroqBuildResolution
+	engineLaneGenerateScaffoldFn    = generateIOSEngineScaffold
+	engineLaneBuildAppDillFn        = buildIOSAppDill
+	engineLaneDelegateFn            = runEngineLaneDelegate
+	engineLaneFreehandFn            = runReleaseIOSEngineBuildFreehand
+	// The PATCH route reaches the same boundaries and needs the same treatment: until it went through
+	// these variables its refusal tests could only assert counters nothing on that route could ever
+	// increment, which is a passing test that proves nothing. Resolution/scaffold/delegate are shared
+	// with the release route (same functions); only the freehand entry differs.
+	engineLanePatchFreehandFn = runPatchIOSEngineFreehand
+)
+
 func runReleaseIOSEngineBuild(args []string) error {
 	head, passthrough := splitFlutterPassthrough(args)
 	projectDir, _ := flagValue(head, "project-dir")
@@ -150,6 +170,25 @@ func runReleaseIOSEngineBuild(args []string) error {
 		return errors.New("with --engine --build, the patchable manifest is generated from soroq.yaml; do not also pass --patchable-manifest")
 	}
 
+	// SHAPE GUARDS FOR THE REAL HARD-OTA ROUTE.
+	//
+	// These sit here, not deeper, because everything below mutates something: requireIOSEngineEnabled
+	// reads project config, ensureManifestTrust can WRITE a signing key into soroq.yaml,
+	// prepareSoroqBuildResolution rewrites dependency resolution, the scaffold generators emit files
+	// into the project, and the freehand branch installs an analyzer and builds. A guard placed after
+	// any of those would refuse a shape only after having already changed the developer's project.
+	//
+	// Both branches below (freehand and scaffolded) are covered because this precedes the split.
+	if err := guardUnverifiedBuildFlags(passthrough); err != nil {
+		return err
+	}
+	if err := guardFlavoredBuild(passthrough); err != nil {
+		return err
+	}
+	if err := guardSupportedIOSApplicationShape(projectDir); err != nil {
+		return err
+	}
+
 	if err := requireIOSEngineEnabled(projectDir); err != nil {
 		return err
 	}
@@ -159,20 +198,20 @@ func runReleaseIOSEngineBuild(args []string) error {
 	if freehand, ferr := isFreehandIOSBuild(projectDir); ferr != nil {
 		return ferr
 	} else if freehand {
-		return runReleaseIOSEngineBuildFreehand(head, passthrough, projectDir, toolchain)
+		return engineLaneFreehandFn(head, passthrough, projectDir, toolchain)
 	}
 	// Self-heal a missing manifest_trust before scaffolding/building so a fresh iOS engine-lane build
 	// never fails with the fork's `Expected soroq.yaml to define "manifest_trust"`. Idempotent: a valid
 	// existing block is preserved untouched; an invalid one surfaces an actionable error.
-	if _, err := ensureManifestTrust(projectDir); err != nil {
+	if _, err := engineLaneEnsureManifestTrustFn(projectDir); err != nil {
 		return err
 	}
 	// Resolve Soroq's own packages in an isolated workspace. The customer's pubspec.yaml and
 	// pubspec.lock are never touched; only .dart_tool/package_config.json (build output) is written.
-	if _, err := prepareSoroqBuildResolution(projectDir); err != nil {
+	if _, err := engineLanePrepareResolutionFn(projectDir); err != nil {
 		return fmt.Errorf("prepare Soroq build resolution: %w", err)
 	}
-	manifestPath, err := generateIOSEngineScaffold(projectDir)
+	manifestPath, err := engineLaneGenerateScaffoldFn(projectDir)
 	if err != nil {
 		return fmt.Errorf("generate iOS engine scaffold: %w", err)
 	}
@@ -183,7 +222,7 @@ func runReleaseIOSEngineBuild(args []string) error {
 	fmt.Fprintf(os.Stderr, "soroq release ios --engine --build: generated %s + lib/soroq_patch_table.g.dart + lib/soroq_activator.dart + %s\n", manifestPath, dynamicInterfacePath)
 	passthrough = iosEngineBuildPassthrough(dynamicInterfacePath, passthrough)
 
-	appDill, buildErr := buildIOSAppDill(projectDir, toolchain, passthrough)
+	appDill, buildErr := engineLaneBuildAppDillFn(projectDir, toolchain, passthrough)
 	if appDill == "" {
 		return buildErr
 	}
@@ -203,7 +242,7 @@ func runReleaseIOSEngineBuild(args []string) error {
 		return err
 	}
 	delegateArgs = append(delegateArgs, "--app-dill", absDill, "--patchable-manifest", manifestPath)
-	return runEngineLaneDelegate("release", delegateArgs)
+	return engineLaneDelegateFn("release", delegateArgs)
 }
 
 // iosEngineBuildPassthrough puts Soroq's base-retention contract before any
@@ -225,6 +264,27 @@ func runPatchIOSEngineScaffolded(args []string) error {
 	if strings.TrimSpace(projectDir) == "" {
 		projectDir = "."
 	}
+	// SHAPE GUARDS FOR THE PATCH SIDE OF THE REAL HARD-OTA ROUTE.
+	//
+	// Same placement rationale as the release route above, and the same list: a shape Soroq refuses to
+	// RELEASE is not a shape it can honestly PATCH. Until these were here, an add-to-app project, a
+	// flavored build or an obfuscated build was refused at release time and accepted at patch time —
+	// and by the time anything noticed, prepareSoroqBuildResolution had already rewritten
+	// .dart_tool/package_config.json in the developer's project.
+	//
+	// This precedes requireIOSEngineEnabled (which reads project config), prepareSoroqBuildResolution
+	// (which writes) and the freehand/scaffolded split, so both branches are covered and a refusal
+	// costs the project nothing.
+	if err := guardUnverifiedBuildFlags(passthrough); err != nil {
+		return err
+	}
+	if err := guardFlavoredBuild(passthrough); err != nil {
+		return err
+	}
+	if err := guardSupportedIOSApplicationShape(projectDir); err != nil {
+		return err
+	}
+
 	if err := requireIOSEngineEnabled(projectDir); err != nil {
 		return err
 	}
@@ -239,7 +299,7 @@ func runPatchIOSEngineScaffolded(args []string) error {
 	// Flutter's own semantics.dart ("SemanticsFlags has no getter hasCheckedState"). Nothing in that
 	// output pointed at the real cause, and re-running the release could not fix it because the baseline
 	// is immutable.
-	if _, err := prepareSoroqBuildResolution(projectDir); err != nil {
+	if _, err := engineLanePrepareResolutionFn(projectDir); err != nil {
 		return fmt.Errorf("prepare Soroq build resolution: %w", err)
 	}
 	// [soroq] freehand: engine enabled but NO ios_engine.patchable list -> automatic kernel-diff patch
@@ -247,9 +307,9 @@ func runPatchIOSEngineScaffolded(args []string) error {
 	if freehand, ferr := isFreehandIOSBuild(projectDir); ferr != nil {
 		return ferr
 	} else if freehand {
-		return runPatchIOSEngineFreehand(head, passthrough, projectDir)
+		return engineLanePatchFreehandFn(head, passthrough, projectDir)
 	}
-	manifestPath, err := generateIOSEngineScaffold(projectDir)
+	manifestPath, err := engineLaneGenerateScaffoldFn(projectDir)
 	if err != nil {
 		return fmt.Errorf("generate iOS engine scaffold: %w", err)
 	}
@@ -272,7 +332,7 @@ func runPatchIOSEngineScaffolded(args []string) error {
 	if len(passthrough) > 0 {
 		delegateArgs = append(delegateArgs, append([]string{"--"}, passthrough...)...)
 	}
-	return runEngineLaneDelegate("patch", delegateArgs)
+	return engineLaneDelegateFn("patch", delegateArgs)
 }
 
 // requireIOSEngineEnabled fails unless soroq.yaml at projectDir enables ios_engine.

@@ -504,6 +504,9 @@ func runPatchAndroid(args []string) error {
 	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
 		return err
 	}
+	if err := guardSupportedApplicationShape(*projectDir); err != nil {
+		return err
+	}
 	resolvedTrack, resolvedRollout, err := resolvePatchTrackAndRollout(*track, *rollout, flagWasSet(fs, "rollout"))
 	if err != nil {
 		return err

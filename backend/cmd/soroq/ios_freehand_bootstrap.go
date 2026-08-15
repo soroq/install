@@ -86,54 +86,10 @@ class SoroqFreehandActivatorImpl
 
 // freehandBootstrapSource renders the zero-touch entrypoint. Every interpolated value is validated by
 // the caller (safe charsets / 64-hex / parsed URL / package: URI) so it cannot break the Dart literal.
-func freehandBootstrapSource(cfg freehandBootstrapConfig) string {
-	return fmt.Sprintf(`// GENERATED — do not edit. Produced by `+"`soroq release/patch ios --engine`"+` (freehand).
-// Zero-touch entrypoint. It wraps the app's real main() so a fresh developer never edits lib/ and
-// never calls Soroq.configure(): configure the engine-lane controller, restore the last committed
-// good patch BEFORE the first frame (NO network), then run the app. Stability is committed per exact
-// version AFTER a healthy rendered frame — the restored version on its first frame, and any newly
-// downloaded+applied version on its first post-apply frame — so a network patch is never left
-// uncommitted (and thus never falsely quarantined), and a crashing patch stays pending. OTA wiring
-// never blocks or fails app launch.
-// ignore_for_file: directives_ordering, unawaited_futures
 
-import 'package:flutter/widgets.dart';
-import 'package:soroq_flutter/soroq_flutter.dart';
-
-import '%s' as app;
-import 'soroq_freehand_activator.g.dart';
-
-const String _soroqAppId = '%s';
-const String _soroqRuntimeId = '%s';
-const String _soroqChannel = '%s';
-const String _soroqControlPlaneBaseUrl = '%s';
-const String _soroqPinnedEnginePublicKeyHex = '%s';
-
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  SoroqEngineLaneController? controller;
-  try {
-    controller = await Soroq.configure(
-      config: SoroqEngineLaneConfig(
-        appId: _soroqAppId,
-        runtimeId: _soroqRuntimeId,
-        channel: _soroqChannel,
-        controlPlaneBaseUrl: Uri.parse(_soroqControlPlaneBaseUrl),
-        pinnedEnginePublicKeyHex: _soroqPinnedEnginePublicKeyHex,
-      ),
-      activator: SoroqFreehandActivatorImpl(),
-    );
-    // Cold start, PHASE 1+2 ONLY: restore persisted state and do crash-loop accounting, with NO
-    // network and -- critically -- NO module load and NO redirect. Installing redirects before the
-    // first frame was reproduced 3/3 on a physical iPhone to leave the window permanently BLACK while
-    // the UI thread kept building frames and the redirected functions returned correct values. State
-    // work stays here because it is what makes crash-loop quarantine correct; activation moves to the
-    // first-frame callback below.
-    await controller.restorePrepare();
-  } catch (_) {
-    // OTA wiring must never prevent the app from launching.
-  }
-
+// The DEFAULT cold-start body: the app starts first and OTA activation is chained behind Flutter's
+// first rasterized frame. This is the ordering proven on a physical iPhone.
+const freehandBootstrapDefaultOrdering = `
   // THE APP STARTS FIRST. Everything OTA-related is chained behind Flutter's first RASTERIZED frame.
   //
   // The previous ordering ran checkForUpdate() before app.main(), and checkForUpdate() reached the
@@ -158,8 +114,95 @@ Future<void> main() async {
       // Network/apply error: do NOT mark stable; the retained (previous-good or base) state stays.
     });
   }
+`
+
+// The OPT-IN cold-start body: Soroq owns a real first frame, activates the retained patch against a
+// satisfied engine, and only then calls developer main() -- so static initializers, top-level finals,
+// provider values and initState observe the retained patch instead of BASE. Not yet device-proven.
+const freehandBootstrapActivateFirstOrdering = `
+  final SoroqEngineLaneController? c = controller;
+  if (c == null) {
+    app.main();
+    return;
+  }
+  await soroqRunAppAfterRestoreActivation(c, app.main%s);
+  // The hosted check runs only after developer main() is live, exactly as in the default ordering.
+  c.checkForUpdate().then((SoroqOtaStatus st) {
+    if (st.error == null && st.isPatched && st.activeVersion != 0) {
+      soroqCommitStableOnHealthyFrame(c, st.activeVersion);
+    }
+  }).catchError((Object _, StackTrace __) {});
+`
+
+func freehandBootstrapSource(cfg freehandBootstrapConfig) string {
+	ordering := freehandBootstrapDefaultOrdering
+	if cfg.ActivateBeforeDeveloperMain {
+		// Bake the declared launch colour in, or omit the argument so the package fallback applies.
+		firstFrameArg := ""
+		if strings.TrimSpace(cfg.LaunchColorARGB) != "" {
+			firstFrameArg = ", firstFrame: const SoroqHandoffFrame(color: Color(" + cfg.LaunchColorARGB + "))"
+		}
+		ordering = fmt.Sprintf(freehandBootstrapActivateFirstOrdering, firstFrameArg)
+	}
+	return fmt.Sprintf(`// GENERATED — do not edit. Produced by `+"`soroq release/patch ios --engine`"+` (freehand).
+// Zero-touch entrypoint. It wraps the app's real main() so a fresh developer never edits lib/ and
+// never calls Soroq.configure(): configure the engine-lane controller, restore the last committed
+// good patch BEFORE the first frame (NO network), then run the app. Stability is committed per exact
+// version AFTER a healthy rendered frame — the restored version on its first frame, and any newly
+// downloaded+applied version on its first post-apply frame — so a network patch is never left
+// uncommitted (and thus never falsely quarantined), and a crashing patch stays pending. OTA wiring
+// never blocks or fails app launch.
+// ignore_for_file: directives_ordering, unawaited_futures
+
+import 'package:flutter/widgets.dart';
+import 'package:soroq_flutter/soroq_flutter.dart';
+
+import '%s' as app;
+import 'soroq_freehand_activator.g.dart';
+
+const String _soroqAppId = '%s';
+const String _soroqRuntimeId = '%s';
+const String _soroqChannel = '%s';
+const String _soroqControlPlaneBaseUrl = '%s';
+const String _soroqPinnedEnginePublicKeyHex = '%s';
+
+Future<void> main() async {
+  // Phases from the TRUE bootstrap entry. Recorded here, not inside the helper, because the helper is
+  // only reached after binding init, controller configuration and restorePrepare -- naming a phase
+  // there 'bootstrap.start' would overstate it by several steps.
+  soroqRecordBootstrapPhase(SoroqPhase.bootstrapEntry);
+  WidgetsFlutterBinding.ensureInitialized();
+  soroqRecordBootstrapPhase(SoroqPhase.bindingInitialized);
+  SoroqEngineLaneController? controller;
+  try {
+    soroqRecordBootstrapPhase(SoroqPhase.controllerConfigureBegin);
+    controller = await Soroq.configure(
+      config: SoroqEngineLaneConfig(
+        appId: _soroqAppId,
+        runtimeId: _soroqRuntimeId,
+        channel: _soroqChannel,
+        controlPlaneBaseUrl: Uri.parse(_soroqControlPlaneBaseUrl),
+        pinnedEnginePublicKeyHex: _soroqPinnedEnginePublicKeyHex,
+      ),
+      activator: SoroqFreehandActivatorImpl(),
+    );
+    // Cold start, PHASE 1+2 ONLY: restore persisted state and do crash-loop accounting, with NO
+    // network and -- critically -- NO module load and NO redirect. Installing redirects before the
+    // first frame was reproduced 3/3 on a physical iPhone to leave the window permanently BLACK while
+    // the UI thread kept building frames and the redirected functions returned correct values. State
+    // work stays here because it is what makes crash-loop quarantine correct; activation moves to the
+    // first-frame callback below.
+    soroqRecordBootstrapPhase(SoroqPhase.controllerConfigureEnd);
+    soroqRecordBootstrapPhase(SoroqPhase.restorePrepareBegin);
+    await controller.restorePrepare();
+    soroqRecordBootstrapPhase(SoroqPhase.restorePrepareEnd);
+  } catch (_) {
+    // OTA wiring must never prevent the app from launching.
+  }
+%s
+
 }
-`, cfg.EntrypointImport, cfg.AppID, cfg.RuntimeID, cfg.Channel, cfg.ControlPlaneBaseURL, cfg.PinnedEnginePubKeyHex)
+`, cfg.EntrypointImport, cfg.AppID, cfg.RuntimeID, cfg.Channel, cfg.ControlPlaneBaseURL, cfg.PinnedEnginePubKeyHex, ordering)
 }
 
 // freehandBootstrapConfig is the resolved zero-touch runtime config baked into the bootstrap.
@@ -170,6 +213,45 @@ type freehandBootstrapConfig struct {
 	ControlPlaneBaseURL   string
 	PinnedEnginePubKeyHex string
 	EntrypointImport      string // package:<pkg>/<path under lib/>
+	// ActivateBeforeDeveloperMain selects the cold-start ordering that lets developer initialization
+	// observe a retained patch. DEFAULT FALSE, deliberately: installing redirects before Flutter's
+	// first frame was reproduced 3/3 on a physical iPhone as a permanently black window, and the
+	// corrected ordering (Soroq owns a real first frame, activates, then calls developer main) has not
+	// yet passed a physical cold-start run. Opt in with SOROQ_ACTIVATE_BEFORE_MAIN=1.
+	ActivateBeforeDeveloperMain bool
+	// LaunchColorARGB is the developer-declared launch-screen colour from soroq.yaml, as 0xAARRGGBB.
+	// Empty means undeclared, and the generated bootstrap then omits the argument so the package
+	// fallback applies. Flutter cannot read the native launch screen, so this is the only way the
+	// handoff surface can match it -- and it must reach production without the developer editing
+	// main.dart, which is the whole zero-touch contract.
+	LaunchColorARGB string
+}
+
+// soroqLaunchColorRE accepts #RRGGBB, #AARRGGBB and the 0x forms. Validated at GENERATION time so a
+// malformed value fails the build with a clear message instead of being baked into Dart as a literal
+// that will not compile, or worse, compiles to the wrong colour.
+var soroqLaunchColorRE = regexp.MustCompile(`^(?:#|0x|0X)?([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$`)
+
+// parseSoroqLaunchColor normalises a declared launch colour to a Dart 0xAARRGGBB literal.
+// A 6-digit value is treated as fully opaque, because a transparent handoff surface would reintroduce
+// the ambiguity the frame exists to remove.
+func parseSoroqLaunchColor(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	m := soroqLaunchColorRE.FindStringSubmatch(value)
+	if m == nil {
+		return "", fmt.Errorf("soroq.yaml launch_color %q is not a hex colour; use #RRGGBB or #AARRGGBB", raw)
+	}
+	digits := strings.ToUpper(m[1])
+	if len(digits) == 6 {
+		digits = "FF" + digits
+	}
+	if strings.HasPrefix(digits, "00") {
+		return "", fmt.Errorf("soroq.yaml launch_color %q is fully transparent; the handoff surface must be opaque so it never composites against an unknown platform surface", raw)
+	}
+	return "0x" + digits, nil
 }
 
 var (
@@ -245,13 +327,19 @@ func prepareFreehandZeroTouch(projectDir, pinnedKeyHex string, developerPassthro
 		return "", err
 	}
 
+	launchColor, launchErr := parseSoroqLaunchColor(parseTopLevelYaml(soroqBytes)["launch_color"])
+	if launchErr != nil {
+		return "", launchErr
+	}
 	cfg := freehandBootstrapConfig{
-		AppID:                 appID,
-		RuntimeID:             strings.ToLower(runtimeID),
-		Channel:               channel,
-		ControlPlaneBaseURL:   controlPlaneURL,
-		PinnedEnginePubKeyHex: strings.ToLower(strings.TrimSpace(pinnedKeyHex)),
-		EntrypointImport:      importURI,
+		ActivateBeforeDeveloperMain: os.Getenv("SOROQ_ACTIVATE_BEFORE_MAIN") == "1",
+		LaunchColorARGB:             launchColor,
+		AppID:                       appID,
+		RuntimeID:                   strings.ToLower(runtimeID),
+		Channel:                     channel,
+		ControlPlaneBaseURL:         controlPlaneURL,
+		PinnedEnginePubKeyHex:       strings.ToLower(strings.TrimSpace(pinnedKeyHex)),
+		EntrypointImport:            importURI,
 	}
 	if err := writeFreehandZeroTouchFiles(projectDir, cfg); err != nil {
 		return "", err

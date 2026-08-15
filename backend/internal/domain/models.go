@@ -258,6 +258,12 @@ type PatchCheckRequest struct {
 	CurrentPatchNumber int       `json:"current_patch_number"`
 	ClientID           string    `json:"client_id"`
 	Kind               PatchKind `json:"kind,omitempty"`
+	// Arch is the client's ABI (e.g. arm64-v8a). It is OPTIONAL for backward compatibility with
+	// already-shipped clients, but it is what makes patch selection architecture-safe: runtime_id is
+	// derived from trust + version and does NOT encode architecture, so without this an arm64 payload
+	// can be offered to an armeabi-v7a device. When it is absent and the runtime id spans more than one
+	// architecture, selection fails closed rather than guessing.
+	Arch string `json:"arch,omitempty"`
 }
 
 type PatchCheckResponse struct {

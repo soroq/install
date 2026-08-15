@@ -23,6 +23,10 @@ import (
 // can stub the SOROQ build step and exercise the soroq.lock pin-write path without a real Flutter build.
 var androidReleaseBuildFn = runFlutterAndroidReleaseBuild
 
+// iosReleaseBuildFn indirects the iOS build so command-level tests can prove that a refused shape
+// costs ZERO build invocations, rather than inferring it from where a guard sits in the source.
+var iosReleaseBuildFn = runFlutterIOSReleaseBuild
+
 // androidReleaseEnvGuardFn resolves the Android engine source WITHOUT touching the network, so a
 // broken toolchain still fails before any control-plane request. The duplicate-release preflight sits
 // behind it: a developer with no usable engine must hear about the engine, not about a release id.
@@ -244,6 +248,9 @@ func runReleaseAndroid(args []string) error {
 		return err
 	}
 	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
+		return err
+	}
+	if err := guardSupportedApplicationShape(*projectDir); err != nil {
 		return err
 	}
 
@@ -494,6 +501,9 @@ func runReleaseIOS(args []string) error {
 	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
 		return err
 	}
+	if err := guardSupportedIOSApplicationShape(*projectDir); err != nil {
+		return err
+	}
 
 	status, err := inspectProject(*projectDir)
 	if err != nil {
@@ -504,7 +514,7 @@ func runReleaseIOS(args []string) error {
 	// emit app.dill for the ios-engine patch lane. Decoupled from the config-lane control-plane
 	// registration below so a fresh dev can produce app.dill without a control-plane round-trip.
 	if *build {
-		return runFlutterIOSReleaseBuild(status.ProjectDir, strings.TrimSpace(*toolchainVersion), flutterBuildArgs)
+		return iosReleaseBuildFn(status.ProjectDir, strings.TrimSpace(*toolchainVersion), flutterBuildArgs)
 	}
 	if len(flutterBuildArgs) > 0 {
 		return errors.New("release ios does not build or upload an IPA without --build; remove passthrough build arguments or pass --build --toolchain <version>")
