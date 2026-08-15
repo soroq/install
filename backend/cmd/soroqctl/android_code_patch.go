@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	androidpatch "soroq/backend/internal/androidpatch"
 	"soroq/backend/internal/domain"
 )
 
@@ -195,13 +196,13 @@ func prepareAndroidCodePatchPlan(options androidCodePatchPlanOptions) (*androidC
 		target.ReleaseID = &trimmedReleaseID
 	}
 
-	codePayloads, nativeBlockers, err := extractAndroidCodePayloads(baseSnapshot, candidateSnapshot, workspaceRoot)
+	codePayloads, nativeBlockers, nativeNotes, err := extractAndroidCodePayloads(baseSnapshot, candidateSnapshot, workspaceRoot)
 	if err != nil {
 		return nil, err
 	}
 	blockers = append(blockers, nativeBlockers...)
 
-	notes := make([]string, 0, 4)
+	notes := make([]string, 0, 4+len(nativeNotes))
 	if candidateSnapshotPath != nil {
 		notes = append(notes, "candidate snapshot is persisted and can be reused by later code-diff tooling")
 	} else {
@@ -215,9 +216,16 @@ func prepareAndroidCodePatchPlan(options androidCodePatchPlanOptions) (*androidC
 	} else {
 		notes = append(notes, fmt.Sprintf("extracted %d changed libapp.so payload(s) into the workspace", len(codePayloads)))
 	}
-	if len(nativeBlockers) > 0 {
+	notes = append(notes, nativeNotes...)
+	switch {
+	case len(nativeBlockers) > 0:
 		notes = append(notes, "non-libapp native drift is still blocked for code-patch planning")
-	} else {
+	case len(nativeNotes) > 0:
+		notes = append(notes, fmt.Sprintf(
+			"only libapp.so changed across the compared native payloads, ignoring %d GNU build-id-only difference(s)",
+			len(nativeNotes),
+		))
+	default:
 		notes = append(notes, "only libapp.so changed across the compared native payloads")
 	}
 
@@ -250,14 +258,14 @@ func extractAndroidCodePayloads(
 	baseSnapshot *androidReleaseSnapshot,
 	candidateSnapshot *androidReleaseSnapshot,
 	workspaceRoot string,
-) ([]androidCodePayload, []androidCodePatchBlocker, error) {
+) ([]androidCodePayload, []androidCodePatchBlocker, []string, error) {
 	baseNative, err := readNativeLibraryEntriesFromArtifact(baseSnapshot.Artifact.Path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read base native libraries: %w", err)
+		return nil, nil, nil, fmt.Errorf("read base native libraries: %w", err)
 	}
 	candidateNative, err := readNativeLibraryEntriesFromArtifact(candidateSnapshot.Artifact.Path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read candidate native libraries: %w", err)
+		return nil, nil, nil, fmt.Errorf("read candidate native libraries: %w", err)
 	}
 
 	allPaths := make(map[string]struct{}, len(baseNative)+len(candidateNative))
@@ -271,9 +279,10 @@ func extractAndroidCodePayloads(
 	sortedPaths := sortedMapKeys(allPaths)
 	blockers := make([]androidCodePatchBlocker, 0)
 	payloadCandidates := make([]androidCodePayload, 0)
+	notes := make([]string, 0)
 
 	if err := os.RemoveAll(workspaceRoot); err != nil && !os.IsNotExist(err) {
-		return nil, nil, fmt.Errorf("reset workspace root: %w", err)
+		return nil, nil, nil, fmt.Errorf("reset workspace root: %w", err)
 	}
 
 	for _, path := range sortedPaths {
@@ -284,6 +293,15 @@ func extractAndroidCodePayloads(
 		}
 
 		if !isLibappPath(path) {
+			// A GNU build-id is stamped by the linker and is not a code
+			// change; libraries that differ only there are unchanged for OTA
+			// purposes. Everything else about the library still has to match
+			// byte for byte, and an unparseable ELF never reaches here as a
+			// match, so real native drift is still blocked.
+			if baseOK && candidateOK && androidpatch.NativeLibrariesMatchIgnoringBuildID(baseEntry.Bytes, candidateEntry.Bytes) {
+				notes = append(notes, androidpatch.BuildIDNormalizedDriftNote(path, baseEntry.SHA256, candidateEntry.SHA256))
+				continue
+			}
 			blockers = append(blockers, nativeDriftBlocker("blocked_native_drift", path, baseOK, candidateOK, baseEntry, candidateEntry))
 			continue
 		}
@@ -295,16 +313,16 @@ func extractAndroidCodePayloads(
 		baseWorkspacePath := filepath.Join(workspaceRoot, "base", filepath.FromSlash(path))
 		candidateWorkspacePath := filepath.Join(workspaceRoot, "candidate", filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(baseWorkspacePath), 0o755); err != nil {
-			return nil, nil, fmt.Errorf("create base workspace dir: %w", err)
+			return nil, nil, nil, fmt.Errorf("create base workspace dir: %w", err)
 		}
 		if err := os.MkdirAll(filepath.Dir(candidateWorkspacePath), 0o755); err != nil {
-			return nil, nil, fmt.Errorf("create candidate workspace dir: %w", err)
+			return nil, nil, nil, fmt.Errorf("create candidate workspace dir: %w", err)
 		}
 		if err := os.WriteFile(baseWorkspacePath, baseEntry.Bytes, 0o644); err != nil {
-			return nil, nil, fmt.Errorf("write base payload %s: %w", path, err)
+			return nil, nil, nil, fmt.Errorf("write base payload %s: %w", path, err)
 		}
 		if err := os.WriteFile(candidateWorkspacePath, candidateEntry.Bytes, 0o644); err != nil {
-			return nil, nil, fmt.Errorf("write candidate payload %s: %w", path, err)
+			return nil, nil, nil, fmt.Errorf("write candidate payload %s: %w", path, err)
 		}
 
 		baseWorkspacePathClean := filepath.Clean(baseWorkspacePath)
@@ -327,7 +345,7 @@ func extractAndroidCodePayloads(
 		}
 		return payloadCandidates[i].ABI < payloadCandidates[j].ABI
 	})
-	return payloadCandidates, blockers, nil
+	return payloadCandidates, blockers, notes, nil
 }
 
 func readNativeLibraryEntriesFromArtifact(artifactPath string) (map[string]androidArtifactFile, error) {
