@@ -60,6 +60,17 @@ func newEngineLaneProjectWithConfig(t *testing.T, pubspec, soroqYAML string) *en
 		t.Fatalf("mkdir lib: %v", err)
 	}
 	writeFile(t, filepath.Join(dir, "lib", "main.dart"), "void main() {}\n")
+	// A RESOLVABLE project. Without a lock file and package_config the release route now refuses at
+	// contractProjectLibraries -- correctly, because a base built from an unresolvable project ships a
+	// retention contract missing its own libraries and every device silently quarantines its patches.
+	// Leaving the fixture unresolvable would make these tests pass for the WRONG reason: the route
+	// would stop early and the boundaries past it would never be exercised at all.
+	writeFile(t, filepath.Join(dir, "pubspec.lock"), "packages: {}\nsdks:\n  dart: \">=3.0.0 <4.0.0\"\n")
+	if err := os.MkdirAll(filepath.Join(dir, ".dart_tool"), 0o755); err != nil {
+		t.Fatalf("mkdir .dart_tool: %v", err)
+	}
+	writeFile(t, filepath.Join(dir, ".dart_tool", "package_config.json"),
+		`{"configVersion":2,"packages":[{"name":"example_app","rootUri":"../","packageUri":"lib/","languageVersion":"3.0"}]}`)
 
 	c := &engineLaneCounters{}
 	prevTrust, prevRes, prevScaffold := engineLaneEnsureManifestTrustFn, engineLanePrepareResolutionFn, engineLaneGenerateScaffoldFn
@@ -133,6 +144,13 @@ func (p *engineLaneProject) assertUntouched(t *testing.T, before map[string]stri
 		}
 	}
 	// The specific artefacts this route would produce, named so a failure says which stage ran.
+	//
+	// Compared against the BASELINE, not against absolute absence: the fixture is now a resolvable
+	// project, so .dart_tool/package_config.json legitimately exists before the command runs. The
+	// property being asserted is that a refusal CREATES none of these, which is what "not in `before`"
+	// expresses. Asserting absolute absence would have quietly forced the fixture to stay unresolvable,
+	// and an unresolvable fixture makes the route refuse early for the wrong reason -- so every
+	// boundary past that point would go unexercised while the tests still passed.
 	for _, forbidden := range []string{
 		".soroq/manifest_signing_key.seed",        // project key creation
 		".dart_tool/package_config.json",          // dependency-resolution mutation
@@ -140,8 +158,11 @@ func (p *engineLaneProject) assertUntouched(t *testing.T, before map[string]stri
 		"lib/soroq_activator.dart",                // generated scaffold
 		".soroq/generated/soroq_bootstrap.g.dart", // freehand bootstrap
 	} {
+		if _, existedBefore := before[forbidden]; existedBefore {
+			continue
+		}
 		if _, err := os.Stat(filepath.Join(p.dir, forbidden)); err == nil {
-			t.Errorf("refusal produced %s", forbidden)
+			t.Errorf("refusal CREATED %s", forbidden)
 		}
 	}
 	if entries, _ := filepath.Glob(filepath.Join(p.dir, ".soroq", "releases", "*")); len(entries) != 0 {

@@ -329,11 +329,16 @@ func d3Manifest() domain.PatchManifest {
 // publishSignedBundle stands in for the publication step, in the ORDER OF OPERATIONS that
 // store.normalizePatchBundleForPatch uses: sign first, attach, and only then emit the artifact.
 //
-// It is typed to ManifestSignerBackend, which is the seam. NOTE, and this is load-bearing for how
-// property 3 may be read: no production publish path accepts that interface today -- FileStore,
-// PostgresStore and normalizePatchBundleForPatch are all typed to the concrete *ManifestSigner. So
-// this proves the seam refuses before anything is emitted; it does not, and must not be read to,
-// prove that some already-wired production publish path was driven by an external signer.
+// It is typed to ManifestSignerBackend, which is the seam. SCOPE, and this is load-bearing for how
+// property 3 may be read: what this file proves is that the SEAM refuses before anything is emitted.
+// It is a stand-in for publication, not a production publish path.
+//
+// The production paths (normalizePatchBundleForPatch, FileStore, PostgresStore) were typed to the
+// concrete *ManifestSigner when this file was written, so an external signer could not be reached
+// from a deployment at all. They now accept ManifestSignerBackend and soroqd can select an external
+// signer from the environment; the evidence that a REAL publish path is driven by one, and writes
+// nothing when it refuses, is internal/store/external_signer_publish_test.go. Neither file should be
+// read as a cloud-KMS integration.
 func publishSignedBundle(outputDir string, manifest domain.PatchManifest, backend ManifestSignerBackend) (string, error) {
 	signature, err := backend.SignManifest(manifest)
 	if err != nil {
