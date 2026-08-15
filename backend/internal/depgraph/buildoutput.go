@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"soroq/backend/internal/nativeelf"
 )
 
 // OutputCategory classifies one entry of a build output.
@@ -38,6 +40,43 @@ type OutputEntry struct {
 	Category OutputCategory
 	SHA256   string
 	Size     int64
+
+	// CompareDigest is what native-library DRIFT is judged on; SHA256 remains the file's true
+	// content hash and keeps its meaning everywhere else (identity, manifests, reporting).
+	//
+	// They differ for exactly one reason. A linker stamps every ELF with an NT_GNU_BUILD_ID note
+	// derived partly from the link environment, so compiling identical sources at a different
+	// absolute path yields a byte-different .so containing identical code. Comparing raw SHA256
+	// made `soroq patch android --code` refuse a build-id-only difference in libdartjni.so and
+	// report blocked_native_drift — which any consumer of a plugin with a native library hits, for
+	// no defect at all.
+	//
+	// For anything that is not an ELF carrying such a note, this is the plain SHA256, so the
+	// comparison is unchanged. Fail-closed by construction: an unparseable or truncated library
+	// yields no normalised digest and falls back to strict equality rather than to a match.
+	CompareDigest string
+}
+
+// compareDigest is the value native-library equality is tested on. Non-native entries and anything
+// the normaliser cannot parse fall back to the raw hash.
+func (e OutputEntry) compareDigest() string {
+	if e.CompareDigest != "" {
+		return e.CompareDigest
+	}
+	return e.SHA256
+}
+
+// nativeCompareDigest normalises a native library for comparison, returning "" when the bytes are
+// not an ELF with a build-id note — in which case the caller keeps using the raw SHA256.
+func nativeCompareDigest(category OutputCategory, data []byte) string {
+	if category != CatNativeLib {
+		return ""
+	}
+	digest, ok := nativeelf.ComparisonDigest(data)
+	if !ok {
+		return ""
+	}
+	return digest
 }
 
 // OutputDiff is the categorized base→candidate difference of two build outputs.
@@ -109,7 +148,7 @@ func DiffBuildOutputs(base, cand map[string]OutputEntry) OutputDiff {
 		case CatNativeLib:
 			if !inBase {
 				d.AddedNativeLibs = append(d.AddedNativeLibs, p)
-			} else if b.SHA256 != c.SHA256 {
+			} else if b.compareDigest() != c.compareDigest() {
 				d.ChangedNativeLibs = append(d.ChangedNativeLibs, p)
 			}
 		case CatRegistrant:
@@ -183,7 +222,15 @@ func scanBuildDir(root string) (map[string]OutputEntry, error) {
 		if ierr != nil {
 			return ierr
 		}
-		out[relSlash] = OutputEntry{Path: relSlash, Category: categorizeOutputPath(relSlash), SHA256: sha, Size: info.Size()}
+		category := categorizeOutputPath(relSlash)
+		var compare string
+		if category == CatNativeLib {
+			// Read in full only for native libraries; every other category still streams its hash.
+			if data, rerr := os.ReadFile(p); rerr == nil {
+				compare = nativeCompareDigest(category, data)
+			}
+		}
+		out[relSlash] = OutputEntry{Path: relSlash, Category: category, SHA256: sha, Size: info.Size(), CompareDigest: compare}
 		return nil
 	})
 	if err != nil {
@@ -213,7 +260,14 @@ func scanBuildArchive(path string) (map[string]OutputEntry, error) {
 		if err != nil {
 			return nil, err
 		}
-		out[name] = OutputEntry{Path: name, Category: categorizeOutputPath(name), SHA256: sha256Hex(data), Size: int64(len(data))}
+		category := categorizeOutputPath(name)
+		out[name] = OutputEntry{
+			Path:          name,
+			Category:      category,
+			SHA256:        sha256Hex(data),
+			Size:          int64(len(data)),
+			CompareDigest: nativeCompareDigest(category, data),
+		}
 	}
 	return out, nil
 }

@@ -18,7 +18,7 @@ import (
 // Fixtures are shared with that package rather than duplicated: real Android
 // NDK shared objects, one pair per shipped ABI, linked from identical sources
 // with two different explicit GNU build-ids. See the directory's README.md.
-const nativeBuildIDFixtureRoot = "../../internal/androidpatch/testdata/native_build_id"
+const nativeBuildIDFixtureRoot = "../../internal/nativeelf/testdata/native_build_id"
 
 var nativeBuildIDFixtureABIs = []string{"arm64-v8a", "armeabi-v7a", "x86_64"}
 

@@ -1,11 +1,18 @@
-package androidpatch
+package nativeelf
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"debug/elf"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 )
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
 
 // A linker stamps every ELF it produces with an NT_GNU_BUILD_ID note. The
 // descriptor of that note is derived from the link inputs *and* from build
@@ -70,10 +77,10 @@ func normalizeNativeLibraryForComparison(raw []byte) ([]byte, bool) {
 	return normalized, true
 }
 
-// nativeComparisonDigest hashes a native library with the GNU build-id note
+// ComparisonDigest hashes a native library with the GNU build-id note
 // descriptor normalised away. It reports false when the library could not be
 // parsed, in which case there is no digest and the caller must stay strict.
-func nativeComparisonDigest(raw []byte) (string, bool) {
+func ComparisonDigest(raw []byte) (string, bool) {
 	normalized, ok := normalizeNativeLibraryForComparison(raw)
 	if !ok {
 		return "", false
@@ -84,10 +91,12 @@ func nativeComparisonDigest(raw []byte) (string, bool) {
 // NativeLibrariesMatchIgnoringBuildID reports whether two native libraries are
 // identical once the GNU build-id note descriptor is normalised.
 //
-// This is the single implementation shared by both code-patch planners: the
-// shipped `soroq patch android --code` path (PrepareCodePatchPlan, below) and
-// the internal soroqctl planner. A second copy would drift, and a drifting copy
-// is how the defect this fixes reached users on one path and not the other.
+// This package exists because the comparison had THREE independent copies, and
+// fixing two of them still left `soroq patch android --code` refusing a
+// deliverable patch: androidpatch.PrepareCodePatchPlan (the shipped path),
+// soroqctl's internal planner, and depgraph.DiffBuildOutputs, which the same
+// command reaches through assertAndroidDependencyDeliverable. All three now call
+// in here. A drifting copy is exactly how this defect survived being "fixed".
 //
 // It fails closed in every direction: differing sizes, an unparseable ELF on
 // either side, or any surviving byte difference all report false, which leaves
@@ -96,11 +105,11 @@ func NativeLibrariesMatchIgnoringBuildID(base []byte, candidate []byte) bool {
 	if len(base) != len(candidate) {
 		return false
 	}
-	baseDigest, baseOK := nativeComparisonDigest(base)
+	baseDigest, baseOK := ComparisonDigest(base)
 	if !baseOK {
 		return false
 	}
-	candidateDigest, candidateOK := nativeComparisonDigest(candidate)
+	candidateDigest, candidateOK := ComparisonDigest(candidate)
 	if !candidateOK {
 		return false
 	}

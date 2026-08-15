@@ -18,6 +18,7 @@ import (
 
 	androidrelease "soroq/backend/internal/androidrelease"
 	"soroq/backend/internal/domain"
+	"soroq/backend/internal/nativeelf"
 	"soroq/backend/internal/signing"
 )
 
@@ -573,8 +574,8 @@ func extractAndroidCodePayloads(
 			// purposes. Everything else about the library still has to match
 			// byte for byte, and an unparseable ELF never reaches here as a
 			// match, so real native drift is still blocked.
-			if NativeLibrariesMatchIgnoringBuildID(baseFile.Bytes, candidateFile.Bytes) {
-				notes = append(notes, BuildIDNormalizedDriftNote(path, baseFile.SHA256, candidateFile.SHA256))
+			if nativeelf.NativeLibrariesMatchIgnoringBuildID(baseFile.Bytes, candidateFile.Bytes) {
+				notes = append(notes, nativeelf.BuildIDNormalizedDriftNote(path, baseFile.SHA256, candidateFile.SHA256))
 				continue
 			}
 			blockers = append(blockers, nativeDriftBlocker(path, baseFile, true, candidateFile, true, "only libapp.so may change in the current code patch lane"))

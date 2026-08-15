@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	androidpatch "soroq/backend/internal/androidpatch"
 	"soroq/backend/internal/domain"
+	"soroq/backend/internal/nativeelf"
 )
 
 type androidCodePatchPlanOptions struct {
@@ -298,8 +298,8 @@ func extractAndroidCodePayloads(
 			// purposes. Everything else about the library still has to match
 			// byte for byte, and an unparseable ELF never reaches here as a
 			// match, so real native drift is still blocked.
-			if baseOK && candidateOK && androidpatch.NativeLibrariesMatchIgnoringBuildID(baseEntry.Bytes, candidateEntry.Bytes) {
-				notes = append(notes, androidpatch.BuildIDNormalizedDriftNote(path, baseEntry.SHA256, candidateEntry.SHA256))
+			if baseOK && candidateOK && nativeelf.NativeLibrariesMatchIgnoringBuildID(baseEntry.Bytes, candidateEntry.Bytes) {
+				notes = append(notes, nativeelf.BuildIDNormalizedDriftNote(path, baseEntry.SHA256, candidateEntry.SHA256))
 				continue
 			}
 			blockers = append(blockers, nativeDriftBlocker("blocked_native_drift", path, baseOK, candidateOK, baseEntry, candidateEntry))
