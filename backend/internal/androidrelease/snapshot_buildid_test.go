@@ -3,6 +3,7 @@ package androidrelease
 import (
 	"bytes"
 	"debug/elf"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -163,3 +164,130 @@ func TestCompareNativeLibraryMapsRefusesSizeMismatch(t *testing.T) {
 func nativeComparisonDigestForTest(raw []byte) (string, bool) {
 	return nativeelf.ComparisonDigest(raw)
 }
+
+// END TO END THROUGH THE SHAPE THE SHIPPED ASSET LANE ACTUALLY USES.
+//
+// The tests above build EntryDigest maps by hand, which proves the comparison but NOT that
+// readNativeLibrariesFromZip records the digest, and not that it survives the JSON round trip the
+// real lane performs — patch_cmd.go writes base-snapshot.json and PreparePlan reloads it. A digest
+// computed but never persisted would pass every test above and fail in production.
+//
+// So this drives the real path: capture two APK zips -> marshal -> LoadSnapshot -> CompareSnapshots.
+func TestCaptureCompareRoundTripAcceptsBuildIDOnlyNativeDrift(t *testing.T) {
+	t.Parallel()
+
+	capture := func(lib []byte, dart []byte) *Snapshot {
+		path := filepath.Join(t.TempDir(), "app-release.apk")
+		writeArtifactZip(t, path, map[string][]byte{
+			"assets/flutter_assets/soroq/soroq_metadata.json": buildIDRoundTripMetadata,
+			"lib/arm64-v8a/libdartjni.so":                     lib,
+			"lib/arm64-v8a/libapp.so":                         dart,
+		})
+		snapshot, err := CaptureSnapshot(path)
+		if err != nil {
+			t.Fatalf("CaptureSnapshot: %v", err)
+		}
+		// The round trip the shipped lane performs: snapshots are written to disk and reloaded.
+		encoded, err := json.Marshal(snapshot)
+		if err != nil {
+			t.Fatalf("marshal snapshot: %v", err)
+		}
+		reloadPath := filepath.Join(t.TempDir(), "snapshot.json")
+		if err := os.WriteFile(reloadPath, encoded, 0o644); err != nil {
+			t.Fatalf("write snapshot: %v", err)
+		}
+		reloaded, err := LoadSnapshot(reloadPath)
+		if err != nil {
+			t.Fatalf("LoadSnapshot: %v", err)
+		}
+		return reloaded
+	}
+
+	// ONE VARIABLE: the build-id of libdartjni.so. libapp.so is held IDENTICAL on purpose.
+	//
+	// The first version of this test also varied libapp.so and failed — correctly. Unlike depgraph,
+	// androidrelease treats every lib/**/*.so as a native library, libapp.so included, and this
+	// comparison guards the ASSET lane, where the Dart payload is precisely what must NOT change.
+	// Varying both conflated a legitimate refusal with the defect under test.
+	dart := []byte("dart payload, identical on both sides")
+	base := capture(readBuildIDFixture(t, "arm64-v8a", "a"), dart)
+	candidate := capture(readBuildIDFixture(t, "arm64-v8a", "b"), dart)
+
+	// The digest must have SURVIVED serialization, or the rest of this is accidental.
+	//
+	// Looked up BY PATH, not by index. NativeLibs is sorted, so index 0 is libapp.so -- the Dart
+	// payload, which is not an ELF and correctly carries no digest. Indexing blindly made this
+	// assertion fail against a working implementation.
+	var dartjni EntryDigest
+	for _, entry := range base.NativeLibs {
+		if entry.Path == "lib/arm64-v8a/libdartjni.so" {
+			dartjni = entry
+		}
+	}
+	if dartjni.Path == "" {
+		t.Fatal("libdartjni.so is missing from the captured snapshot")
+	}
+	if dartjni.CompareDigest == "" {
+		t.Fatal("compare_digest did not survive the JSON round trip; the shipped lane reloads " +
+			"snapshots from disk, so a digest that is computed but not persisted buys nothing")
+	}
+
+	report := CompareSnapshots(base, candidate)
+	for _, check := range report.Checks {
+		if check.ID == "native_libraries" && !check.Passed {
+			t.Fatalf("native_libraries check failed on a build-id-only difference: %s", check.Detail)
+		}
+	}
+	if !report.Compatible {
+		t.Fatalf("CompareSnapshots reported incompatible on a build-id-only difference; "+
+			"`soroq patch android --kind asset` would refuse this: %+v", report.Checks)
+	}
+}
+
+// CONTROL for the round trip: real code drift must still be refused all the way through.
+func TestCaptureCompareRoundTripStillRefusesRealCodeDrift(t *testing.T) {
+	t.Parallel()
+
+	raw := readBuildIDFixture(t, "arm64-v8a", "a")
+	file, err := elf.NewFile(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("parse ELF: %v", err)
+	}
+	text := file.Section(".text")
+	mutated := make([]byte, len(raw))
+	copy(mutated, raw)
+	mutated[text.Offset+text.Size/2] ^= 0xff
+
+	capture := func(lib []byte) *Snapshot {
+		path := filepath.Join(t.TempDir(), "app-release.apk")
+		writeArtifactZip(t, path, map[string][]byte{
+			"assets/flutter_assets/soroq/soroq_metadata.json": buildIDRoundTripMetadata,
+			"lib/arm64-v8a/libdartjni.so":                     lib,
+			"lib/arm64-v8a/libapp.so":                         []byte("dart"),
+		})
+		snapshot, err := CaptureSnapshot(path)
+		if err != nil {
+			t.Fatalf("CaptureSnapshot: %v", err)
+		}
+		return snapshot
+	}
+
+	report := CompareSnapshots(capture(raw), capture(mutated))
+	if report.Compatible {
+		t.Fatal("a real .text change was reported compatible end to end; normalisation is masking " +
+			"genuine native drift on the asset lane")
+	}
+}
+
+var buildIDRoundTripMetadata = []byte(`{
+  "schema_version": 1,
+  "app": { "name": "Example", "version": "1.2.3+45", "build_name": "1.2.3", "build_number": "45" },
+  "soroq": {
+    "app_id": "com.example.app",
+    "channel": "stable",
+    "runtime_id": "runtime-1",
+    "runtime_id_strategy": "manifest_trust_v1",
+    "manifest_trust": { "keys": [ { "id": "prod-primary", "public_key": "abc" } ] },
+    "manifest_trust_fingerprint": "fingerprint-1"
+  }
+}`)
