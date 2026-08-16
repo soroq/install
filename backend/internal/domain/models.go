@@ -284,7 +284,32 @@ type RuntimeEvent struct {
 	Kind         RuntimeEventKind `json:"kind"`
 	PatchNumber  *int             `json:"patch_number,omitempty"`
 	PatchNumbers []int            `json:"patch_numbers,omitempty"`
+
+	// FailureClass says WHY an install failed. Gate B2 asks for the signature/hash refusal rate, and
+	// until this existed every failure arrived as an undifferentiated patch_install_failure — the
+	// numerator that metric names could not be extracted from what production recorded, so the honest
+	// answer was "cannot be measured" rather than a guess.
+	//
+	// `omitempty` and free-form on purpose: an older client sends nothing and still reports a failure
+	// exactly as before, and a client that learns a new refusal reason does not need a server release
+	// to report it. Unknown values are counted under their own key rather than dropped — a taxonomy
+	// that silently discards what it does not recognise is how a gap like this one reappears.
+	FailureClass string `json:"failure_class,omitempty"`
 }
+
+// Failure classes the runtime reports today. These are the values Soroq's own client emits; the field
+// accepts others so a newer client is never silenced by an older server.
+const (
+	// The two B2 actually asks about.
+	FailureClassSignatureRefused = "signature_refused"
+	FailureClassHashMismatch     = "hash_mismatch"
+
+	FailureClassDownloadFailed   = "download_failed"
+	FailureClassBytecodeRejected = "bytecode_rejected"
+	FailureClassActivationFailed = "activation_failed"
+	// Reported when a client knows only that the install failed.
+	FailureClassUnspecified = "unspecified"
+)
 
 type BootReportRequest struct {
 	AppID             string         `json:"app_id"`
@@ -303,15 +328,21 @@ type BootReportResponse struct {
 }
 
 type PatchHealth struct {
-	PatchID             string           `json:"patch_id"`
-	PatchNumber         int              `json:"patch_number"`
-	SuccessCount        int              `json:"success_count"`
-	FailureCount        int              `json:"failure_count"`
-	SuccessfulClientIDs []string         `json:"successful_client_ids"`
-	FailedClientIDs     []string         `json:"failed_client_ids"`
-	LastEventKind       RuntimeEventKind `json:"last_event_kind,omitempty"`
-	LastEventAt         time.Time        `json:"last_event_at,omitempty"`
-	RolledBack          bool             `json:"rolled_back"`
+	PatchID             string   `json:"patch_id"`
+	PatchNumber         int      `json:"patch_number"`
+	SuccessCount        int      `json:"success_count"`
+	FailureCount        int      `json:"failure_count"`
+	SuccessfulClientIDs []string `json:"successful_client_ids"`
+	FailedClientIDs     []string `json:"failed_client_ids"`
+	// FailureClasses is the B2 histogram: failure class -> distinct clients reporting it. Counted by
+	// CLIENT, not by event, to match FailureCount directly above — a device that retries and fails
+	// five times is one failing device, and counting events would inflate a refusal rate by exactly
+	// the retry behaviour that a refusal causes.
+	FailureClasses map[string]int `json:"failure_classes,omitempty"`
+
+	LastEventKind RuntimeEventKind `json:"last_event_kind,omitempty"`
+	LastEventAt   time.Time        `json:"last_event_at,omitempty"`
+	RolledBack    bool             `json:"rolled_back"`
 }
 
 // ToolchainArtifact is one hosted toolchain file (an archive/role inside a platform set), matching the
