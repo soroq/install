@@ -64,6 +64,13 @@ type FreehandPatchPlan struct {
 	NewCodeClosure         []string            `json:"new_code_closure"`
 	Diff                   *FreehandDiffReport `json:"diff"`
 
+	// BaseIdentity is the COMPLETE rich identity of the base this patch was diffed against, derived from
+	// the verified baseline struct (never from a re-read of baseline.json). It travels the whole way —
+	// plan -> artifact metadata -> signed device manifest — because runtime_id alone is version-derived
+	// and two structurally different bases sharing app/channel/version/trust collide on it, so a patch
+	// bound only by runtime_id is deliverable to a base it was never compiled for.
+	BaseIdentity *FreehandRichBaseIdentity `json:"base_identity_record"`
+
 	// DependencyDescriptor is the base→candidate RUNTIME dependency delta, already assessed as
 	// code-only deliverable and anchored to the immutable base graph recorded in the release baseline.
 	// Its digest is bound into the artifact identity, the module manifest and the signed metadata.
@@ -338,12 +345,38 @@ func computeFreehandPatchPlan(projectDir, flutterRoot string) (*FreehandPatchPla
 	if !rep.Supported {
 		return nil, fmt.Errorf("freehand diff did not produce a supported patch (no changed patchable declarations)")
 	}
+	// CAPABILITY GATE — the diff has produced changed-patchable declarations, and nothing has been
+	// synthesised yet. Every identity here is about to become a redirect on the device, so this is the
+	// last point at which "the base's engine cannot honour this kind" is a message to a developer rather
+	// than a patch that installs cleanly and does nothing. It runs BEFORE module synthesis so the refusal
+	// costs no compile, and it consults the base's recorded capability data rather than any list here.
+	changedDecls, err := changedDeclsFromDiff(rep.Changed)
+	if err != nil {
+		return nil, fmt.Errorf("freehand patch refused — %w", err)
+	}
+	if err := assertFreehandRedirectCapability(base, changedDecls); err != nil {
+		return nil, fmt.Errorf("freehand patch refused — %w", err)
+	}
+	// CONSTANT-PROPAGATION GATE. The capability gate above asks whether the engine can honour this KIND
+	// of identity. This one asks a question no runtime can answer: whether the base's own compiler
+	// already replaced the calls with the value, in which case a perfectly committed redirect changes
+	// nothing. See freehand_foldcheck.go for the measurement this rule is built on.
+	if err := assertFreehandNoFoldedValue(relDir, changedDecls); err != nil {
+		return nil, fmt.Errorf("freehand patch refused — %w", err)
+	}
 
 	closure := make([]string, 0, len(rep.NewCodeClosure))
 	for _, c := range rep.NewCodeClosure {
 		if ml, ok := c["manifestLine"].(string); ok {
 			closure = append(closure, ml)
 		}
+	}
+	// Derived from the VERIFIED baseline struct above. A base that cannot produce a complete identity
+	// cannot produce a deliverable patch either, so this fails the patch here rather than emitting an
+	// artifact that the publish gate would refuse after the compile has already been paid for.
+	baseIdentity, err := richBaseIdentityFromBaseline(base)
+	if err != nil {
+		return nil, fmt.Errorf("freehand patch refused — %w", err)
 	}
 	return &FreehandPatchPlan{
 		Schema:                     "soroq.freehand.patch_plan.v1",
@@ -353,6 +386,7 @@ func computeFreehandPatchPlan(projectDir, flutterRoot string) (*FreehandPatchPla
 		Version:                    base.Version,
 		IdentitySchema:             base.IdentitySchema,
 		BaseAppDillSHA256:          base.AppDillSHA256,
+		BaseIdentity:               &baseIdentity,
 		BaseSourceKernelSHA256:     base.SourceAppDillSHA256,
 		CandSourceKernelSHA256:     candSHA,
 		SourceRecipeDigest:         base.SourceRecipeDigest,
@@ -473,23 +507,27 @@ func computeToolchainBinding(flutterRoot, bundleDir, toolchain string, needsFlut
 
 // FreehandPatchArtifactMeta is the immutable, bound metadata for a generated freehand patch module.
 type FreehandPatchArtifactMeta struct {
-	Schema                 string                   `json:"schema"` // freehandPatchArtifactSchema
-	RuntimeID              string                   `json:"runtime_id"`
-	IdentitySchema         string                   `json:"identity_schema"`
-	AppID                  string                   `json:"app_id"`
-	Version                string                   `json:"version"`
-	Channel                string                   `json:"channel"`
-	BaseAppDillSHA256      string                   `json:"base_app_dill_sha256"`
-	BaseSourceKernelSHA256 string                   `json:"base_source_kernel_sha256"`
-	CandSourceKernelSHA256 string                   `json:"candidate_source_kernel_sha256"`
-	SourceRecipeDigest     string                   `json:"source_kernel_recipe_digest"`
-	PatchPlanSHA256        string                   `json:"patch_plan_sha256"`
-	ModuleSourceSHA256     string                   `json:"module_source_sha256"`
-	ModuleGraphDigest      string                   `json:"module_graph_digest"`
-	CarriedLibraries       []freehandCarriedLibrary `json:"carried_libraries"`
-	ModuleBytecodeSHA256   string                   `json:"module_bytecode_sha256"`
-	ModuleManifestSHA256   string                   `json:"module_manifest_sha256"` // sha of soroq_freehand_module_manifest.json (the durable replacement ABI)
-	ModuleLibrary          string                   `json:"module_library"`         // synthetic module-library identity for runtime lookup
+	Schema            string `json:"schema"` // freehandPatchArtifactSchema
+	RuntimeID         string `json:"runtime_id"`
+	IdentitySchema    string `json:"identity_schema"`
+	AppID             string `json:"app_id"`
+	Version           string `json:"version"`
+	Channel           string `json:"channel"`
+	BaseAppDillSHA256 string `json:"base_app_dill_sha256"`
+	// BaseIdentity is the rich base identity carried verbatim from the plan. `base_app_dill_sha256`
+	// above is the same value as its BaseFingerprint; both are kept because the former is what the
+	// existing diff/verification paths read and the latter is what the device compares.
+	BaseIdentity           *FreehandRichBaseIdentity `json:"base_identity_record"`
+	BaseSourceKernelSHA256 string                    `json:"base_source_kernel_sha256"`
+	CandSourceKernelSHA256 string                    `json:"candidate_source_kernel_sha256"`
+	SourceRecipeDigest     string                    `json:"source_kernel_recipe_digest"`
+	PatchPlanSHA256        string                    `json:"patch_plan_sha256"`
+	ModuleSourceSHA256     string                    `json:"module_source_sha256"`
+	ModuleGraphDigest      string                    `json:"module_graph_digest"`
+	CarriedLibraries       []freehandCarriedLibrary  `json:"carried_libraries"`
+	ModuleBytecodeSHA256   string                    `json:"module_bytecode_sha256"`
+	ModuleManifestSHA256   string                    `json:"module_manifest_sha256"` // sha of soroq_freehand_module_manifest.json (the durable replacement ABI)
+	ModuleLibrary          string                    `json:"module_library"`         // synthetic module-library identity for runtime lookup
 	// (carried_libraries above maps every carried package library to its own synthetic URI)
 	NeedsFlutterTarget     bool                      `json:"needs_flutter_target"`
 	ToolchainBinding       *FreehandToolchainBinding `json:"toolchain_binding"`
@@ -667,9 +705,183 @@ var abiKinds = map[string]bool{"function": true, "static-method": true, "instanc
 type changedDecl struct {
 	manifestLine string // == replacement_abi.base_identity
 	stableKey    string // == replacement_abi.stable_identity ("v1|libUri|kind|class|member|sigShort")
+	keyKind      string // SEMANTIC kind segment parsed from stableKey (never an ABI shape label)
 	keyClass     string // class segment parsed from stableKey
 	keyMember    string // member segment parsed from stableKey
 	keyIsFunc    bool   // stableKey kind segment == "function"
+}
+
+// freehandSemanticKinds is the universe of frozen identity kinds — the third segment of a v1 stable
+// identity. expectABI below is the authority on what each one means, so this set is exactly the set of
+// cases in its switch; TestSemanticKindUniverseMatchesExpectABI holds the two in agreement, so a kind
+// added there can never become a kind a base's capability record is unable to name.
+var freehandSemanticKinds = map[string]bool{
+	"function": true, "method": true, "static-method": true,
+	"getter": true, "setter": true, "operator": true,
+	"constructor": true, "factory": true, "field-initializer": true,
+}
+
+func freehandSemanticKindList() string {
+	out := make([]string, 0, len(freehandSemanticKinds))
+	for k := range freehandSemanticKinds {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
+}
+
+// assertFreehandRedirectCapability refuses, BEFORE any module is synthesised, a changed identity whose
+// semantic kind the base's engine has not been shown to honour.
+//
+// THE FAILURE THIS EXISTS FOR. Three constructor identities were published, verified, staged and
+// committed on a real iPhone (`transition.result committed=4`) and changed nothing observable. Every
+// producer- and transport-side guard passed, correctly: the names were the VM's own, the ABI was a valid
+// bijection with measured shapes, the signature verified, the engine resolved both ends and set the
+// slot. Setting a slot the running code never consults is indistinguishable, from every one of those
+// vantage points, from success. This is the only place that asks whether the base's ENGINE can honour a
+// redirect on that KIND of identity rather than merely resolve one.
+//
+// It is ADDITIVE: it relaxes nothing in parseAndValidateModuleManifest, and an entry it admits still
+// faces every ABI, bijection and shape check unchanged. And it decides from the base's RECORDED data,
+// so an engine build that declares constructor support unlocks constructors through this same code.
+func assertFreehandRedirectCapability(base *FreehandBaselineMeta, decls []changedDecl) error {
+	caps, err := baseRedirectCapabilities(base)
+	if err != nil {
+		return fmt.Errorf("cannot decide what this base's engine can honour: %w", err)
+	}
+	honoured := caps.kindSet()
+	refused := make([]string, 0, len(decls))
+	kinds := make([]string, 0, len(decls))
+	seenKind := map[string]bool{}
+	for _, d := range decls {
+		if honoured[d.keyKind] {
+			continue
+		}
+		refused = append(refused, fmt.Sprintf("kind %q: %s   (frozen identity %s)", d.keyKind, d.manifestLine, d.stableKey))
+		if !seenKind[d.keyKind] {
+			seenKind[d.keyKind] = true
+			kinds = append(kinds, d.keyKind)
+		}
+	}
+	if len(refused) == 0 {
+		return nil
+	}
+	sort.Strings(kinds)
+	return fmt.Errorf("this base's engine does not honour redirects on %s identities, so the patch would install, commit and change NOTHING on device:\n  - %s\n"+
+		"  base engine %s honours: [%s] (source: %s)\n"+
+		"  why: %s\n"+
+		"  A redirect on an unhonoured kind resolves, passes every ABI check and commits — and the running code never consults the slot,\n"+
+		"  so the app keeps executing base code while every layer reports success. Refusing here makes that silence loud.\n"+
+		"  To ship it: release a new base built on an engine whose bundle declares %s including %s — no producer change is needed, the\n"+
+		"  capability is read from the base.",
+		strings.Join(kinds, "/"), joinLines(refused),
+		caps.EngineRevision, caps.kindList(), caps.Source, caps.Note,
+		freehandEngineCapabilityKey, strings.Join(kinds, "/"))
+}
+
+// abiExpectation is what a frozen identity requires of its replacement_abi entry: the VM name the
+// identity must carry at BOTH ends, and the shape labels the runtime will accept for it.
+type abiExpectation struct {
+	vmName string
+	kinds  map[string]bool
+}
+
+func (e abiExpectation) kindList() string {
+	out := make([]string, 0, len(e.kinds))
+	for k := range e.kinds {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return strings.Join(out, "|")
+}
+
+// expectABI derives, from the frozen identity ALONE, the VM name the identity must carry and the ABI
+// shape labels that are legal for it.
+//
+// SEMANTIC KINDS ARE NOT ABI KINDS. The engine's SoroqKindConsistent accepts exactly
+// function / static-method / instance-member and returns false — which throws — for anything else, so
+// a semantic kind like "constructor" reaching the ABI is a device-side crash rather than a
+// producer-side refusal. Each semantic kind is mapped onto the shape the VM actually builds:
+//
+//	generative constructor  -> a NON-static VM function (kernel_loader.cc builds kConstructor with
+//	                           is_static false; object.cc:6708 asserts it)      -> instance-member
+//	factory                 -> a STATIC constructor (object.cc:6711 asserts it) -> static-method
+//	top-level init:<field>  -> a static function of the library toplevel class  -> function
+//	static class init:<f>   -> a static method of that class                    -> static-method
+//
+// An unrecognized semantic kind is an ERROR, not a pass-through: a kind this function does not model
+// is a kind whose VM shape nobody has measured.
+func expectABI(d changedDecl) (abiExpectation, error) {
+	set := func(k ...string) map[string]bool {
+		m := make(map[string]bool, len(k))
+		for _, s := range k {
+			m[s] = true
+		}
+		return m
+	}
+	hasClass := d.keyClass != ""
+	switch d.keyKind {
+	case "function":
+		if hasClass {
+			return abiExpectation{}, fmt.Errorf("frozen kind \"function\" carries class %q", d.keyClass)
+		}
+		return abiExpectation{vmName: d.keyMember, kinds: set("function")}, nil
+	case "method":
+		if !hasClass {
+			return abiExpectation{}, errors.New("frozen kind \"method\" carries no class")
+		}
+		return abiExpectation{vmName: d.keyMember, kinds: set("instance-member")}, nil
+	case "static-method":
+		if !hasClass {
+			return abiExpectation{}, errors.New("frozen kind \"static-method\" carries no class")
+		}
+		return abiExpectation{vmName: d.keyMember, kinds: set("static-method")}, nil
+	case "getter", "setter", "operator":
+		// The VM names an accessor with its prefix; the bare source name resolves to nothing.
+		vm := d.keyMember
+		if d.keyKind == "getter" {
+			vm = "get:" + d.keyMember
+		} else if d.keyKind == "setter" {
+			vm = "set:" + d.keyMember
+		}
+		if !hasClass {
+			return abiExpectation{vmName: vm, kinds: set("function")}, nil
+		}
+		// Staticness is measured by the analyzer from the kernel; the frozen key does not carry it.
+		return abiExpectation{vmName: vm, kinds: set("instance-member", "static-method")}, nil
+	case "constructor":
+		if !hasClass {
+			return abiExpectation{}, errors.New("frozen kind \"constructor\" carries no class")
+		}
+		// THE DOT IS ALWAYS PRESENT. An unnamed constructor is `Foo.`, never `Foo`.
+		return abiExpectation{vmName: d.keyClass + "." + d.keyMember, kinds: set("instance-member")}, nil
+	case "factory":
+		if !hasClass {
+			return abiExpectation{}, errors.New("frozen kind \"factory\" carries no class")
+		}
+		return abiExpectation{vmName: d.keyClass + "." + d.keyMember, kinds: set("static-method")}, nil
+	case "field-initializer":
+		if d.keyMember == "" {
+			return abiExpectation{}, errors.New("field-initializer identity carries no field name")
+		}
+		if hasClass {
+			return abiExpectation{vmName: "init:" + d.keyMember, kinds: set("static-method")}, nil
+		}
+		return abiExpectation{vmName: "init:" + d.keyMember, kinds: set("function")}, nil
+	default:
+		return abiExpectation{}, fmt.Errorf("frozen identity kind %q has no measured VM shape; refusing "+
+			"to emit an ABI entry for a shape nobody has measured", d.keyKind)
+	}
+}
+
+// splitIdentity splits `<libUri>::<class>::<vmName>` into its three segments. Library URIs contain
+// single colons but never "::", so the split is unambiguous.
+func splitIdentity(id string) (lib, class, vmName string, err error) {
+	parts := strings.Split(id, "::")
+	if len(parts) != 3 {
+		return "", "", "", fmt.Errorf("identity %q is not <libUri>::<class>::<vmName>", id)
+	}
+	return parts[0], parts[1], parts[2], nil
 }
 
 // changedDeclsFromDiff extracts the changed-patchable declarations from a diff report's `changed` array
@@ -693,6 +905,7 @@ func changedDeclsFromDiff(diffChanged []map[string]any) ([]changedDecl, error) {
 		out = append(out, changedDecl{
 			manifestLine: ml,
 			stableKey:    key,
+			keyKind:      parts[2],
 			keyClass:     parts[3],
 			keyMember:    parts[4],
 			keyIsFunc:    parts[2] == "function",
@@ -787,7 +1000,8 @@ func parseAndValidateModuleManifest(manifestBytes []byte, diffChanged []map[stri
 			return "", err
 		}
 		if !abiKinds[e.Kind] {
-			return "", fmt.Errorf("replacement_abi entry %s has unknown kind %q", e.BaseIdentity, e.Kind)
+			return "", fmt.Errorf("replacement_abi entry %s has unknown kind %q (the runtime accepts only "+
+				"function, static-method and instance-member and throws on anything else)", e.BaseIdentity, e.Kind)
 		}
 		if !sha256HexRe.MatchString(e.SignatureSHA256) {
 			return "", fmt.Errorf("replacement_abi entry %s has malformed signature_sha256", e.BaseIdentity)
@@ -814,13 +1028,39 @@ func parseAndValidateModuleManifest(manifestBytes []byte, diffChanged []map[stri
 		if e.ModuleClass != d.keyClass {
 			return "", fmt.Errorf("replacement_abi entry %s module_class %q != frozen key class %q", e.BaseIdentity, e.ModuleClass, d.keyClass)
 		}
-		if e.ModuleMember != d.keyMember {
-			return "", fmt.Errorf("replacement_abi entry %s module_member %q != frozen key member %q", e.BaseIdentity, e.ModuleMember, d.keyMember)
-		}
-		// kind shape must be internally consistent: function ⟺ empty class ⟺ frozen-key function kind.
+		// kind shape must be internally consistent: `function` ⟺ empty class.
 		abiIsFunc := e.Kind == "function"
-		if abiIsFunc != (e.ModuleClass == "") || abiIsFunc != d.keyIsFunc {
-			return "", fmt.Errorf("replacement_abi entry %s kind %q is inconsistent with class %q / frozen key", e.BaseIdentity, e.Kind, e.ModuleClass)
+		if abiIsFunc != (e.ModuleClass == "") {
+			return "", fmt.Errorf("replacement_abi entry %s kind %q is inconsistent with class %q", e.BaseIdentity, e.Kind, e.ModuleClass)
+		}
+		// The frozen SEMANTIC kind decides both the legal shape label and the VM name, and the VM name is
+		// checked at BOTH ends. The base identity is what the runtime looks the base function up by; the
+		// module member is what it looks the replacement up by; they go through the SAME lookup, so a name
+		// that is right at one end and wrong at the other resolves to nothing and throws on device.
+		exp, err := expectABI(d)
+		if err != nil {
+			return "", fmt.Errorf("replacement_abi entry %s: %w", e.BaseIdentity, err)
+		}
+		if !exp.kinds[e.Kind] {
+			return "", fmt.Errorf("replacement_abi entry %s has kind %q but frozen kind %q is built by the VM as %s",
+				e.BaseIdentity, e.Kind, d.keyKind, exp.kindList())
+		}
+		if e.ModuleMember != exp.vmName {
+			return "", fmt.Errorf("replacement_abi entry %s module_member %q != the VM name %q for frozen kind %q",
+				e.BaseIdentity, e.ModuleMember, exp.vmName, d.keyKind)
+		}
+		_, baseClass, baseVMName, err := splitIdentity(e.BaseIdentity)
+		if err != nil {
+			return "", fmt.Errorf("replacement_abi entry: %w", err)
+		}
+		if baseClass != d.keyClass {
+			return "", fmt.Errorf("replacement_abi base_identity %s names class %q but the frozen key names %q",
+				e.BaseIdentity, baseClass, d.keyClass)
+		}
+		if baseVMName != exp.vmName {
+			return "", fmt.Errorf("replacement_abi base_identity %s carries VM name %q but frozen kind %q requires %q "+
+				"(a missing constructor dot or accessor prefix matches nothing at runtime)",
+				e.BaseIdentity, baseVMName, d.keyKind, exp.vmName)
 		}
 	}
 	// No missing: every changed decl must have exactly one entry (bijection completeness).
@@ -902,6 +1142,25 @@ func verifyExistingPatchArtifact(dir, expectArtifactID string) error {
 	}
 	if err := validateCarriedLibraries(m.ModuleGraphDigest, m.ModuleLibrary, m.CarriedLibraries, nil); err != nil {
 		return fmt.Errorf("artifact carried-library mapping is invalid: %w", err)
+	}
+	// The rich base identity is REQUIRED, not optional-with-a-zero-default. An artifact that records no
+	// identity can only be bound by runtime_id, which is version-derived and shared by every base with
+	// the same app/channel/version/trust — so it is deliverable to a base it was never compiled for.
+	if m.BaseIdentity == nil {
+		return errors.New("artifact records no rich base identity; it predates the four-field base identity — rebuild the patch")
+	}
+	if err := m.BaseIdentity.validate(); err != nil {
+		return fmt.Errorf("artifact base identity is invalid: %w", err)
+	}
+	// Cross-check against the artifact's OWN records. A swapped identity block would otherwise be
+	// perfectly self-consistent — it recomputes its own digest — while describing a different base than
+	// the one the module was actually diffed against.
+	if m.BaseIdentity.RuntimeID != m.RuntimeID {
+		return fmt.Errorf("artifact base identity runtime_id %q != artifact runtime_id %q", m.BaseIdentity.RuntimeID, m.RuntimeID)
+	}
+	if m.BaseIdentity.BaseFingerprint != m.BaseAppDillSHA256 {
+		return fmt.Errorf("artifact base identity base_fingerprint %s != artifact base_app_dill_sha256 %s",
+			short12(m.BaseIdentity.BaseFingerprint), short12(m.BaseAppDillSHA256))
 	}
 	// Rehash the module source + bytecode against the recorded values.
 	if got, err := sha256OfPath(filepath.Join(dir, "soroq_freehand_module.dart")); err != nil || got != m.ModuleSourceSHA256 {
@@ -1114,10 +1373,18 @@ func runPatchIOSEngineFreehand(head, passthrough []string, projectDir string) er
 		// DEPLOYMENT VERSION. This was hardcoded to 1, which meant every patch shipped as version 1 and
 		// the controller silently ignored every patch after a device's first (see
 		// freehand_manifest_version.go). It is now the next monotonic number for this
-		// (app, channel, release) scope, resolved from the control plane before signing.
-		verAPI, _ := flagValue(head, "api")
-		verRelease, _ := flagValue(head, "release-id")
-		existingScoped, versionErr := existingScopedPatches(verAPI, plan.AppID, plan.Channel, verRelease)
+		// (app, channel, runtime) scope, resolved from the control plane before signing.
+		// THE SAME control plane the publish will write to, not the raw --api flag. When --api was
+		// omitted -- the ordinary case, since the default is the hosted API -- this resolved to the
+		// empty string, existingScopedPatches returned "no patches" without asking anything, and every
+		// patch was signed as version 1. The second patch for a runtime then aborted with
+		// "concurrent publication detected", naming a race that had not happened; and had the server
+		// agreed, the controller would have ignored the patch as an already-seen version.
+		verAPI := freehandPublishAPIBase(head)
+		// Scoped by RUNTIME, matching how the control plane allocates patch.Number. Passing the
+		// release id here made the client and server disagree whenever one runtime carried more than
+		// one release, and the publish aborted reporting a race that had not happened.
+		existingScoped, versionErr := existingScopedPatches(verAPI, plan.AppID, plan.Channel, plan.RuntimeID)
 		if versionErr != nil {
 			return fmt.Errorf("resolve the next deployment version: %w", versionErr)
 		}
@@ -1395,6 +1662,7 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 		Version:                plan.Version,
 		Channel:                plan.Channel,
 		BaseAppDillSHA256:      plan.BaseAppDillSHA256,
+		BaseIdentity:           plan.BaseIdentity,
 		BaseSourceKernelSHA256: plan.BaseSourceKernelSHA256,
 		CandSourceKernelSHA256: plan.CandSourceKernelSHA256,
 		SourceRecipeDigest:     plan.SourceRecipeDigest,

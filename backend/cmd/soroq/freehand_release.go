@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -574,7 +575,65 @@ func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterR
 			AnalysisID: filepath.Base(analysisDir),
 		},
 	}
-	return persistFreehandBaseline(projectDir, bl, appDill, sourceKernelPath, manifestPath, graphPath, baseDepGraph)
+	relDir, err := persistFreehandBaseline(projectDir, bl, appDill, sourceKernelPath, manifestPath, graphPath, baseDepGraph)
+	if err != nil {
+		return "", err
+	}
+	// Move the build's gen_snapshot object graph into the immutable baseline. `soroq patch` reads it to
+	// refuse a redirect whose value the precompiler already propagated into its callers -- the only
+	// failure in this lane that no runtime check can see. It stays LOCAL: it is never uploaded, because
+	// it carries unrelated application strings.
+	// POST-COMPILE IDENTITY DELIVERY. All four identity fields exist only now, after gen_snapshot and
+	// after the baseline is persisted, which is exactly why they cannot be Dart constants. Writing the
+	// asset is REQUIRED, not best-effort: an app shipped without it refuses every patch on device, and
+	// the operator should learn that here rather than from a phone.
+	written, err := deliverFreehandBaseIdentity(projectDir, relDir)
+	if err != nil {
+		return "", fmt.Errorf("deliver the base identity into the app bundle: %w", err)
+	}
+	for _, w := range written {
+		fmt.Fprintf(os.Stderr, "base identity delivered -> %s\n", w)
+	}
+	if err := adoptFreehandObjectGraph(projectDir, relDir); err != nil {
+		fmt.Fprintf(os.Stderr, "NOTICE: could not keep the base object graph (%v); `soroq patch` will "+
+			"not be able to run the constant-propagation check against this baseline\n", err)
+	}
+	return relDir, nil
+}
+
+// freehandObjectGraphBuildPath is where the build is told to write the object graph, before it is moved
+// into the content-addressed baseline directory (whose name is not known until the build finishes).
+func freehandObjectGraphBuildPath(projectDir string) string {
+	return filepath.Join(projectDir, ".soroq", "build", freehandObjectGraphName)
+}
+
+func adoptFreehandObjectGraph(projectDir, relDir string) error {
+	src := freehandObjectGraphBuildPath(projectDir)
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("no object graph at %s: %w", src, err)
+	}
+	dst := filepath.Join(relDir, freehandObjectGraphName)
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	// Rename fails across devices; copy instead rather than lose the evidence.
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Remove(src)
 }
 
 // freehandFinalizeBuild persists the immutable baseline and registers the release AFTER a fully
@@ -619,6 +678,20 @@ func freehandFinalizeBuild(head []string, projectDir, appDill string, buildErr e
 	if v := freehandProjectVersion(projectDir); v != "" && !hasFlag(delegateArgs, "version") {
 		delegateArgs = append(delegateArgs, "--version", v)
 	}
+	// --api MUST be forwarded, not left to the delegate's own default.
+	//
+	// The delegate's `-api` defaults to http://localhost:8080. Without an explicit value the
+	// control-plane app+release is never created: the local baseline persists, "registered engine-lane
+	// baseline" prints, and the command exits 0 -- so it reads as success. The next `soroq patch` then
+	// resolves the real control plane and fails with 404 "unknown release", pointing at the patch
+	// rather than at the release that silently did half its job.
+	//
+	// This is the same defect platforms_cmd.go already fixes for the `soroq release --platforms=ios`
+	// route. It was never fixed on THIS route, and it cost a full base build and publish cycle on
+	// 2026-08-21 before the 404 named it.
+	if !hasFlag(delegateArgs, "api") {
+		delegateArgs = append(delegateArgs, "--api", defaultAPIBase())
+	}
 	return freehandReleaseDelegate("release", delegateArgs)
 }
 
@@ -662,6 +735,16 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 
 	fmt.Fprintf(os.Stderr, "soroq release ios --engine --build (freehand): analyzer %s, no ios_engine.patchable required\n", analyzerSha[:12])
 	passthrough = iosEngineBuildPassthrough(dynamicInterfacePath, passthrough)
+	// Ask gen_snapshot for its object graph unless the developer already asked for one; two
+	// --write_v8_snapshot_profile_to flags would leave which file won undefined.
+	if !strings.Contains(strings.Join(passthrough, " "), "write_v8_snapshot_profile_to") {
+		graphPath := freehandObjectGraphBuildPath(projectDir)
+		if err := os.MkdirAll(filepath.Dir(graphPath), 0o755); err == nil {
+			_ = os.Remove(graphPath) // never let a previous build's graph be adopted as this build's
+			passthrough = append(passthrough,
+				"--extra-gen-snapshot-options=--write_v8_snapshot_profile_to="+graphPath)
+		}
+	}
 
 	// Zero-touch runtime wiring: generate the dual-interface activator + bootstrap entrypoint under
 	// .soroq/generated/ and redirect the build entrypoint to the bootstrap, so the compiled app.dill

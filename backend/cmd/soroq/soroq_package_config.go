@@ -206,6 +206,10 @@ func resolveSoroqBuildInputs(projectDir, dynamicModulesDir string) (cfgBytes []b
 	if err != nil {
 		return nil, nil, err
 	}
+	// Relative path dependencies are relative to the DEVELOPER'S project, not to this temp workspace.
+	// Without this, any monorepo or locally-developed plugin fails to resolve here while resolving
+	// fine in the developer's own tree.
+	withDep = pubspecWithAbsolutePathDependencies(withDep, projectDir)
 	if err := os.WriteFile(filepath.Join(workspace, "pubspec.yaml"), []byte(withDep), 0o644); err != nil {
 		return nil, nil, err
 	}
@@ -436,4 +440,39 @@ func runPluginInjection(projectDir string) error {
 		return fmt.Errorf("resolve plugin scaffolding: %w", injectErr)
 	}
 	return nil
+}
+
+// pubspecWithAbsolutePathDependencies rewrites every relative `path:` dependency to an absolute path
+// anchored at the real project directory.
+//
+// WHY. The isolated workspace is a temp directory, and the pubspec is copied into it verbatim. A
+// relative path dependency — `path: ../../packages/soroq_flutter`, which every monorepo and every
+// locally-developed plugin uses — then resolves against the TEMP directory and pub fails with
+//
+//	Because <app> depends on soroq_flutter from path which doesn't exist
+//	(could not find package soroq_flutter at "../../packages/soroq_flutter")
+//
+// naming a path the developer's own project resolves perfectly well. The isolation is the point of
+// the workspace, so the fix is to make the paths location-independent rather than to abandon it.
+//
+// Absolute paths are only rewritten INTO the workspace copy; the developer's pubspec.yaml on disk is
+// never modified.
+func pubspecWithAbsolutePathDependencies(text, projectDir string) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "path:") {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(trimmed, "path:"))
+		// Quoted forms are legal YAML; normalise before deciding, and re-emit unquoted since an
+		// absolute POSIX path needs no quoting.
+		value = strings.Trim(value, `"'`)
+		if value == "" || filepath.IsAbs(value) {
+			continue
+		}
+		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+		lines[i] = indent + "path: " + filepath.Clean(filepath.Join(projectDir, value))
+	}
+	return strings.Join(lines, "\n")
 }

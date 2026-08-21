@@ -165,7 +165,9 @@ func runRollbackConfigLane(platform string, args []string) error {
 	verifyCurrentPatchNumber := fs.Int("verify-current-patch-number", 0, "current patch number to report during rollback verification")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stdout, "usage: soroq rollback %s [--patch-id patch-123] [--release-id release-123] [--channel stable] [--project-dir .] [--api https://api.soroq.dev] [--verify] [--verify-client-id device-123] [--json]\n", platform)
+		// --runtime-id is listed because the engine lane's multiple-baseline refusal tells the operator
+		// to use it; a remedy named in an error has to be discoverable in the usage text too.
+		fmt.Fprintf(os.Stdout, "usage: soroq rollback %s [--patch-id patch-123] [--release-id release-123] [--runtime-id <64-hex base runtime>] [--channel stable] [--project-dir .] [--api https://api.soroq.dev] [--verify] [--verify-client-id device-123] [--json]\n", platform)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

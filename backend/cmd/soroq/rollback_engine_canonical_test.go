@@ -38,7 +38,7 @@ func TestEngineRollbackDerivesEverythingFromProjectState(t *testing.T) {
 	dir := engineProject(t, "dev.soroq.canonapp", "stable")
 	seedBaseline(t, dir, runtime)
 
-	plan, err := deriveEngineRollbackPlan(dir)
+	plan, err := deriveEngineRollbackPlan(dir, "")
 	if err != nil {
 		t.Fatalf("derivation failed: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestEngineRollbackDerivesEverythingFromProjectState(t *testing.T) {
 func TestEngineRollbackHonoursTheProjectChannel(t *testing.T) {
 	dir := engineProject(t, "dev.soroq.canonapp", "beta")
 	seedBaseline(t, dir, strings.Repeat("a", 64))
-	plan, err := deriveEngineRollbackPlan(dir)
+	plan, err := deriveEngineRollbackPlan(dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestEngineRollbackHonoursTheProjectChannel(t *testing.T) {
 // MISSING STATE must be actionable: name the artifact and the command that produces it.
 func TestEngineRollbackWithoutABaselineIsActionable(t *testing.T) {
 	dir := engineProject(t, "dev.soroq.canonapp", "stable")
-	_, err := deriveEngineRollbackPlan(dir)
+	_, err := deriveEngineRollbackPlan(dir, "")
 	if err == nil {
 		t.Fatal("a project with no persisted base release derived a rollback anyway")
 	}
@@ -90,7 +90,7 @@ func TestEngineRollbackWithoutABaselineIsActionable(t *testing.T) {
 func TestEngineRollbackWithoutAnAppIdIsActionable(t *testing.T) {
 	dir := t.TempDir()
 	mustWriteFile(t, filepath.Join(dir, "pubspec.yaml"), "name: app\n")
-	_, err := deriveEngineRollbackPlan(dir)
+	_, err := deriveEngineRollbackPlan(dir, "")
 	if err == nil {
 		t.Fatal("a project with no soroq.yaml derived a rollback anyway")
 	}
@@ -107,7 +107,7 @@ func TestEngineRollbackRefusesAnAmbiguousRuntime(t *testing.T) {
 	seedBaseline(t, dir, strings.Repeat("a", 64))
 	seedBaseline(t, dir, strings.Repeat("b", 64))
 
-	_, err := deriveEngineRollbackPlan(dir)
+	_, err := deriveEngineRollbackPlan(dir, "")
 	if err == nil {
 		t.Fatal("two baselines produced a derived runtime; the device's base is not knowable here")
 	}
@@ -122,7 +122,7 @@ func TestSigningSeedIsNeverPassedInArgv(t *testing.T) {
 	const runtime = "3ff36e9b6c3725746e73060cc2bd1f74904811922131a73a66d6e89134c41ce5"
 	dir := engineProject(t, "dev.soroq.canonapp", "stable")
 	seedBaseline(t, dir, runtime)
-	plan, err := deriveEngineRollbackPlan(dir)
+	plan, err := deriveEngineRollbackPlan(dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,11 @@ func TestSigningSeedIsNeverPassedInArgv(t *testing.T) {
 
 // The delegate must actually carry the seed in its environment, or the canonical command cannot sign.
 func TestDelegateEnvCarriesTheSeed(t *testing.T) {
-	env := append(engineLaneDelegateEnv(nil), "SOROQ_ENGINE_SIGNING_SEED=abc123")
+	baseEnv, envErr := engineLaneDelegateEnv(nil)
+	if envErr != nil {
+		t.Fatalf("delegate env: %v", envErr)
+	}
+	env := append(baseEnv, "SOROQ_ENGINE_SIGNING_SEED=abc123")
 	var found bool
 	for _, e := range env {
 		if strings.HasPrefix(e, "SOROQ_ENGINE_SIGNING_SEED=") {
@@ -185,7 +189,7 @@ func TestExplicitOverridesWinOverDerivation(t *testing.T) {
 	const runtime = "3ff36e9b6c3725746e73060cc2bd1f74904811922131a73a66d6e89134c41ce5"
 	dir := engineProject(t, "dev.soroq.canonapp", "stable")
 	seedBaseline(t, dir, runtime)
-	plan, err := deriveEngineRollbackPlan(dir)
+	plan, err := deriveEngineRollbackPlan(dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,5 +276,46 @@ func TestEngineRollbackPatchIDsRemainChronologicallySortable(t *testing.T) {
 	}
 	if !strings.HasPrefix(earlier, "freehand-rollback-826f9b98948d-v0-20260810t172405z-") {
 		t.Errorf("id lost its operator-readable provenance: %q", earlier)
+	}
+}
+
+// THE ERROR MUST BE ACTIONABLE BY THE FLAG IT NAMES.
+//
+// With several bases persisted, the derivation refuses and tells the operator to "re-run with an
+// explicit --runtime-id". That flag was read by the command and applied to the plan AFTERWARDS — so
+// the derivation failed first and the advice could never work. An error that names its own remedy has
+// to be resolvable by that remedy.
+func TestExplicitRuntimeIDResolvesTheMultipleBaselineRefusal(t *testing.T) {
+	dir := engineProject(t, "dev.soroq.canonapp", "stable")
+	a := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	b := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	seedBaseline(t, dir, a)
+	seedBaseline(t, dir, b)
+
+	// Without the flag: refused, and the message must name the flag that fixes it.
+	_, err := deriveEngineRollbackPlan(dir, "")
+	if err == nil {
+		t.Fatal("two persisted baselines must not be silently guessed between")
+	}
+	if !strings.Contains(err.Error(), "--runtime-id") {
+		t.Fatalf("refusal should name the remedy:\n%s", err)
+	}
+
+	// With the flag: resolved, to exactly the base named.
+	plan, err := deriveEngineRollbackPlan(dir, b)
+	if err != nil {
+		t.Fatalf("--runtime-id did not resolve the refusal it is advertised for: %v", err)
+	}
+	if plan.RuntimeID != b {
+		t.Fatalf("plan targets %s, want %s", plan.RuntimeID, b)
+	}
+	if plan.SourceRt != "--runtime-id" {
+		t.Errorf("provenance should record the flag, got %q", plan.SourceRt)
+	}
+
+	// A runtime id this project never built must be refused rather than signed for: the device would
+	// reject that manifest, and a wrong argument would present as a broken rollback.
+	if _, err := deriveEngineRollbackPlan(dir, "c"+b[1:]); err == nil {
+		t.Fatal("an unknown --runtime-id was accepted")
 	}
 }

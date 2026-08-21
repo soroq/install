@@ -389,14 +389,28 @@ func assertManifestMatchesBaseline(manifestPath, baselinePath string) error {
 // `soroq login` stored (a per-user cli_token or the operator token) so the delegated soroqctl
 // authenticates WITHOUT a manual SOROQ_CONTROL_PLANE_OPERATOR_TOKEN export. An explicit env token (set
 // by the caller) always wins — this only fills the gap when nothing is exported.
-func engineLaneDelegateEnv(args []string) []string {
+func engineLaneDelegateEnv(args []string) ([]string, error) {
 	env := os.Environ()
 	if firstNonEmptyEnv("SOROQ_CONTROL_PLANE_OPERATOR_TOKEN", "SOROQ_OPERATOR_TOKEN") != "" {
-		return env
+		return env, nil
 	}
-	creds, err := currentOperatorCredentialsForRequest("", apiFlagFromArgs(args))
+	target := apiFlagFromArgs(args)
+	creds, err := currentOperatorCredentialsForRequest("", target)
 	if err != nil || strings.TrimSpace(creds.Token) == "" {
-		return env
+		return env, nil
+	}
+	// A STORED credential names the control plane it was issued for and must not travel anywhere else.
+	// requireOperatorCredentials enforces exactly this on the in-process path; without the same check
+	// here, delegating merely stepped around it. I hit this for real: a cli_token issued for
+	// api.soroq.dev was forwarded to a different control plane, which then reported a confusing
+	// "Decoding Firebase ID token failed" — the credential had already left the host it belonged to by
+	// the time anything complained.
+	if creds.Source == "config" && strings.TrimSpace(creds.APIBase) != "" &&
+		!apiTargetMatchesCredential(target, creds.APIBase) {
+		return nil, fmt.Errorf(
+			"stored credentials were issued for %s but this command targets %s; refusing to send them "+
+				"to a different control plane. Pass --api %s, or run `soroq login` against %s.",
+			creds.APIBase, target, creds.APIBase, target)
 	}
 	env = append(env, "SOROQ_CONTROL_PLANE_OPERATOR_TOKEN="+strings.TrimSpace(creds.Token))
 	// Only the static operator_token uses the email header; a cli_token's email is bound to the token
@@ -404,7 +418,7 @@ func engineLaneDelegateEnv(args []string) []string {
 	if creds.Email != "" && normalizeCredentialKind(creds.CredentialKind, creds.Token) == credentialKindOperatorToken {
 		env = append(env, "SOROQ_OPERATOR_EMAIL="+strings.TrimSpace(creds.Email))
 	}
-	return env
+	return env, nil
 }
 
 // apiFlagFromArgs extracts --api <val> / --api=<val> from the delegate args (default: the standard
@@ -431,7 +445,11 @@ func runEngineLaneDelegate(verb string, args []string) error {
 	fmt.Fprintln(os.Stderr, "  advanced mode: `soroqctl "+verb+" ios-engine --engine-bundle <dir> ...` runs the same lane against a hand-specified bundle.")
 	fullArgs := append([]string{verb, "ios-engine"}, args...)
 	cmd := exec.Command(bin, fullArgs...)
-	cmd.Env = engineLaneDelegateEnv(args)
+	delegateEnv, err := engineLaneDelegateEnv(args)
+	if err != nil {
+		return err
+	}
+	cmd.Env = delegateEnv
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -463,7 +481,11 @@ func runEngineLaneDelegateWithEnv(verb string, args []string, extraEnv []string)
 	if len(flagArgs) > 0 && flagArgs[0] == "ios-engine" {
 		flagArgs = flagArgs[1:]
 	}
-	cmd.Env = append(engineLaneDelegateEnv(flagArgs), extraEnv...)
+	baseEnv, err := engineLaneDelegateEnv(flagArgs)
+	if err != nil {
+		return err
+	}
+	cmd.Env = append(baseEnv, extraEnv...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

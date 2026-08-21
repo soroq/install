@@ -51,7 +51,11 @@ type engineRollbackPlan struct {
 //
 // Every field reports where it came from: an actionable failure has to name the missing artifact, not
 // just the missing value.
-func deriveEngineRollbackPlan(projectDir string) (engineRollbackPlan, error) {
+// explicitRuntimeID, when non-empty, SELECTS among the persisted baselines instead of deriving one.
+// It is passed in rather than applied by the caller afterwards because the multiple-baseline case used
+// to fail here, before any override could be considered -- so `--runtime-id`, the flag the error
+// message tells you to use, could not actually resolve the error it was named in.
+func deriveEngineRollbackPlan(projectDir, explicitRuntimeID string) (engineRollbackPlan, error) {
 	p := engineRollbackPlan{ProjectDir: projectDir}
 
 	p.AppID = freehandProjectAppID(projectDir)
@@ -73,6 +77,28 @@ func deriveEngineRollbackPlan(projectDir string) (engineRollbackPlan, error) {
 			baselines = append(baselines, e.Name())
 		}
 	}
+	if want := strings.TrimSpace(explicitRuntimeID); want != "" {
+		// Validated against what is actually persisted: a typo'd runtime id would otherwise sign a
+		// version-0 manifest for a base that does not exist here, which the device refuses and which
+		// then reads as a broken rollback rather than as a wrong argument.
+		found := false
+		for _, b := range baselines {
+			if b == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return p, fmt.Errorf(
+				"--runtime-id %s is not among the base releases persisted under %s (%s).\n"+
+					"  A signed version-0 rollback must be bound to a base this project actually built.",
+				want, baselineDir, strings.Join(baselines, ", "))
+		}
+		p.RuntimeID = want
+		p.SourceRt = "--runtime-id"
+		baselines = []string{want}
+	}
+
 	switch len(baselines) {
 	case 0:
 		return p, fmt.Errorf(
@@ -81,7 +107,9 @@ func deriveEngineRollbackPlan(projectDir string) (engineRollbackPlan, error) {
 				"  running, and that identity is only recorded by a successful `soroq release\n"+
 				"  --platforms=ios`. Run a release for this project first.", baselineDir)
 	case 1:
-		p.RuntimeID = baselines[0]
+		if p.RuntimeID == "" {
+			p.RuntimeID = baselines[0]
+		}
 	default:
 		return p, fmt.Errorf(
 			"%d base releases are persisted under %s (%s).\n"+
@@ -89,7 +117,9 @@ func deriveEngineRollbackPlan(projectDir string) (engineRollbackPlan, error) {
 				"  --runtime-id for the base you are rolling back.",
 			len(baselines), baselineDir, strings.Join(baselines, ", "))
 	}
-	p.SourceRt = baselineDir
+	if p.SourceRt == "" {
+		p.SourceRt = baselineDir
+	}
 
 	// Release id and channel: prefer what the release lane actually recorded, then the project config.
 	state, _ := loadProjectCLIState(projectDir)
@@ -142,7 +172,7 @@ func freehandProjectChannelOrDefault(projectDir string) string {
 // the environment. It never appears in argv, so it is not visible in `ps` or shell history, and it is
 // never logged or persisted.
 func runRollbackIOSEngineCanonical(projectDir string, explicitReleaseID, explicitRuntimeID, explicitAPI string, jsonOut bool) error {
-	plan, err := deriveEngineRollbackPlan(projectDir)
+	plan, err := deriveEngineRollbackPlan(projectDir, explicitRuntimeID)
 	if err != nil {
 		return err
 	}

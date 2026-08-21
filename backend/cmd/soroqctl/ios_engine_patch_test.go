@@ -185,7 +185,7 @@ func writeAppDill(t *testing.T) (string, string) {
 func TestReleaseIOSEngineWritesImmutableBaselineAndRefusesMutation(t *testing.T) {
 	dir := writeEngineBundle(t, nil)
 	appDill, appDillSHA := writeAppDill(t)
-	out := filepath.Join(t.TempDir(), "baseline.json")
+	out := filepath.Join(t.TempDir(), engineLaneBaselineDefaultName)
 
 	args := []string{"--engine-bundle", dir, "--app-dill", appDill, "--release-id", "rel-1", "--app-id", "com.example.app", "--out", out}
 	if err := runReleaseIOSEngine(args); err != nil {
@@ -221,7 +221,7 @@ func TestReleaseIOSEngineWritesImmutableBaselineAndRefusesMutation(t *testing.T)
 func TestReleaseIOSEngineAPIRequiresRuntimeAndVersion(t *testing.T) {
 	dir := writeEngineBundle(t, nil)
 	appDill, _ := writeAppDill(t)
-	out := filepath.Join(t.TempDir(), "baseline.json")
+	out := filepath.Join(t.TempDir(), engineLaneBaselineDefaultName)
 	// --api without --runtime-id/--version must be rejected before any network call.
 	err := runReleaseIOSEngine([]string{
 		"--engine-bundle", dir, "--app-dill", appDill, "--release-id", "rel-1", "--app-id", "com.example.app",
