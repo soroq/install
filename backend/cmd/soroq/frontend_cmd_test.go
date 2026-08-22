@@ -17,8 +17,13 @@ func writeExecutable(t *testing.T, path string) {
 	}
 }
 
-// TestResolveSoroqFlutterBinOrder pins the D1.2 resolution order:
-// SOROQ_FLUTTER_BIN -> recorded frontend install -> legacy ~/development fallback -> error.
+// TestResolveSoroqFlutterBinOrder pins the resolution order, which is now TWO sources and a refusal:
+// SOROQ_FLUTTER_BIN -> the frontend recorded for THIS home -> error.
+//
+// The legacy `~/development/soroq-forks` fallback this used to pin is GONE, and case (a) below now
+// asserts its absence. It could select a frontend the developer never chose, from a path that is not
+// the frontend store, with nothing said in the output — the same class as the `soroq-flutter` PATH
+// shim removed alongside it. An external frontend is still reachable, but only by naming it.
 func TestResolveSoroqFlutterBinOrder(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -33,9 +38,12 @@ func TestResolveSoroqFlutterBinOrder(t *testing.T) {
 	legacyBin := filepath.Join(home, "development", "soroq-forks", "flutter-sdk-src", "bin", "flutter")
 	writeExecutable(t, legacyBin)
 
-	// (a) With nothing recorded, the legacy fallback wins over "not found".
-	if got, err := resolveSoroqFlutterBin(); err != nil || got != legacyBin {
-		t.Fatalf("legacy fallback: got %q err %v, want %q", got, err, legacyBin)
+	// (a) With nothing recorded, a legacy ~/development checkout must NOT be selected. It is present
+	//     on disk for this assertion precisely so its absence from the result is a measurement.
+	if got, err := resolveSoroqFlutterBin(); err == nil {
+		t.Fatalf("a ~/development checkout was selected with nothing recorded: %q", got)
+	} else if got == legacyBin {
+		t.Fatalf("the removed legacy fallback is back: %q", got)
 	}
 
 	// (b) Record an active frontend install: it now takes precedence over the legacy checkout.
@@ -55,7 +63,7 @@ func TestResolveSoroqFlutterBinOrder(t *testing.T) {
 	}
 	t.Setenv("SOROQ_FLUTTER_BIN", "")
 
-	// (d) Remove both the recorded install target and the legacy checkout: clear error.
+	// (d) Remove the recorded install: clear error naming both routes.
 	if err := os.RemoveAll(filepath.Join(home, ".soroq")); err != nil {
 		t.Fatal(err)
 	}

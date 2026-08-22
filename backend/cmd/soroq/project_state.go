@@ -124,39 +124,108 @@ func runFlutterAndroidReleaseBuild(projectDir string, artifactType string, toolc
 	return nil
 }
 
-// resolveSoroqFlutterBin resolves the Soroq Flutter frontend's bin/flutter in this order (D1.2):
-//  1. $SOROQ_FLUTTER_BIN — explicit dev override.
-//  2. a `soroq-flutter` on PATH — packaged shim override.
-//  3. the recorded frontend install (`soroq frontend install <version>` -> ~/.soroq/frontends/<active>/...)
-//     — the normal fresh-user path, no env needed.
-//  4. legacy ~/development/soroq-forks checkout — dev-only fallback.
+// soroqFrontendChoice is the frontend the CLI will build with, and WHERE it came from.
 //
-// A clean machine with none of these gets a clear error telling the user to run `soroq frontend install`.
-func resolveSoroqFlutterBin() (string, error) {
+// The provenance is not decoration. A build silently using a frontend the developer did not select
+// produces artifacts whose identity nobody can account for afterwards, and the only trace is an
+// absolute path buried in a build log. Every caller prints this.
+type soroqFrontendChoice struct {
+	Bin string
+	// Provenance is one short human sentence: what selected this frontend.
+	Provenance string
+}
+
+// resolveSoroqFlutterFrontend resolves the Soroq Flutter frontend's bin/flutter.
+//
+// TWO SOURCES, AND ONLY TWO:
+//
+//  1. $SOROQ_FLUTTER_BIN — the explicit override. Anything outside this user's own frontend store may
+//     be used ONLY through this, because naming it is the developer's decision and it is auditable.
+//  2. the frontend installed for THIS home: `~/.soroq/frontends/<active>/...`, resolved from
+//     `os.UserHomeDir()` and verified to live under that root.
+//
+// WHAT WAS REMOVED, AND WHY. Two silent fallbacks used to sit between them:
+//
+//   - `exec.LookPath("soroq-flutter")`. PATH is not home-relative and is not the developer's frontend
+//     selection. A stale shim left on PATH by an old install would win over the frontend the user
+//     just installed and activated, with nothing said.
+//   - `~/development/soroq-forks/...`. A dev-machine checkout that outranked the recorded install.
+//
+// Both could select a frontend from outside the active store without a word in the output. That is
+// the class of defect this function now refuses: an external frontend is reachable, but only by name.
+//
+// NOTE ON WHAT PROMPTED THIS. An audit of a hosted-only acceptance lane reported that a build run
+// with an isolated HOME had used the developer's real-home frontend. On investigation that did NOT
+// reproduce — a fresh isolated-HOME build resolves the isolated frontend and its log contains zero
+// references to the real home. The original observation was a reading error in the diagnostic, not in
+// the resolver. The hardening below stands on its own merits: the two fallbacks really could select
+// an external frontend silently, whether or not they did on that occasion.
+func resolveSoroqFlutterFrontend() (soroqFrontendChoice, error) {
 	if flutterBin := strings.TrimSpace(os.Getenv("SOROQ_FLUTTER_BIN")); flutterBin != "" {
-		return flutterBin, nil
+		return soroqFrontendChoice{
+			Bin:        flutterBin,
+			Provenance: "explicit SOROQ_FLUTTER_BIN",
+		}, nil
 	}
-	if flutterBin, err := exec.LookPath("soroq-flutter"); err == nil && strings.TrimSpace(flutterBin) != "" {
-		return flutterBin, nil
-	}
-	// Recorded frontend install (Option B): the auto-detected, no-env path.
-	if flutterBin, err := resolveInstalledFrontendFlutterBin(); err == nil && strings.TrimSpace(flutterBin) != "" {
-		return flutterBin, nil
-	}
-	home, _ := os.UserHomeDir()
-	candidates := []string{}
-	if home != "" {
-		candidates = append(candidates,
-			filepath.Join(home, "development", "soroq-forks", "flutter-sdk-src", "bin", "flutter"),
-			filepath.Join(home, "development", "soroq-forks", "flutter-sdk-3.28-src", "bin", "flutter"),
-		)
-	}
-	for _, candidate := range candidates {
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
-			return candidate, nil
+	root, rootErr := frontendsRoot()
+	flutterBin, err := resolveInstalledFrontendFlutterBin()
+	if err == nil && strings.TrimSpace(flutterBin) != "" {
+		if rootErr == nil && !pathIsWithin(root, flutterBin) {
+			// The active record named a binary outside this home's store. Refuse rather than use it:
+			// a record that points elsewhere is exactly the silent cross-home selection this guards.
+			return soroqFrontendChoice{}, fmt.Errorf(
+				"the active frontend record points outside this user's frontend store\n"+
+					"  record: %s\n  store:  %s\n"+
+					"Re-run `soroq frontend install`, or name it deliberately with SOROQ_FLUTTER_BIN",
+				flutterBin, root)
 		}
+		version := "installed frontend"
+		if active, ok, aerr := loadActiveFrontend(); aerr == nil && ok && strings.TrimSpace(active.Version) != "" {
+			version = "installed frontend " + active.Version
+		}
+		return soroqFrontendChoice{
+			Bin:        flutterBin,
+			Provenance: version + " (" + root + ")",
+		}, nil
 	}
-	return "", errors.New("Soroq-compatible Flutter frontend was not found; run `soroq frontend install <version> --api <base>` (or set SOROQ_FLUTTER_BIN to a Soroq Flutter fork's bin/flutter)")
+	return soroqFrontendChoice{}, errors.New(
+		"no Soroq Flutter frontend is installed for this user; run `soroq frontend install <version> --api <base>`, " +
+			"or set SOROQ_FLUTTER_BIN to a Soroq Flutter fork's bin/flutter to use one from elsewhere")
+}
+
+// pathIsWithin reports whether path is root or sits under it, after resolving symlinks on both sides
+// so a link out of the store cannot pass as a member of it.
+func pathIsWithin(root, path string) bool {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	if r, err := filepath.EvalSymlinks(absRoot); err == nil {
+		absRoot = r
+	}
+	if p, err := filepath.EvalSymlinks(absPath); err == nil {
+		absPath = p
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolveSoroqFlutterBin keeps the old signature for the nine call sites that only need the path.
+// It PRINTS the provenance, so no build can select a frontend without saying which one.
+func resolveSoroqFlutterBin() (string, error) {
+	choice, err := resolveSoroqFlutterFrontend()
+	if err != nil {
+		return "", err
+	}
+	fmt.Fprintf(os.Stderr, "soroq frontend: %s\n  %s\n", choice.Bin, choice.Provenance)
+	return choice.Bin, nil
 }
 
 func soroqFlutterBuildEnv(env []string) []string {
