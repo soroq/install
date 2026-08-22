@@ -29,19 +29,38 @@ type ManifestKeyringConfig struct {
 	Keys         []ManifestKeyringEntry `json:"keys"`
 }
 
+// The set holds ManifestSignerBackend, not *ManifestSigner, so that a signer whose key material is
+// NOT in this process (see ExternalManifestSigner) can be carried by the same keyring the publish
+// paths already read. Everything below is key-id bookkeeping and never touches key material, so
+// nothing here has to know which kind of signer it is holding.
 type ManifestSignerSet struct {
 	defaultKeyID string
-	signers      map[string]*ManifestSigner
+	signers      map[string]ManifestSignerBackend
 }
 
 func NewManifestSignerSet(signers []*ManifestSigner, defaultKeyID string) (*ManifestSignerSet, error) {
+	// Converting a []*ManifestSigner to []ManifestSignerBackend would turn a nil POINTER into a
+	// non-nil interface, so the nil check has to happen while the concrete type is still visible.
+	backends := make([]ManifestSignerBackend, 0, len(signers))
+	for _, signer := range signers {
+		if signer == nil {
+			return nil, errors.New("manifest signer set contains a nil signer")
+		}
+		backends = append(backends, signer)
+	}
+	return NewManifestSignerSetFromBackends(backends, defaultKeyID)
+}
+
+// NewManifestSignerSetFromBackends builds a set from any mix of signer backends: locally seeded
+// signers, external helper-backed signers, or both.
+func NewManifestSignerSetFromBackends(signers []ManifestSignerBackend, defaultKeyID string) (*ManifestSignerSet, error) {
 	if len(signers) == 0 {
 		return nil, errors.New("manifest signer set requires at least one signer")
 	}
 
 	result := &ManifestSignerSet{
 		defaultKeyID: strings.TrimSpace(defaultKeyID),
-		signers:      make(map[string]*ManifestSigner, len(signers)),
+		signers:      make(map[string]ManifestSignerBackend, len(signers)),
 	}
 	for _, signer := range signers {
 		if signer == nil {
@@ -139,7 +158,7 @@ func (s *ManifestSignerSet) ResolveKeyID(requestedKeyID string) (string, error) 
 	return "", errors.New("manifest signing key id is required because multiple signer keys are configured")
 }
 
-func (s *ManifestSignerSet) SignerForKeyID(keyID string) (*ManifestSigner, error) {
+func (s *ManifestSignerSet) SignerForKeyID(keyID string) (ManifestSignerBackend, error) {
 	keyID, err := s.ResolveKeyID(keyID)
 	if err != nil {
 		return nil, err

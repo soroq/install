@@ -73,9 +73,20 @@ a bad signature, wrong schema, or absent platform is REFUSED. --api is an advanc
 	if err != nil {
 		return err
 	}
+	// Resolve and verify EVERY requested pair before the first installer runs. This preserves the
+	// no-side-effects promise when (for example) android is healthy but a later iOS catalog reference is
+	// missing, and prevents a large frontend download before discovering an absent toolchain.
+	preflight, err := catalogReferencePreflightFn(base, catalog, platforms)
+	if err != nil {
+		return fmt.Errorf("catalog artifact preflight: %w", err)
+	}
 
 	for _, platform := range platforms {
-		if err := setupPlatform(platform, catalog, base, *force); err != nil {
+		verified, ok := preflight[platform]
+		if !ok {
+			return fmt.Errorf("catalog artifact preflight returned no verified pair for %s", platform)
+		}
+		if err := setupPlatform(platform, catalog, verified, base, *force); err != nil {
 			// Fail-fast: never record a partial set. A failure on one platform stops setup with a clear error.
 			return fmt.Errorf("setup %s: %w", platform, err)
 		}
@@ -120,13 +131,19 @@ func parseSetupPlatforms(positional []string, platformsFlag string) ([]string, e
 // setupPlatform resolves the catalog entry for one platform and installs its frontend + toolchain, then
 // records the active toolchain. The active pointer is written ONLY after BOTH installs succeed, so it
 // never points at a partial/failed install.
-func setupPlatform(platform string, catalog catalogDoc, base string, force bool) error {
+func setupPlatform(platform string, catalog catalogDoc, verified catalogPlatformPreflight, base string, force bool) error {
 	entry, err := catalog.entryForPlatform(platform)
 	if err != nil {
 		return err
 	}
 
 	fmt.Fprintf(os.Stdout, "Setting up %s: frontend %s, toolchain %s\n", platform, entry.FrontendVersion, entry.ToolchainVersion)
+	fmt.Fprintf(os.Stdout, "  verified pair: build_mode=%s tier=%s\n", verified.Toolchain.BuildMode, verified.Toolchain.Tier)
+	if strings.EqualFold(platform, "ios") &&
+		(!strings.EqualFold(strings.TrimSpace(verified.Toolchain.BuildMode), "release") ||
+			!strings.EqualFold(strings.TrimSpace(verified.Toolchain.Tier), "production")) {
+		fmt.Fprintln(os.Stderr, "WARNING: selected iOS toolchain is experimental and is NOT an App-Store-production engine; device lifecycle success does not imply Apple approval.")
+	}
 
 	// Frontend install (existing installer, called as a library). It re-verifies signature + archive hash
 	// and caches under ~/.soroq/frontends/.

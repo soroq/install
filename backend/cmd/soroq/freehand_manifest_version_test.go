@@ -7,9 +7,13 @@ import (
 	"soroq/backend/internal/domain"
 )
 
-func mkPatch(app, channel, release string, number int, rolledBack bool) domain.Patch {
+// The third argument is the RUNTIME id, which is the scope the control plane numbers by. Each patch
+// also gets a release id derived from it, so a test that accidentally scoped by release would still
+// see a coherent fixture rather than an empty one.
+func mkPatch(app, channel, runtime string, number int, rolledBack bool) domain.Patch {
 	return domain.Patch{
-		AppID: app, Channel: channel, ReleaseID: release, Number: number, RolledBack: rolledBack,
+		AppID: app, Channel: channel, RuntimeID: runtime, ReleaseID: "rel-of-" + runtime,
+		Number: number, RolledBack: rolledBack,
 	}
 }
 
@@ -71,23 +75,52 @@ func TestStaleVersionIsRefusedWithAnActionableMessage(t *testing.T) {
 	}
 }
 
-// Versions are per (app, channel, release): parallel scopes must not collide or interfere.
+// Versions are per (app, channel, runtime): parallel scopes must not collide or interfere.
 func TestVersionScopeIsolation(t *testing.T) {
 	all := []domain.Patch{
-		mkPatch("app", "stable", "rel", 1, false),
-		mkPatch("app", "stable", "rel", 2, false),
-		mkPatch("app", "beta", "rel", 7, false),
-		mkPatch("other", "stable", "rel", 9, false),
-		mkPatch("app", "stable", "otherRel", 5, false),
+		mkPatch("app", "stable", "rt", 1, false),
+		mkPatch("app", "stable", "rt", 2, false),
+		mkPatch("app", "beta", "rt", 7, false),
+		mkPatch("other", "stable", "rt", 9, false),
+		mkPatch("app", "stable", "otherRt", 5, false),
 	}
-	if got := nextManifestVersion(scopedPatches(all, "app", "stable", "rel")); got != 3 {
-		t.Errorf("app/stable/rel next = %d, want 3", got)
+	if got := nextManifestVersion(scopedPatches(all, "app", "stable", "rt")); got != 3 {
+		t.Errorf("app/stable/rt next = %d, want 3", got)
 	}
-	if got := nextManifestVersion(scopedPatches(all, "app", "beta", "rel")); got != 8 {
-		t.Errorf("app/beta/rel next = %d, want 8 (a parallel channel must not be dragged along)", got)
+	if got := nextManifestVersion(scopedPatches(all, "app", "beta", "rt")); got != 8 {
+		t.Errorf("app/beta/rt next = %d, want 8 (a parallel channel must not be dragged along)", got)
 	}
-	if got := nextManifestVersion(scopedPatches(all, "app", "stable", "brandNew")); got != 1 {
-		t.Errorf("a fresh release must start at 1, got %d", got)
+	if got := nextManifestVersion(scopedPatches(all, "app", "stable", "brandNewRt")); got != 1 {
+		t.Errorf("a fresh runtime must start at 1, got %d", got)
+	}
+}
+
+// THE SCOPE MUST BE THE SERVER'S SCOPE.
+//
+// The control plane numbers patches per (app_id, runtime_id, channel). The client used to resolve the
+// version per (app, channel, RELEASE), and the two agree only while every runtime has exactly one
+// release. The moment a second release is registered against the same runtime -- which is ordinary,
+// since the runtime id is version-derived and does not change when only the app code changes -- the
+// client signs version 1, the server allocates 2, and the publish aborts with
+//
+//	concurrent publication detected: ... another publish won the race
+//
+// naming a race that never happened. This pins the disagreement rather than the symptom: a fixture
+// where one runtime carries two releases must resolve to the number the server would allocate.
+func TestVersionScopeMatchesTheControlPlaneAllocationScope(t *testing.T) {
+	// One runtime, two releases -- the exact shape that broke.
+	all := []domain.Patch{
+		{AppID: "app", Channel: "stable", RuntimeID: "rt1", ReleaseID: "release-A", Number: 1},
+		{AppID: "app", Channel: "stable", RuntimeID: "rt1", ReleaseID: "release-A", Number: 2},
+	}
+	// Publishing under a NEW release id against the SAME runtime must continue the runtime's sequence.
+	if got := nextManifestVersion(scopedPatches(all, "app", "stable", "rt1")); got != 3 {
+		t.Fatalf("next version for runtime rt1 = %d, want 3; scoping by release would have said 1 and "+
+			"the control plane would have allocated 3", got)
+	}
+	// And a genuinely different runtime still starts fresh.
+	if got := nextManifestVersion(scopedPatches(all, "app", "stable", "rt2")); got != 1 {
+		t.Fatalf("a different runtime must start at 1, got %d", got)
 	}
 }
 
@@ -133,5 +166,31 @@ func TestExistingScopedPatchesIsOfflineSafe(t *testing.T) {
 	}
 	if v := nextManifestVersion(got); v != 1 {
 		t.Errorf("offline derived version = %d, want 1", v)
+	}
+}
+
+// TestPublishVersionQueryUsesThePublishControlPlane pins the trap that shipped: the deployment-version
+// query read the RAW --api flag while the publish itself resolved the default hosted API. With --api
+// omitted -- the ordinary invocation -- the query base was the empty string, existingScopedPatches
+// took its offline-safe path above WITHOUT asking anything, and every patch was signed as version 1.
+//
+// The offline-safe path is correct for `--emit-signed-manifest` and is kept. What must never happen
+// again is a PUBLISH reaching it, so this asserts the two halves resolve the same non-empty base.
+func TestPublishVersionQueryUsesThePublishControlPlane(t *testing.T) {
+	var noFlags []string
+	raw, _ := flagValue(noFlags, "api")
+	if raw != "" {
+		t.Fatalf("precondition: with no --api the raw flag must be empty, got %q", raw)
+	}
+	resolved := freehandPublishAPIBase(noFlags)
+	if strings.TrimSpace(resolved) == "" {
+		t.Fatal("freehandPublishAPIBase returned an empty base with no --api; a publish would sign version 1 forever")
+	}
+	if resolved != defaultAPIBase() {
+		t.Fatalf("freehandPublishAPIBase(no flags) = %q, want the default %q", resolved, defaultAPIBase())
+	}
+	// And the explicit flag still wins, so a publish against a non-default control plane asks THAT one.
+	if got := freehandPublishAPIBase([]string{"--api", "https://example.invalid/api"}); got != "https://example.invalid/api" {
+		t.Fatalf("explicit --api not honoured: %q", got)
 	}
 }

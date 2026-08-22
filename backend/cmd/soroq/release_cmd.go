@@ -23,6 +23,10 @@ import (
 // can stub the SOROQ build step and exercise the soroq.lock pin-write path without a real Flutter build.
 var androidReleaseBuildFn = runFlutterAndroidReleaseBuild
 
+// iosReleaseBuildFn indirects the iOS build so command-level tests can prove that a refused shape
+// costs ZERO build invocations, rather than inferring it from where a guard sits in the source.
+var iosReleaseBuildFn = runFlutterIOSReleaseBuild
+
 // androidReleaseEnvGuardFn resolves the Android engine source WITHOUT touching the network, so a
 // broken toolchain still fails before any control-plane request. The duplicate-release preflight sits
 // behind it: a developer with no usable engine must hear about the engine, not about a release id.
@@ -240,6 +244,15 @@ func runReleaseAndroid(args []string) error {
 	configureCLIOutput(*verbose, *quiet, *jsonOut)
 	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
+	if err := guardUnverifiedBuildFlags(flutterBuildArgs); err != nil {
+		return err
+	}
+	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
+		return err
+	}
+	if err := guardSupportedApplicationShape(*projectDir); err != nil {
+		return err
+	}
 
 	status, err := inspectProject(*projectDir)
 	if err != nil {
@@ -268,6 +281,7 @@ func runReleaseAndroid(args []string) error {
 	// soroqBuilt is true ONLY when SOROQ ran the build below. On the --artifact bypass (soroq did NOT
 	// build and resolves no toolchain) it stays false, so NO soroq.lock pin is written for that release.
 	soroqBuilt := false
+	var soroqBuildStartedAt time.Time
 	if resolvedArtifactPath == "" && *buildBeforeDiscover {
 		if envErr := androidReleaseEnvGuardFn(resolvedToolchainVersion, flutterBuildArgs); envErr != nil {
 			return envErr
@@ -310,6 +324,7 @@ func runReleaseAndroid(args []string) error {
 				return reportIdempotentRelease(preflight, status.ProjectDir, *jsonOut)
 			}
 		}
+		soroqBuildStartedAt = time.Now()
 		if err := androidReleaseBuildFn(status.ProjectDir, *buildArtifactType, resolvedToolchainVersion, flutterBuildArgs); err != nil {
 			return err
 		}
@@ -321,6 +336,10 @@ func runReleaseAndroid(args []string) error {
 			return errors.New("no Android release artifact found; run `soroq release android` with a working Flutter toolchain or pass --artifact")
 		}
 		if err != nil {
+			return err
+		}
+		// Soroq built; the file it just found must be one THIS build produced.
+		if err := guardStaleDiscoveredArtifact(resolvedArtifactPath, soroqBuildStartedAt); err != nil {
 			return err
 		}
 	}
@@ -476,6 +495,15 @@ func runReleaseIOS(args []string) error {
 	configureCLIOutput(*verbose, *quiet, *jsonOut)
 	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
+	if err := guardUnverifiedBuildFlags(flutterBuildArgs); err != nil {
+		return err
+	}
+	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
+		return err
+	}
+	if err := guardSupportedIOSApplicationShape(*projectDir); err != nil {
+		return err
+	}
 
 	status, err := inspectProject(*projectDir)
 	if err != nil {
@@ -486,7 +514,7 @@ func runReleaseIOS(args []string) error {
 	// emit app.dill for the ios-engine patch lane. Decoupled from the config-lane control-plane
 	// registration below so a fresh dev can produce app.dill without a control-plane round-trip.
 	if *build {
-		return runFlutterIOSReleaseBuild(status.ProjectDir, strings.TrimSpace(*toolchainVersion), flutterBuildArgs)
+		return iosReleaseBuildFn(status.ProjectDir, strings.TrimSpace(*toolchainVersion), flutterBuildArgs)
 	}
 	if len(flutterBuildArgs) > 0 {
 		return errors.New("release ios does not build or upload an IPA without --build; remove passthrough build arguments or pass --build --toolchain <version>")
@@ -696,9 +724,30 @@ func resolveReleaseArchForArtifact(artifactType string, abis []string, override 
 		return abis[0], nil
 	default:
 		if artifactType == "aab" {
+			// An AAB legitimately covers every ABI: Play splits it per-device at delivery.
 			return "universal", nil
 		}
-		return preferredAndroidABI(abis), nil
+		// A fat APK binds the release to ONE architecture while every ABI inside it shares a single
+		// runtime_id -- patch selection keys on runtime_id and channel, not arch. Devices running the
+		// other ABIs therefore sit on this release and are offered patches built from this slice.
+		//
+		// Preferring arm64 is a deliberate, tested default and is kept: it is right for the overwhelming
+		// majority of shipped Flutter apps. What was wrong is that it happened SILENTLY, so a developer
+		// shipping a genuinely multi-ABI APK had no way to notice. Say it plainly instead of changing it.
+		chosen := preferredAndroidABI(abis)
+		uncovered := make([]string, 0, len(abis))
+		for _, abi := range abis {
+			if abi != chosen {
+				uncovered = append(uncovered, abi)
+			}
+		}
+		fmt.Fprintf(os.Stderr,
+			"warning: this APK contains %d ABIs (%s); the release is bound to %s.\n"+
+				"  Patches are selected by runtime id, not architecture, so devices running %s would be offered\n"+
+				"  code built for %s. Pass --arch to choose explicitly, or ship an app bundle\n"+
+				"  (--artifact-type aab) so Play delivers a per-ABI split.\n",
+			len(abis), strings.Join(abis, ", "), chosen, strings.Join(uncovered, ", "), chosen)
+		return chosen, nil
 	}
 }
 

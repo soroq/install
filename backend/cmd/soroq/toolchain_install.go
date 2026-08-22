@@ -445,7 +445,9 @@ func runUnchangedVerifyEngineBundle(bundleDir string) (string, error) {
 	if err := os.WriteFile(appDill, []byte("throwaway app.dill for verify-only run"), 0o644); err != nil {
 		return "", err
 	}
-	baselineOut := filepath.Join(tmp, "baseline.json")
+	// NOT "baseline.json": that name is reserved for the freehand baseline, and `release
+	// ios-engine` refuses it so the two artifacts can never be confused.
+	baselineOut := filepath.Join(tmp, "soroq-ios-engine-baseline.json")
 	cmd := exec.Command(bin, "release", "ios-engine",
 		"--engine-bundle", bundleDir,
 		"--app-dill", appDill,

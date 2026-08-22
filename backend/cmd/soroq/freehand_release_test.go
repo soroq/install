@@ -569,8 +569,18 @@ func TestPatchArtifact_ConcurrentIdenticalAndInterrupted(t *testing.T) {
 		if !complete {
 			return // interrupted: no patch_artifact.json
 		}
+		// A complete rich base identity is now required of every artifact, so the fixture carries a real
+		// one (recomputed, not hand-written) and cross-consistent with the artifact's own runtime id.
+		baseIdentity, ierr := newFreehandRichBaseIdentity(
+			"rt-concurrent", freehandSHA256Bytes([]byte("baseapp")),
+			freehandSHA256Bytes([]byte("contract")), freehandSHA256Bytes([]byte("retention")))
+		if ierr != nil {
+			t.Fatal(ierr)
+		}
 		m := FreehandPatchArtifactMeta{
 			Schema: "soroq.freehand.patch_artifact.v2", ArtifactID: aid,
+			RuntimeID:    "rt-concurrent",
+			BaseIdentity: &baseIdentity, BaseAppDillSHA256: baseIdentity.BaseFingerprint,
 			PatchPlanSHA256: planSHA, ModuleManifestSHA256: manifestSHA,
 			ModuleLibrary:      "soroq-freehand:///import/prefix/1111111111111111111111111111111111111111111111111111111111111111/soroq_freehand_module.dart",
 			ModuleGraphDigest:  "1111111111111111111111111111111111111111111111111111111111111111",
@@ -596,5 +606,63 @@ func TestPatchArtifact_ConcurrentIdenticalAndInterrupted(t *testing.T) {
 		if err := verifyExistingPatchArtifact(winner, aid); err != nil {
 			t.Fatalf("identical concurrent producer %d must accept the winner: %v", i, err)
 		}
+	}
+}
+
+// The delegate MUST receive an --api, and MUST keep the developer's when one is given.
+//
+// The regression this guards: the delegate's own -api defaults to http://localhost:8080, so without a
+// forwarded value the control-plane release is never created while the command still prints
+// "registered engine-lane baseline" and exits 0. The failure surfaces one command later, as a 404
+// "unknown release" from `soroq patch`, pointing at the patch instead of the release. It cost a full
+// base build and publish cycle on 2026-08-21. platforms_cmd.go fixes the same defect for the
+// --platforms=ios route; this route was never fixed.
+func TestFreehandFinalizeBuild_ForwardsAPIToDelegate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		head []string
+		want string
+	}{
+		{"defaulted when absent", nil, defaultAPIBase()},
+		{"developer's value wins", []string{"--api", "http://127.0.0.1:8080"}, "http://127.0.0.1:8080"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proj := t.TempDir()
+			relDir := filepath.Join(proj, ".soroq", "releases", "abc123")
+			if err := os.MkdirAll(relDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			origPersist, origDelegate := freehandPersistFn, freehandReleaseDelegate
+			defer func() { freehandPersistFn, freehandReleaseDelegate = origPersist, origDelegate }()
+			freehandPersistFn = func(string, string, string, string, string, string) (string, error) {
+				return relDir, nil
+			}
+			var got []string
+			freehandReleaseDelegate = func(verb string, args []string) error {
+				got = args
+				return nil
+			}
+			if err := freehandFinalizeBuild(tc.head, proj, filepath.Join(proj, "app.dill"),
+				nil, "analyzer-sha", t.TempDir(), "toolchain-x", ""); err != nil {
+				t.Fatal(err)
+			}
+			v, ok := flagValue(got, "api")
+			if !ok {
+				t.Fatalf("delegate received no --api at all: %v", got)
+			}
+			if v != tc.want {
+				t.Fatalf("delegate --api = %q, want %q", v, tc.want)
+			}
+			// Exactly one, or which value the delegate honours is undefined.
+			n := 0
+			for _, a := range got {
+				if a == "--api" {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Fatalf("delegate received %d --api flags, want exactly 1: %v", n, got)
+			}
+		})
 	}
 }

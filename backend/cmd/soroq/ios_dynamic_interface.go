@@ -187,7 +187,10 @@ func generateFreehandBaseContract(projectDir string, sdkAvailable, flutterAvaila
 		return zero, fmt.Errorf("create iOS dynamic-interface directory: %w", err)
 	}
 
-	appLibs, depLibs := contractProjectLibraries(absDir)
+	appLibs, depLibs, err := contractProjectLibraries(absDir)
+	if err != nil {
+		return zero, err
+	}
 	c := buildFreehandBaseContract(sdkAvailable, flutterAvailable, appLibs, depLibs)
 	c.Path = path
 

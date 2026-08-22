@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -61,10 +64,75 @@ func stubInstalls(t *testing.T) (frontendCalls *[][]string, toolchainCalls *[][]
 	t.Helper()
 	var fcalls, tcalls [][]string
 	prevF, prevT := installFrontend, installToolchain
+	prevPreflight := catalogReferencePreflightFn
 	installFrontend = func(args []string) error { fcalls = append(fcalls, args); return nil }
 	installToolchain = func(args []string) error { tcalls = append(tcalls, args); return nil }
-	t.Cleanup(func() { installFrontend = prevF; installToolchain = prevT })
+	catalogReferencePreflightFn = func(_ string, doc catalogDoc, platforms []string) (map[string]catalogPlatformPreflight, error) {
+		out := make(map[string]catalogPlatformPreflight, len(platforms))
+		for _, platform := range platforms {
+			entry, err := doc.entryForPlatform(platform)
+			if err != nil {
+				return nil, err
+			}
+			out[platform] = catalogPlatformPreflight{
+				Platform: platform,
+				Entry:    entry,
+				Toolchain: cliManifest{
+					Platform: platform, BuildMode: "release", Tier: "production",
+				},
+			}
+		}
+		return out, nil
+	}
+	t.Cleanup(func() {
+		installFrontend = prevF
+		installToolchain = prevT
+		catalogReferencePreflightFn = prevPreflight
+	})
 	return &fcalls, &tcalls
+}
+
+func TestSetupPreflightsEveryRequestedPairBeforeAnyInstall(t *testing.T) {
+	signer := setupTestSigner(t)
+	t.Setenv("HOME", t.TempDir())
+	doc := catalogDoc{
+		Schema: catalogSchema,
+		Platforms: map[string]catalogPlatform{
+			"android": {FrontendVersion: "frontend-A", ToolchainVersion: "toolchain-A"},
+			"ios":     {FrontendVersion: "frontend-I", ToolchainVersion: "missing-toolchain-I"},
+		},
+	}
+	body, _ := json.MarshalIndent(doc, "", "  ")
+	srv := catalogTestServer(t, body, signBytes(t, signer, body))
+
+	var fcalls, tcalls int
+	prevF, prevT, prevPreflight := installFrontend, installToolchain, catalogReferencePreflightFn
+	installFrontend = func([]string) error { fcalls++; return nil }
+	installToolchain = func([]string) error { tcalls++; return nil }
+	catalogReferencePreflightFn = func(_ string, _ catalogDoc, platforms []string) (map[string]catalogPlatformPreflight, error) {
+		if len(platforms) != 2 || platforms[0] != "android" || platforms[1] != "ios" {
+			t.Fatalf("preflight platforms = %v", platforms)
+		}
+		return nil, errors.New("REFUSED: catalog ios toolchain missing-toolchain-I: manifest fetch: 404")
+	}
+	t.Cleanup(func() {
+		installFrontend, installToolchain, catalogReferencePreflightFn = prevF, prevT, prevPreflight
+	})
+
+	err := runSetup([]string{"--platforms", "android,ios", "--api", srv.URL})
+	if err == nil || !strings.Contains(err.Error(), "catalog artifact preflight") || !strings.Contains(err.Error(), "missing-toolchain-I") {
+		t.Fatalf("expected exact preflight refusal, got %v", err)
+	}
+	if fcalls != 0 || tcalls != 0 {
+		t.Fatalf("install side effects before all-pair preflight completed: frontend=%d toolchain=%d", fcalls, tcalls)
+	}
+	// Zero installs is necessary but not sufficient: the ACTIVE POINTER must also be untouched, or a
+	// refused setup would still repoint the toolchain a later build resolves. active.json is written
+	// per-platform after both installs succeed, so a partial write here would mean the android leg
+	// committed state before the ios leg was known to be broken.
+	if _, statErr := os.Stat(filepath.Join(os.Getenv("HOME"), ".soroq", "toolchains", "active.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("a refused preflight left an active-toolchain pointer behind (stat err = %v)", statErr)
+	}
 }
 
 // (a) setup android: verifies -> resolves -> installs -> writes active.json with the right toolchain.

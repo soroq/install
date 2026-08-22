@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"soroq/backend/internal/nativeelf"
 )
 
 type Snapshot struct {
@@ -37,6 +39,19 @@ type EntryDigest struct {
 	Path      string `json:"path"`
 	SHA256    string `json:"sha256"`
 	SizeBytes uint64 `json:"size_bytes"`
+
+	// CompareDigest is the same content hashed with the ELF GNU build-id note normalised away. It
+	// exists because a linker stamps every ELF with a build-id derived partly from the build
+	// environment, so identical sources compiled at a different path produce a byte-different
+	// library containing identical code — and comparing raw SHA256 refused patches that were in
+	// fact deliverable.
+	//
+	// `omitempty`, and DELIBERATELY not a schema version bump: a snapshot written before this field
+	// existed simply has no value, and compareNativeLibraryMaps falls back to strict SHA256 for any
+	// pair where either side lacks it. Old snapshots therefore keep exactly their old behaviour
+	// instead of failing to load, and the fallback direction is the safe one — a missing digest can
+	// only ever cause a REFUSAL, never an acceptance.
+	CompareDigest string `json:"compare_digest,omitempty"`
 }
 
 type AOTLinkMetadataDescriptor struct {
@@ -469,11 +484,19 @@ func readNativeLibrariesFromZip(files []*zip.File) ([]EntryDigest, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read native library %s: %w", file.Name, err)
 		}
-		entries = append(entries, EntryDigest{
+		entry := EntryDigest{
 			Path:      path,
 			SHA256:    sha256Hex(bytes),
 			SizeBytes: uint64(len(bytes)),
-		})
+		}
+		// Recorded at SCAN time because this is the only point where the bytes exist: a Snapshot is
+		// serialized to JSON and reloaded by LoadSnapshot, so a comparison run later has digests and
+		// sizes and nothing else. That is why this had to become a field rather than a call at the
+		// comparison site, as it could be in the other three copies.
+		if digest, ok := nativeelf.ComparisonDigest(bytes); ok {
+			entry.CompareDigest = digest
+		}
+		entries = append(entries, entry)
 	}
 	if len(entries) == 0 {
 		return nil, errors.New("no native libraries found in Android artifact")
@@ -512,11 +535,27 @@ func compareNativeLibraryMaps(base map[string]EntryDigest, candidate map[string]
 		if !ok {
 			return false
 		}
-		if baseEntry.SHA256 != candidateEntry.SHA256 || baseEntry.SizeBytes != candidateEntry.SizeBytes {
+		if baseEntry.SizeBytes != candidateEntry.SizeBytes {
+			return false
+		}
+		if !nativeLibraryContentsMatch(baseEntry, candidateEntry) {
 			return false
 		}
 	}
 	return true
+}
+
+// nativeLibraryContentsMatch compares two native libraries, ignoring a difference that is only the
+// ELF GNU build-id.
+//
+// FAIL-CLOSED IN EVERY DIRECTION. The normalised digests are used only when BOTH sides have one; if
+// either is missing — an old snapshot, a non-ELF member, an unparseable library — the comparison
+// falls back to strict SHA256 equality. A missing digest can therefore only cause a refusal.
+func nativeLibraryContentsMatch(base EntryDigest, candidate EntryDigest) bool {
+	if base.CompareDigest != "" && candidate.CompareDigest != "" {
+		return base.CompareDigest == candidate.CompareDigest
+	}
+	return base.SHA256 == candidate.SHA256
 }
 
 func sortedMapKeys[T any](items map[string]T) []string {

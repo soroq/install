@@ -20,6 +20,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"soroq/backend/internal/signing"
@@ -41,6 +45,19 @@ type catalogPlatform struct {
 	FrontendVersion  string `json:"frontend_version"`
 	ToolchainVersion string `json:"toolchain_version"`
 }
+
+// catalogPlatformPreflight is the verified, signed artifact pair behind one catalog entry. Keeping the
+// parsed manifests lets setup report the selected build mode/tier without trusting unsigned catalog text.
+type catalogPlatformPreflight struct {
+	Platform  string
+	Entry     catalogPlatform
+	Frontend  frontendManifest
+	Toolchain cliManifest
+}
+
+// catalogReferencePreflightFn is the single setup/operator-publish preflight seam. Production always uses
+// the real verifier; tests may replace it to isolate catalog routing/signing from artifact-fixture setup.
+var catalogReferencePreflightFn = preflightCatalogReferences
 
 // fetchVerifiedCatalog fetches, VERIFIES, and schema-gates the catalog from base (the api). It returns the
 // parsed doc ONLY after the signature verifies against the pinned key AND the schema is exactly
@@ -114,4 +131,169 @@ func (d catalogDoc) platformNames() []string {
 		names = append(names, k)
 	}
 	return names
+}
+
+// preflightCatalogReferences verifies every requested frontend/toolchain pair and lightly probes both
+// signed archive URLs BEFORE setup performs any install. This closes a distribution-integrity gap where a
+// validly-signed catalog could name an absent artifact: cached machines continued to work while every fresh
+// setup failed only after the first large install had already run.
+func preflightCatalogReferences(base string, doc catalogDoc, platforms []string) (map[string]catalogPlatformPreflight, error) {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" {
+		base = defaultControlPlaneAPI
+	}
+	verified := make(map[string]catalogPlatformPreflight, len(platforms))
+	for _, rawPlatform := range platforms {
+		platform := strings.ToLower(strings.TrimSpace(rawPlatform))
+		entry, err := doc.entryForPlatform(platform)
+		if err != nil {
+			return nil, err
+		}
+
+		frontend, err := fetchCatalogFrontendManifest(base, entry.FrontendVersion)
+		if err != nil {
+			return nil, fmt.Errorf("REFUSED: catalog %s frontend %q: %w", platform, entry.FrontendVersion, err)
+		}
+		toolchain, err := fetchCatalogToolchainManifest(base, entry.ToolchainVersion)
+		if err != nil {
+			return nil, fmt.Errorf("REFUSED: catalog %s toolchain %q: %w", platform, entry.ToolchainVersion, err)
+		}
+		if got := strings.ToLower(strings.TrimSpace(toolchain.Platform)); got != platform {
+			return nil, fmt.Errorf("REFUSED: catalog %s toolchain %q declares platform %q", platform, entry.ToolchainVersion, toolchain.Platform)
+		}
+		if !containsExact(frontend.CompatibleToolchainIDs, entry.ToolchainVersion) {
+			return nil, fmt.Errorf("REFUSED: catalog %s pair is not bound: frontend %q does not declare toolchain %q compatible", platform, entry.FrontendVersion, entry.ToolchainVersion)
+		}
+		if err := probeSignedArchive(frontend.Archive.URL, frontend.Archive.CompressedBytes); err != nil {
+			return nil, fmt.Errorf("REFUSED: catalog %s frontend archive: %w", platform, err)
+		}
+		if err := probeSignedArchive(toolchain.Archive.URL, toolchain.Archive.CompressedBytes); err != nil {
+			return nil, fmt.Errorf("REFUSED: catalog %s toolchain archive: %w", platform, err)
+		}
+		verified[platform] = catalogPlatformPreflight{
+			Platform: platform, Entry: entry, Frontend: frontend, Toolchain: toolchain,
+		}
+	}
+	return verified, nil
+}
+
+func fetchCatalogFrontendManifest(base, version string) (frontendManifest, error) {
+	manifestBytes, err := httpGetBytes(base + "/v1/frontends/" + url.PathEscape(version))
+	if err != nil {
+		return frontendManifest{}, fmt.Errorf("manifest fetch: %w", err)
+	}
+	sigBytes, err := httpGetBytes(base + "/v1/frontends/" + url.PathEscape(version) + "/manifest.sig")
+	if err != nil {
+		return frontendManifest{}, fmt.Errorf("signature fetch: %w", err)
+	}
+	if err := signing.VerifyToolchainManifestSignature(manifestBytes, strings.TrimSpace(string(sigBytes)), pinnedToolchainPublicKeyHex()); err != nil {
+		return frontendManifest{}, fmt.Errorf("signature verification: %w", err)
+	}
+	manifest, err := parseFrontendManifest(manifestBytes)
+	if err != nil {
+		return frontendManifest{}, err
+	}
+	if manifest.SoroqFrontendVersion != version {
+		return frontendManifest{}, fmt.Errorf("manifest version %q does not match catalog version %q", manifest.SoroqFrontendVersion, version)
+	}
+	if err := checkFrontendIdentity(manifest); err != nil {
+		return frontendManifest{}, err
+	}
+	if strings.TrimSpace(manifest.Archive.URL) == "" || len(strings.TrimSpace(manifest.Archive.SHA256)) != 64 || manifest.Archive.CompressedBytes <= 0 {
+		return frontendManifest{}, fmt.Errorf("signed manifest has incomplete archive identity")
+	}
+	return manifest, nil
+}
+
+func fetchCatalogToolchainManifest(base, version string) (cliManifest, error) {
+	manifestBytes, err := httpGetBytes(base + "/v1/toolchains/" + url.PathEscape(version))
+	if err != nil {
+		return cliManifest{}, fmt.Errorf("manifest fetch: %w", err)
+	}
+	sigBytes, err := httpGetBytes(base + "/v1/toolchains/" + url.PathEscape(version) + "/manifest.sig")
+	if err != nil {
+		return cliManifest{}, fmt.Errorf("signature fetch: %w", err)
+	}
+	if err := signing.VerifyToolchainManifestSignature(manifestBytes, strings.TrimSpace(string(sigBytes)), pinnedToolchainPublicKeyHex()); err != nil {
+		return cliManifest{}, fmt.Errorf("signature verification: %w", err)
+	}
+	manifest, err := parseCLIManifest(manifestBytes)
+	if err != nil {
+		return cliManifest{}, err
+	}
+	if manifest.SoroqToolchainVersion != version {
+		return cliManifest{}, fmt.Errorf("manifest version %q does not match catalog version %q", manifest.SoroqToolchainVersion, version)
+	}
+	if err := checkToolchainIdentity(manifest); err != nil {
+		return cliManifest{}, err
+	}
+	if strings.TrimSpace(manifest.Archive.URL) == "" || len(strings.TrimSpace(manifest.Archive.SHA256)) != 64 || manifest.Archive.CompressedBytes <= 0 {
+		return cliManifest{}, fmt.Errorf("signed manifest has incomplete archive identity")
+	}
+	return manifest, nil
+}
+
+func containsExact(values []string, want string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// probeSignedArchive performs a one-byte range GET rather than downloading a multi-gigabyte archive.
+// Some registry routes do not implement HEAD, so HEAD cannot distinguish an absent artifact from an
+// unsupported method. A server that ignores Range is still bounded client-side: the body is closed after
+// one byte. Full size and SHA verification remain the installer's responsibility.
+func probeSignedArchive(rawURL string, expectedBytes int64) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return fmt.Errorf("invalid signed archive URL %q", rawURL)
+	}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		_, _ = io.CopyN(io.Discard, resp.Body, 512)
+		return fmt.Errorf("GET %s returned %s", u.Redacted(), resp.Status)
+	}
+	if expectedBytes > 0 {
+		servedBytes, err := archiveResponseSize(resp)
+		if err != nil {
+			return fmt.Errorf("GET %s: %w", u.Redacted(), err)
+		}
+		if servedBytes != expectedBytes {
+			return fmt.Errorf("GET %s archive size %d does not match signed size %d", u.Redacted(), servedBytes, expectedBytes)
+		}
+		var one [1]byte
+		if n, readErr := resp.Body.Read(one[:]); n != 1 || (readErr != nil && readErr != io.EOF) {
+			return fmt.Errorf("GET %s returned no archive bytes", u.Redacted())
+		}
+	}
+	return nil
+}
+
+func archiveResponseSize(resp *http.Response) (int64, error) {
+	if resp.StatusCode == http.StatusOK && resp.ContentLength >= 0 {
+		return resp.ContentLength, nil
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		contentRange := strings.TrimSpace(resp.Header.Get("Content-Range"))
+		slash := strings.LastIndexByte(contentRange, '/')
+		if slash >= 0 && slash+1 < len(contentRange) {
+			total, err := strconv.ParseInt(contentRange[slash+1:], 10, 64)
+			if err == nil && total >= 0 {
+				return total, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("archive response does not expose a usable total size")
 }

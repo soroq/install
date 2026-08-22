@@ -107,10 +107,24 @@ func buildFreehandArtifactFrom(t *testing.T, dir string, decls []abiDecl) (strin
 	}
 	artifactID := computeFreehandArtifactID(planSHA, bindingDigest, manifestSHA, descriptor.DescriptorDigest)
 
+	// Every artifact carries a COMPLETE rich base identity, derived the way the real patch path derives
+	// it: base_fingerprint is the artifact's own base app.dill sha, and the digest is recomputed rather
+	// than written by hand, so a fixture can never encode a digest the production code would reject.
+	baseIdentity, err := newFreehandRichBaseIdentity(
+		"rt-1",
+		freehandSHA256Bytes([]byte("baseapp")),
+		freehandSHA256Bytes([]byte("contract")),
+		freehandSHA256Bytes([]byte("retention")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	meta := FreehandPatchArtifactMeta{
 		Schema: "soroq.freehand.patch_artifact.v2", RuntimeID: "rt-1", IdentitySchema: "v1",
 		AppID: "com.shreyansh.calorietracker", Version: "1.0.0", Channel: "stable",
-		BaseAppDillSHA256: freehandSHA256Bytes([]byte("baseapp")), BaseSourceKernelSHA256: freehandSHA256Bytes([]byte("basesrc")),
+		BaseAppDillSHA256: freehandSHA256Bytes([]byte("baseapp")), BaseIdentity: &baseIdentity,
+		BaseSourceKernelSHA256: freehandSHA256Bytes([]byte("basesrc")),
 		CandSourceKernelSHA256: freehandSHA256Bytes([]byte("candsrc")), SourceRecipeDigest: freehandSHA256Bytes([]byte("recipe")),
 		PatchPlanSHA256: planSHA, ModuleSourceSHA256: freehandSHA256Bytes(moduleSrcBytes),
 		ModuleBytecodeSHA256: freehandSHA256Bytes(moduleBytecodeBytes), ModuleManifestSHA256: manifestSHA,

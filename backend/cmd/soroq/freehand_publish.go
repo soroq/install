@@ -66,6 +66,14 @@ type FreehandDeviceManifest struct {
 	// decodes non-strictly, so an older client simply ignores the field and still fails closed on the
 	// checks it does understand.
 	DependencyDescriptorDigest string `json:"dependencyDescriptorDigest,omitempty"`
+	// BaseIdentity is the COMPLETE rich identity of the base this patch was compiled against, inside the
+	// signed bytes. The top-level RuntimeID above is version-derived — appId | channel | appVersion |
+	// buildName | buildNumber | trustFingerprint — and describes nothing about the app binary, so two
+	// structurally different bases sharing all of those have the SAME runtime_id and each passes the
+	// other's runtime check. This block is what tells them apart; `SoroqEngineLaneController.
+	// rejectForeignArtifact` compares it field by field and re-derives its digest before anything is
+	// staged.
+	BaseIdentity *FreehandRichBaseIdentity `json:"baseIdentity"`
 }
 
 // buildFreehandDeviceManifest projects an immutable Step-4 artifact into a device manifest. It re-derives
@@ -125,9 +133,24 @@ func buildFreehandDeviceManifest(artifactDir string, version int, bytecodeName s
 		})
 	}
 
+	// FAIL CLOSED. An artifact with no rich identity can only be bound by runtime_id, so publishing it
+	// would produce a manifest that an identity-aware device must refuse anyway — and that a
+	// pre-identity device would accept from the wrong base. Refuse here, where the message can say what
+	// to do about it, rather than shipping a payload nothing can use.
+	if meta.BaseIdentity == nil {
+		return zero, nil, errors.New("refusing to publish: the patch artifact records no rich base identity (it predates the four-field identity) — rebuild the patch")
+	}
+	if err := meta.BaseIdentity.validate(); err != nil {
+		return zero, nil, fmt.Errorf("refusing to publish an artifact with an invalid base identity: %w", err)
+	}
+	if meta.BaseIdentity.RuntimeID != meta.RuntimeID {
+		return zero, nil, fmt.Errorf("refusing to publish: base identity runtime_id %q != artifact runtime_id %q", meta.BaseIdentity.RuntimeID, meta.RuntimeID)
+	}
+
 	m := FreehandDeviceManifest{
 		Version:              version,
 		RuntimeID:            meta.RuntimeID,
+		BaseIdentity:         meta.BaseIdentity,
 		BytecodeSha256:       bytecodeSHA,
 		EntrypointContract:   freehandDeviceContract,
 		Patches:              []freehandDevicePatch{{Bytecode: bytecodeName}},
@@ -173,6 +196,19 @@ func validateFreehandDeviceManifest(manifestBytes []byte) error {
 	}
 	if strings.TrimSpace(m.RuntimeID) == "" {
 		return errors.New("freehand device manifest missing runtime_id")
+	}
+	// A manifest for an identity-aware base that is missing ANY identity field, or whose digest does not
+	// recompute from its own fields, is refused before it can be signed — the producer half of the gate
+	// the device runs before staging. Neither the signature nor the payload hash says anything about
+	// WHICH BASE a module was compiled against, so this is the only check that does.
+	if m.BaseIdentity == nil {
+		return errors.New("freehand device manifest is missing the baseIdentity block; runtime_id alone cannot distinguish two bases that share app/channel/version/trust")
+	}
+	if err := m.BaseIdentity.validate(); err != nil {
+		return fmt.Errorf("freehand device manifest base identity: %w", err)
+	}
+	if m.BaseIdentity.RuntimeID != m.RuntimeID {
+		return fmt.Errorf("freehand device manifest base identity runtime_id %q != manifest runtime_id %q", m.BaseIdentity.RuntimeID, m.RuntimeID)
 	}
 	if !sha256HexRe.MatchString(m.BytecodeSha256) {
 		return errors.New("freehand device manifest bytecodeSha256 malformed")

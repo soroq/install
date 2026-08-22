@@ -54,16 +54,31 @@ func nextManifestVersion(existing []domain.Patch) int {
 	return max + 1
 }
 
-// scopedPatches filters a patch list to one deployment scope. Versions are monotonic PER
-// (app, channel, release) so parallel channels or releases never collide with each other.
-func scopedPatches(all []domain.Patch, appID, channel, releaseID string) []domain.Patch {
-	appID, channel, releaseID = strings.TrimSpace(appID), strings.TrimSpace(channel), strings.TrimSpace(releaseID)
+// scopedPatches filters a patch list to one deployment scope.
+//
+// THE SCOPE MUST BE THE SERVER'S SCOPE. The control plane allocates patch.Number per
+// (app_id, runtime_id, channel) -- see FileStore.patchNumberScope and the postgres
+// `select max(number) ... where app_id = $1 and runtime_id = $2 and channel = $3`. This function
+// used to scope by (app, channel, RELEASE) instead, and the two disagree the moment one runtime
+// carries more than one release: the client would sign a manifest for version 1 while the server
+// allocated 2, and the publish aborted with
+//
+//	concurrent publication detected: ... another publish won the race
+//
+// which names a race that never happened. I hit it on the first publish into every channel that
+// already had patches from an earlier release -- reproducibly, with nothing else running.
+//
+// Scoping on the runtime id is also the correct invariant on its own terms: the device sends its
+// runtime id and compares versions against what IT has applied, so "newer than what I run" is a
+// question about a runtime, not about a release.
+func scopedPatches(all []domain.Patch, appID, channel, runtimeID string) []domain.Patch {
+	appID, channel, runtimeID = strings.TrimSpace(appID), strings.TrimSpace(channel), strings.TrimSpace(runtimeID)
 	out := make([]domain.Patch, 0, len(all))
 	for _, p := range all {
 		if p.AppID != appID || p.Channel != channel {
 			continue
 		}
-		if releaseID != "" && p.ReleaseID != releaseID {
+		if runtimeID != "" && p.RuntimeID != runtimeID {
 			continue
 		}
 		out = append(out, p)
@@ -114,7 +129,7 @@ func assertAllocatedVersionMatches(signedVersion int, allocated domain.Patch) er
 // An empty api base means an offline emit (`--emit-signed-manifest`) with no control plane to consult; it
 // returns no patches, so the derived version is 1. That is correct for an artifact that is not being
 // deployed, and `validateManifestVersion` still refuses version 0.
-func existingScopedPatches(apiBase, appID, channel, releaseID string) ([]domain.Patch, error) {
+func existingScopedPatches(apiBase, appID, channel, runtimeID string) ([]domain.Patch, error) {
 	apiBase = strings.TrimSpace(apiBase)
 	if apiBase == "" {
 		return nil, nil
@@ -126,8 +141,8 @@ func existingScopedPatches(apiBase, appID, channel, releaseID string) ([]domain.
 	if s := strings.TrimSpace(channel); s != "" {
 		q.Set("channel", s)
 	}
-	if s := strings.TrimSpace(releaseID); s != "" {
-		q.Set("release_id", s)
+	if s := strings.TrimSpace(runtimeID); s != "" {
+		q.Set("runtime_id", s)
 	}
 	listURL := strings.TrimRight(apiBase, "/") + "/v1/patches"
 	if enc := q.Encode(); enc != "" {
@@ -138,6 +153,6 @@ func existingScopedPatches(apiBase, appID, channel, releaseID string) ([]domain.
 		return nil, err
 	}
 	// Filter again client-side: the server query is a convenience, but the version invariant is per
-	// (app, channel, release) and must not depend on server-side filter semantics.
-	return scopedPatches(all, appID, channel, releaseID), nil
+	// (app, channel, runtime) and must not depend on server-side filter semantics.
+	return scopedPatches(all, appID, channel, runtimeID), nil
 }

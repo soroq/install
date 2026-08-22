@@ -20,12 +20,25 @@ import (
 )
 
 // contractProjectLibraries returns (application library URIs, eligible Dart-only dependency library URIs)
-// for the project. Failures are non-fatal: a contract missing the project's own libraries is narrower,
-// never wider, so it can only refuse more — it can never let something through unchecked.
-func contractProjectLibraries(projectDir string) (appLibs []string, depLibs []string) {
-	g, err := depgraph.Resolve(projectDir)
-	if err != nil {
-		return nil, nil
+// for the project.
+//
+// A resolve failure USED to be swallowed here, on the reasoning that a narrower contract "can only
+// refuse more". That reasoning is wrong in consequence, and a device run proved it: with no
+// pubspec.lock, Resolve fails, the contract omits the project's OWN libraries, the base builds and the
+// patch publishes — and then the device quarantines every patch while reporting
+// `fetch=- sig=- hash=- err=null`, which is indistinguishable from no patch existing at all. The build
+// is not safer for being narrower; it is silently unpatchable, and it says nothing about why.
+//
+// The common cause is mundane: `flutter pub get` has not been run. That is worth an actionable refusal
+// at build time rather than a mystery on a device days later.
+func contractProjectLibraries(projectDir string) (appLibs []string, depLibs []string, err error) {
+	g, resolveErr := depgraph.Resolve(projectDir)
+	if resolveErr != nil {
+		return nil, nil, fmt.Errorf(
+			"cannot determine this project's own libraries for the retention contract: %w\n\n"+
+				"A base built without them publishes patches that every device silently quarantines, "+
+				"reporting no error. Run `flutter pub get` in %s and rebuild.",
+			resolveErr, projectDir)
 	}
 	// Prefer the libraries actually present in the PINNED base kernel. Walking lib/ instead exposes
 	// libraries that cannot compile for this target at all -- a package's web-only dart:js_interop
@@ -58,7 +71,7 @@ func contractProjectLibraries(projectDir string) (appLibs []string, depLibs []st
 		}
 		sort.Strings(appLibs)
 		sort.Strings(depLibs)
-		return appLibs, depLibs
+		return appLibs, depLibs, nil
 	}
 	libPaths := map[string]string{}
 	appLibs = dartLibraryURIs(g.RootPackage, filepath.Join(projectDir, "lib"), libPaths)
@@ -102,7 +115,7 @@ func contractProjectLibraries(projectDir string) (appLibs []string, depLibs []st
 	depLibs = dropURIs(depLibs, excluded)
 
 	sort.Strings(depLibs)
-	return appLibs, depLibs
+	return appLibs, depLibs, nil
 }
 
 // dropURIs returns uris with every member of drop removed.

@@ -58,6 +58,14 @@ const engineBundleSchema = "soroq.ios_engine.v2"
 const androidEngineBundleSchema = "soroq.android_engine.v1"
 const engineLaneBaselineSchemaV1 = "soroq.ios_engine_baseline.v1"
 const engineLaneBaselineSchema = "soroq.ios_engine_baseline.v2"
+
+// The default filename for the ENGINE-LANE baseline, and the filename RESERVED for the freehand one.
+// These two artifacts are both called "the baseline" in conversation, carry different schemas, and are
+// consumed by different commands; giving them the same name is what let one be handed to the reader of
+// the other. Named constants so the distinction is stated once and asserted in tests.
+const engineLaneBaselineDefaultName = "soroq-ios-engine-baseline.json"
+const freehandBaselineReservedName = "baseline.json"
+const freehandBaselineSchemaV2Name = "soroq.freehand.baseline.v2"
 const engineLaneBundleDescriptorSchema = "soroq.ios_engine.v1"
 
 // engineLaneSpec parameterizes verifyEngineBundle per platform: the accepted engine.json schema + the
@@ -380,10 +388,13 @@ func runReleaseIOSEngine(args []string) error {
 	}
 	outPath := strings.TrimSpace(*out)
 	if outPath == "" {
-		outPath = "soroq-ios-engine-baseline.json"
+		outPath = engineLaneBaselineDefaultName
 	}
-	// IMMUTABLE: refuse to overwrite a DIFFERENT baseline for the same release id.
+	if err := checkEngineLaneBaselineOutPath(outPath); err != nil {
+		return err
+	}
 	if existing, err := os.ReadFile(outPath); err == nil {
+		// IMMUTABLE: refuse to overwrite a DIFFERENT baseline for the same release id.
 		var prev engineLaneBaseline
 		if json.Unmarshal(existing, &prev) == nil && prev.ReleaseID == baseline.ReleaseID && !prev.equals(baseline) {
 			return fmt.Errorf("refusing to mutate the immutable baseline for release %q at %s (engine/app.dill changed); use a new --release-id", baseline.ReleaseID, outPath)
@@ -1055,6 +1066,48 @@ func publishEngineBundleViaAPI(apiBase, patchID, appID, releaseID, runtimeID, ch
 }
 
 // loadEngineLaneBaseline reads + validates the immutable baseline written by release ios-engine.
+// checkEngineLaneBaselineOutPath refuses an --out that would confuse the engine-lane baseline with the
+// freehand one. Two guards, because either alone leaves a hole: the NAME check protects the file that
+// does not exist yet (whichever artifact is written second would otherwise clobber the first), and the
+// SCHEMA check protects a file that exists under any name at all.
+func checkEngineLaneBaselineOutPath(outPath string) error {
+	// RESERVED NAME. `baseline.json` belongs to the FREEHAND baseline, which lives at
+	// .soroq/releases/<runtime-id>/baseline.json. Writing an engine-lane baseline under that name is
+	// how the two artifacts get confused, and pointing --out at an actual freehand release directory
+	// would destroy an immutable base. Refuse the name outright rather than only when it collides:
+	// a guard that depends on the file already existing does not protect the file written first.
+	if filepath.Base(outPath) == freehandBaselineReservedName {
+		return fmt.Errorf(
+			"--out %s uses the reserved filename %q, which is the FREEHAND baseline (%s) written by "+
+				"`soroq release ios --engine --build` into .soroq/releases/<runtime-id>/.\n"+
+				"  This command writes the ENGINE-LANE baseline (%s); name it something else, e.g. %s.",
+			outPath, freehandBaselineReservedName, freehandBaselineSchemaV2Name,
+			engineLaneBaselineSchema, engineLaneBaselineDefaultName)
+	}
+	// NEVER OVERWRITE THE OTHER ARTIFACT. The immutability check below unmarshals into
+	// engineLaneBaseline, and a freehand baseline unmarshals into it "successfully" with an empty
+	// ReleaseID — so the release-id comparison below is false and the write proceeds straight over a
+	// file it never understood. Discriminate on the declared schema first.
+	existing, rerr := os.ReadFile(outPath)
+	if rerr == nil {
+		var probe struct {
+			Schema string `json:"schema"`
+		}
+		if json.Unmarshal(existing, &probe) == nil {
+			if s := strings.TrimSpace(probe.Schema); s != "" &&
+				s != engineLaneBaselineSchema && s != engineLaneBaselineSchemaV1 {
+				return fmt.Errorf(
+					"refusing to overwrite %s: it declares schema %q, not an engine-lane baseline (%s or %s).\n"+
+						"  Two different artifacts are called a \"baseline\": the freehand baseline (%s) and this "+
+						"engine-lane one. Write the engine-lane baseline to its own path.",
+					outPath, s, engineLaneBaselineSchema, engineLaneBaselineSchemaV1,
+					freehandBaselineSchemaV2Name)
+			}
+		}
+	}
+	return nil
+}
+
 func loadEngineLaneBaseline(path string) (engineLaneBaseline, error) {
 	var b engineLaneBaseline
 	raw, err := os.ReadFile(path)
@@ -1064,9 +1117,44 @@ func loadEngineLaneBaseline(path string) (engineLaneBaseline, error) {
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return b, fmt.Errorf("--baseline: parse: %w", err)
 	}
+
+	// DISCRIMINATE ON THE SCHEMA BEFORE COMPLAINING ABOUT FIELDS.
+	//
+	// Two different artifacts are called baseline.json. `soroq release ios --engine --build` writes a
+	// FREEHAND baseline into .soroq/releases/<runtime-id>/; `soroq release ios-engine` writes an
+	// ENGINE-LANE baseline. Handed the freehand one, this function used to report
+	// "missing release_id / framework_sha256 / app_dill_sha256", which sends the reader looking for
+	// absent fields instead of telling them they passed the wrong kind of file.
+	//
+	// Backward compatibility is retained ONLY where it is unambiguous: an empty schema is accepted if
+	// the required engine-lane fields are all present, because early files predate the field. Anything
+	// that names a schema must name an engine-lane one.
+	switch schema := strings.TrimSpace(b.Schema); {
+	case schema == "":
+		// fall through to the field check below; absence is the legacy case.
+	case schema == engineLaneBaselineSchema || schema == engineLaneBaselineSchemaV1:
+		// expected
+	case strings.HasPrefix(schema, "soroq.freehand.baseline."):
+		return b, fmt.Errorf(
+			"--baseline %s is a FREEHAND baseline (schema %q), not an engine-lane baseline.\n"+
+				"  These are two different artifacts that share the filename baseline.json:\n"+
+				"    freehand    %s  written by `soroq release ios --engine --build` into .soroq/releases/<runtime-id>/\n"+
+				"    engine lane %s  written by `soroq release ios-engine --out <file>`\n"+
+				"  Generate the engine-lane one with `soroq release ios-engine --out <file>` and pass that.",
+			path, schema, schema, engineLaneBaselineSchema)
+	default:
+		return b, fmt.Errorf(
+			"--baseline %s declares unknown schema %q; expected %q or %q",
+			path, schema, engineLaneBaselineSchema, engineLaneBaselineSchemaV1)
+	}
+
 	if strings.TrimSpace(b.ReleaseID) == "" || strings.TrimSpace(b.AppDillSHA256) == "" ||
 		strings.TrimSpace(b.FrameworkSHA256) == "" {
-		return b, errors.New("--baseline is missing release_id / framework_sha256 / app_dill_sha256 (regenerate with release ios-engine)")
+		return b, fmt.Errorf(
+			"--baseline %s is missing release_id / framework_sha256 / app_dill_sha256 and declares no "+
+				"schema, so it cannot be identified as an engine-lane baseline (%q). Regenerate with "+
+				"`soroq release ios-engine --out <file>`",
+			path, engineLaneBaselineSchema)
 	}
 	if b.EngineBundleSchema == "" {
 		b.EngineBundleSchema = engineBundleSchemaV1
@@ -1292,12 +1380,34 @@ func readRuntimePatchIdentities(manifestPath, packageConfigPath string) ([]runti
 	configDir := filepath.Dir(packageConfigPath)
 	projectRoot := filepath.Dir(configDir)
 	var identities []runtimePatchIdentity
+	var skippedGenerated []string
 	for _, line := range strings.Split(string(manifestBytes), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		parts := strings.Split(line, "::")
+		// A NON-package library URI is not addressable by this lane, but only ONE shape of it is
+		// expected and only that shape may be skipped.
+		//
+		// The freehand analyzer emits exactly one such entry: Soroq's OWN generated entrypoint at
+		// .soroq/generated/soroq_bootstrap.g.dart, which lives outside any package. Every freehand
+		// project has it. Treating it as invalid aborted a 5395-entry manifest over a line that was
+		// never a patch target, naming a path the developer never wrote.
+		//
+		// A DIFFERENT non-package entry is a different situation entirely — it means developer code
+		// is being silently dropped from the patchable surface — so it stays FATAL. "Not addressable"
+		// and "unexpectedly missing" must not collapse into the same silent skip.
+		if len(parts) == 3 && !strings.HasPrefix(parts[0], "package:") {
+			if !isSoroqGeneratedLibraryURI(parts[0]) {
+				return nil, "", fmt.Errorf(
+					"patchable identity %q has a non-package library URI that is not a Soroq-generated "+
+						"file; refusing to skip it, because that would silently drop developer code from "+
+						"the patchable surface", line)
+			}
+			skippedGenerated = append(skippedGenerated, parts[0])
+			continue
+		}
 		if len(parts) != 3 || !strings.HasPrefix(parts[0], "package:") ||
 			(parts[1] != "" && !validPatchIdentifier(parts[1])) || !validPatchIdentifier(parts[2]) {
 			return nil, "", fmt.Errorf("invalid patchable identity %q", line)
@@ -1331,6 +1441,16 @@ func readRuntimePatchIdentities(manifestPath, packageConfigPath string) ([]runti
 	if len(identities) == 0 {
 		return nil, "", errors.New("--patchable-manifest contains no identities")
 	}
+	if len(skippedGenerated) > 0 {
+		// Announced WITH the paths, never a bare count: a reader has to be able to see exactly what
+		// was dropped and satisfy themselves it was Soroq's own generated file.
+		fmt.Fprintf(os.Stderr, "note: skipped %d Soroq-generated non-package patchable identit(y/ies):\n",
+			len(skippedGenerated))
+		for _, uri := range skippedGenerated {
+			fmt.Fprintf(os.Stderr, "  %s\n", uri)
+		}
+	}
+
 	return identities, projectRoot, nil
 }
 
@@ -1393,7 +1513,34 @@ func sameFile(a, b string) bool {
 	return errA == nil && errB == nil && filepath.Clean(aa) == filepath.Clean(bb)
 }
 
+// isSoroqGeneratedLibraryURI reports whether a non-package library URI is one Soroq itself generated
+// under the project's .soroq/generated/ directory. Anything else is developer code and must not be
+// skipped silently.
+func isSoroqGeneratedLibraryURI(uri string) bool {
+	if !strings.HasPrefix(uri, "file:") {
+		return false
+	}
+	return strings.Contains(uri, "/.soroq/generated/") && strings.HasSuffix(uri, ".g.dart")
+}
+
 func validPatchIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	// Dart accessors carry a VM-level prefix in this identity format: a getter is `get:iterator`,
+	// a setter `set:value`. The analyzer emits them — the freehand surface deliberately includes
+	// getters — and rejecting the colon aborted the whole manifest on
+	// `package:characters/…::StringCharacters::get:iterator`, an entry Soroq itself produced.
+	//
+	// Only these two prefixes are stripped, and only once, so a stray colon anywhere else is still
+	// invalid. `get:` alone stays invalid because the name after the prefix must still be an
+	// identifier.
+	for _, prefix := range []string{"get:", "set:"} {
+		if strings.HasPrefix(s, prefix) {
+			s = strings.TrimPrefix(s, prefix)
+			break
+		}
+	}
 	if s == "" {
 		return false
 	}
