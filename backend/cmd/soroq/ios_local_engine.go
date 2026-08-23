@@ -30,6 +30,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -62,6 +63,58 @@ func iosCachedToolchainBundleDir(version string) (string, error) {
 	return filepath.Join(root, version, "ios"), nil
 }
 
+// iosToolchainEngineMode reads the build mode and tier the toolchain bundle DECLARES.
+//
+// WHY THE DIRECTORY NAMES CANNOT ANSWER THIS. The packed layout keeps the historical
+// `out/{ios_profile,host_profile_unopt}` names whatever the engine inside them is, because Flutter
+// resolves a local engine by the PATH it is handed and does not re-derive a build mode from it. So a
+// production, release-mode engine ships under a directory called `ios_profile`, and reading the name
+// would report the opposite of the truth. `engine.json` is what the packer records and what the
+// pre-publication gate verifies; it is the only honest source.
+func iosToolchainEngineMode(iosBundleDir string) (buildMode string, tier string, err error) {
+	raw, err := os.ReadFile(filepath.Join(iosBundleDir, "engine.json"))
+	if err != nil {
+		return "", "", fmt.Errorf("read the toolchain's engine.json: %w", err)
+	}
+	var meta struct {
+		BuildMode string `json:"build_mode"`
+		Tier      string `json:"tier"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return "", "", fmt.Errorf("parse the toolchain's engine.json: %w", err)
+	}
+	buildMode = strings.TrimSpace(meta.BuildMode)
+	tier = strings.TrimSpace(meta.Tier)
+	if buildMode == "" {
+		return "", "", errors.New("the toolchain's engine.json declares no build_mode; refusing to guess which mode to build in")
+	}
+	return buildMode, tier, nil
+}
+
+// iosFlutterBuildModeFlag maps the ENGINE's build mode onto the flag the app build must use.
+//
+// THE DEFECT THIS EXISTS FOR. `flutter build ios --profile` was hard-coded here, so a production
+// release-mode toolchain was consumed by a PROFILE app build. That is not a cosmetic mismatch: a
+// profile build embeds the VM service and is not an App-Store release, so a "production" label in the
+// catalog would have described something a developer could not ship. The label and the flow have to
+// agree, and the engine's own declaration is what decides.
+//
+// A release/production toolchain has NO profile fallback. Falling back would reintroduce exactly the
+// silent downgrade this replaces, and it would do it under a production label.
+func iosFlutterBuildModeFlag(buildMode, tier string) (string, error) {
+	switch buildMode {
+	case "release":
+		return "--release", nil
+	case "profile":
+		if tier == "production" {
+			return "", fmt.Errorf("toolchain declares tier=production with build_mode=profile — a production toolchain must be a release engine; refusing to build")
+		}
+		return "--profile", nil
+	default:
+		return "", fmt.Errorf("toolchain declares an unknown build_mode %q (want release or profile)", buildMode)
+	}
+}
+
 // materializeIOSLocalEngineLayout maps the FLAT packed soroq artifacts under iosBundleDir into the `out/`
 // engine-source layout. Idempotent. ONLY soroq-under-test bytes (the flutter_framework Mach-O + the host
 // gen_snapshot).
@@ -88,7 +141,14 @@ func materializeIOSLocalEngineLayout(iosBundleDir string) error {
 	if err := linkOrCopyFile(flatFramework, topFrameworkBinary); err != nil {
 		return fmt.Errorf("materialize Flutter.framework/Flutter: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(targetOut, "Flutter.framework", "Info.plist"), []byte(iosFrameworkInfoPlist), 0o644); err != nil {
+	// The framework's declared BuildMode must be the engine's own, not a constant. It was hard-coded
+	// to "profile", which made a release engine describe itself as a profile one to anything reading
+	// the plist.
+	buildMode, _, err := iosToolchainEngineMode(iosBundleDir)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(targetOut, "Flutter.framework", "Info.plist"), []byte(iosFrameworkInfoPlistFor(buildMode)), 0o644); err != nil {
 		return fmt.Errorf("write Flutter.framework/Info.plist: %w", err)
 	}
 
@@ -338,9 +398,21 @@ func buildIOSAppDill(projectDir, toolchainVersion string, extraArgs []string) (s
 		return "", err
 	}
 
+	// THE MODE THE ENGINE DECLARES, not a constant. See iosFlutterBuildModeFlag.
+	engineBuildMode, engineTier, err := iosToolchainEngineMode(iosBundleDir)
+	if err != nil {
+		return "", err
+	}
+	modeFlag, err := iosFlutterBuildModeFlag(engineBuildMode, engineTier)
+	if err != nil {
+		return "", err
+	}
+	fmt.Fprintf(os.Stderr, "soroq iOS toolchain %s: build_mode=%s tier=%s -> flutter build ios %s\n",
+		toolchainVersion, engineBuildMode, engineTier, modeFlag)
+
 	manifestPath := filepath.Join(projectDir, "soroq_app_manifest.txt")
 	args := []string{
-		"build", "ios", "--profile",
+		"build", "ios", modeFlag,
 		"--local-engine=" + iosLocalEngineTargetName,
 		"--local-engine-host=" + iosLocalEngineHostName,
 		"--local-engine-src-path=" + iosBundleDir,
@@ -460,7 +532,8 @@ func locateBuiltIOSApp(projectDir string) (string, error) {
 // iosFrameworkInfoPlist is a minimal, valid framework Info.plist for the top-level (soroq-bytes-only)
 // Flutter.framework. The device build reads the xcframework copy, not this bundle; this exists to satisfy
 // the materialized-layout assertion + reference-shape parity.
-const iosFrameworkInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
+func iosFrameworkInfoPlistFor(buildMode string) string {
+	return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -485,7 +558,8 @@ const iosFrameworkInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
   <key>MinimumOSVersion</key>
   <string>13.0</string>
   <key>BuildMode</key>
-  <string>profile</string>
+  <string>` + buildMode + `</string>
 </dict>
 </plist>
 `
+}
