@@ -457,11 +457,47 @@ func runPluginInjection(projectDir string) error {
 //
 // Absolute paths are only rewritten INTO the workspace copy; the developer's pubspec.yaml on disk is
 // never modified.
+// isPathDependencyField reports whether the `path:` line at index i is a FIELD under a dependency,
+// rather than a dependency NAMED `path`.
+//
+// Both look identical on their own line. `path` is one of the most widely used packages on pub.dev, so
+// treating every `path:` as a path dependency rewrote a version constraint into a filesystem path and
+// made any app depending on it unbuildable:
+//
+//	Could not parse version "/Users/<dev>/<app>/^1.9.1"
+//
+// Indentation is what separates them. A dependency NAME sits directly under its block header
+// (`dependencies:`, `dev_dependencies:`, `dependency_overrides:`); a `path:` FIELD sits one level
+// deeper, under the dependency it configures. So walk back to the nearest line with strictly smaller
+// indentation: if that is a block header, this `path:` is a dependency name and must be left alone.
+func isPathDependencyField(lines []string, i int) bool {
+	indentOf := func(s string) int { return len(s) - len(strings.TrimLeft(s, " \t")) }
+	mine := indentOf(lines[i])
+	for j := i - 1; j >= 0; j-- {
+		prev := lines[j]
+		if strings.TrimSpace(prev) == "" || strings.HasPrefix(strings.TrimSpace(prev), "#") {
+			continue
+		}
+		if indentOf(prev) >= mine {
+			continue
+		}
+		switch strings.TrimSpace(prev) {
+		case "dependencies:", "dev_dependencies:", "dependency_overrides:":
+			return false // `path` is itself the dependency name
+		}
+		return true // nested under a dependency name -> a real path dependency
+	}
+	return false
+}
+
 func pubspecWithAbsolutePathDependencies(text, projectDir string) string {
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "path:") {
+			continue
+		}
+		if !isPathDependencyField(lines, i) {
 			continue
 		}
 		value := strings.TrimSpace(strings.TrimPrefix(trimmed, "path:"))

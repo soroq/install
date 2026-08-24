@@ -198,7 +198,9 @@ func TestABI_PlantedFailures(t *testing.T) {
 		},
 		{
 			name: "module-class-does-not-match-frozen-key", wantMsg: "module_class",
-			edit: func(m map[string]any) { abiIndexOf(t, m, "::NamedCtorProbe.seeded")["module_class"] = "EagerProviderProbe" },
+			edit: func(m map[string]any) {
+				abiIndexOf(t, m, "::NamedCtorProbe.seeded")["module_class"] = "EagerProviderProbe"
+			},
 		},
 	}
 
