@@ -124,3 +124,54 @@ func TestPathDependencyProjectPubspecIsNeverModified(t *testing.T) {
 			before, after)
 	}
 }
+
+// THE PACKAGE NAMED `path` IS NOT A PATH DEPENDENCY.
+//
+// This is a real defect found by building a shipping app: `path` is one of the most widely used
+// packages on pub.dev, and declaring it the ordinary way produced
+//
+//	Error on line 40, column 9 of pubspec.yaml: Invalid version constraint:
+//	Could not parse version "/Users/shrey/calorie_tracker_tf/^1.9.1".
+//
+// because the rewriter matched on the line PREFIX `path:` and could not tell a dependency NAME from a
+// `path:` FIELD nested under one. Any app depending on `path` could not build through the CLI at all.
+//
+// Indentation is what separates the two cases: a dependency name sits directly under `dependencies:`,
+// while a `path:` field sits one level deeper, under the dependency it belongs to.
+func TestPackageNamedPathIsNotRewritten(t *testing.T) {
+	in := `name: app
+dependencies:
+  flutter:
+    sdk: flutter
+  path: ^1.9.1
+  soroq_flutter:
+    path: ../packages/soroq_flutter
+`
+	out := pubspecWithAbsolutePathDependencies(in, "/repo/app")
+	if !strings.Contains(out, "  path: ^1.9.1") {
+		t.Errorf("the pub package named `path` was rewritten; got:\n%s", out)
+	}
+	// The genuine path dependency alongside it must still be made absolute.
+	if !strings.Contains(out, "path: /repo/packages/soroq_flutter") {
+		t.Errorf("the real path dependency was not absolutised; got:\n%s", out)
+	}
+}
+
+// Version constraints take several shapes, and none of them is a filesystem path.
+func TestVersionConstraintsForPackageNamedPathSurvive(t *testing.T) {
+	for _, constraint := range []string{"^1.9.1", "any", ">=1.0.0 <2.0.0", "1.9.1"} {
+		in := "name: app\ndependencies:\n  path: " + constraint + "\n"
+		out := pubspecWithAbsolutePathDependencies(in, "/repo/app")
+		if out != in {
+			t.Errorf("constraint %q was rewritten:\n%s", constraint, out)
+		}
+	}
+}
+
+// A dev_dependencies entry named `path` is the same case one block down.
+func TestPackageNamedPathInDevDependencies(t *testing.T) {
+	in := "name: app\ndev_dependencies:\n  path: ^1.9.1\n"
+	if out := pubspecWithAbsolutePathDependencies(in, "/repo/app"); out != in {
+		t.Errorf("dev_dependencies `path` was rewritten:\n%s", out)
+	}
+}
