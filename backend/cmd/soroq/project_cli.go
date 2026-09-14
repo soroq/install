@@ -152,6 +152,13 @@ func runInit(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("init", fs.Args(), nil); err != nil {
+		return err
+	}
 	if *verbose {
 		cliVerboseRequested = true
 	}
@@ -206,6 +213,15 @@ func runInit(args []string) error {
 				return fmt.Errorf("project is not initialized for Soroq; run `soroq init%s` to set it up", hint)
 			}
 			return nil
+		}
+		// --json IS LISTED IN THIS COMMAND'S OWN HELP, so --dry-run has to honour it.
+		//
+		// It did not: `soroq init --json --dry-run` printed the prose preview and ignored the flag. A
+		// command whose --help advertises a machine-readable mode and then emits prose is worse than
+		// one that does not offer it, because a script written against the documented surface silently
+		// parses nothing.
+		if *jsonOut {
+			return printInitPlanJSON(os.Stdout, status, plan, resolvedAppID, appIDWarnings, appIDErr)
 		}
 		printInitPlan(os.Stdout, status, plan, resolvedAppID, appIDWarnings, appIDErr)
 		return nil
@@ -537,6 +553,57 @@ func appIDOrPlaceholder(appID string) string {
 		return "<pass --app-id>"
 	}
 	return appID
+}
+
+// printInitPlanJSON renders the same read-only preview as printInitPlan, in the machine-readable form
+// this command's own --help promises. It writes ONLY to w, never to disk.
+func printInitPlanJSON(
+	w io.Writer,
+	status projectStatus,
+	plan []initPlanItem,
+	appID string,
+	warnings []string,
+	appIDErr error,
+) error {
+	type jsonPlanItem struct {
+		Target string `json:"target"`
+		Action string `json:"action"`
+		Detail string `json:"detail,omitempty"`
+	}
+	document := struct {
+		DryRun      bool           `json:"dry_run"`
+		ProjectDir  string         `json:"project_dir"`
+		AppID       string         `json:"app_id,omitempty"`
+		AppIDError  string         `json:"app_id_error,omitempty"`
+		Warnings    []string       `json:"warnings"`
+		Plan        []jsonPlanItem `json:"plan"`
+		NeedsInit   bool           `json:"needs_init"`
+		FilesEdited bool           `json:"files_written"`
+	}{
+		DryRun:     true,
+		ProjectDir: status.ProjectDir,
+		// An empty list is `[]`, not `null`: a caller that iterates must not fail on a clean project.
+		Warnings:    []string{},
+		Plan:        []jsonPlanItem{},
+		NeedsInit:   planNeedsInit(plan),
+		FilesEdited: false,
+	}
+	if appIDErr != nil {
+		document.AppIDError = appIDErr.Error()
+	} else if strings.TrimSpace(appID) != "" && !status.HasSoroqConfig {
+		document.AppID = appID
+	}
+	document.Warnings = append(document.Warnings, warnings...)
+	for _, item := range plan {
+		document.Plan = append(document.Plan, jsonPlanItem{
+			Target: item.Target,
+			Action: string(item.Action),
+			Detail: item.Detail,
+		})
+	}
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(document)
 }
 
 // printInitPlan renders the read-only --dry-run preview. It writes ONLY to w (never to disk).
@@ -1176,13 +1243,25 @@ func runStatus(args []string) error {
 	projectDir := fs.String("project-dir", ".", "Flutter app directory")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	check := fs.Bool("check", false, "exit non-zero when the project is not ready")
+	// --local and --remote name what a developer means, rather than making them know that patch state
+	// happens to require a network call. --local is the default because it always works offline.
+	localOnly := fs.Bool("local", false, "report only what can be determined without the network (default)")
+	withRemote := fs.Bool("remote", false, "also ask the control plane for the active update and track")
+	platform := fs.String("platform", "", "report readiness for one platform (ios|android)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq status [--project-dir .] [--json] [--check]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq status [--project-dir .] [--local|--remote] [--platform ios|android] [--json] [--check]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// `soroq status ios` was byte-identical to bare `soroq status`, at exit 0 -- while
+	// `--platform ios` really does change the output. A reader who writes the platform as a word gets
+	// the unscoped answer and no indication that the word did nothing.
+	if err := refuseUnconsumedArguments("status", fs.Args(),
+		[]string{"--platform ios", "--platform android"}); err != nil {
 		return err
 	}
 
@@ -1196,6 +1275,51 @@ func runStatus(args []string) error {
 	// When both android + ios are recorded, show the most recently updated one.
 	state, _ := loadProjectCLIState(status.ProjectDir)
 	lock, _ := loadSoroqLock(status.ProjectDir)
+
+	// ONE READINESS MODEL. `status` used to answer "is this ready?" from its own reading of the project
+	// while `doctor` answered from an independent check list, so the two could disagree about the same
+	// directory. Both now render computePlatformReadiness, so a disagreement is impossible by
+	// construction rather than by review.
+	if *platform != "" {
+		if *platform != "ios" && *platform != "android" {
+			return fmt.Errorf("unknown platform %q (expected ios or android)", *platform)
+		}
+		authed := false
+		authDetail := ""
+		if creds, credErr := currentOperatorCredentials(""); credErr == nil && creds.Token != "" {
+			authed = true
+			authDetail = creds.Email
+			if authDetail == "" {
+				authDetail = "stored credential present"
+			}
+		} else if credErr != nil {
+			authDetail = credErr.Error()
+		}
+		readiness := computePlatformReadiness(*platform, status, state, lock, authed, authDetail)
+		if *withRemote {
+			// Deliberately not implemented as a silent local guess: until the remote lookup lands, the
+			// state stays unknown and says so, because reporting a server fact we never asked for is
+			// exactly the false readiness this model exists to prevent.
+			readiness = readiness.withRemoteState(unknownState(stRemotePatch,
+				"active update on the server",
+				"remote lookup is not wired into status yet; this is reported unknown rather than guessed"))
+		}
+		_ = *localOnly
+		if *jsonOut {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"schema":   "soroq.status.v1",
+				"platform": readiness.Platform,
+				"ready":    readiness.Ready(),
+				"states":   readiness.States,
+				"next":     readiness.FirstAction(),
+			})
+		}
+		fmt.Print(renderReadiness(readiness))
+		if *check && !readiness.Ready() {
+			return fmt.Errorf("project is not ready for %s", *platform)
+		}
+		return nil
+	}
 	var relPlatform, relID, relVersion, relChannel, relToolchain string
 	haveRelease := false
 	android := state.LastAndroidRelease

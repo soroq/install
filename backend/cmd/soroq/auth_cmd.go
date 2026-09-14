@@ -108,6 +108,13 @@ func runLogin(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("login", fs.Args(), nil); err != nil {
+		return err
+	}
 
 	resolvedConfigPath, err := resolveSoroqConfigPath(*configPath)
 	if err != nil {
@@ -212,6 +219,13 @@ func runWhoami(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("whoami", fs.Args(), nil); err != nil {
 		return err
 	}
 
@@ -360,6 +374,13 @@ func runLogout(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("logout", fs.Args(), nil); err != nil {
 		return err
 	}
 
@@ -628,6 +649,26 @@ func currentOperatorCredentialsForRequest(configPath string, targetAPIBase strin
 	if err != nil {
 		return operatorCredentials{}, err
 	}
+
+	// REFUSE BEFORE RETURNING, NOT ONLY BEFORE REFRESHING.
+	//
+	// This function used to guard only the REFRESH of a stored credential: on an origin mismatch it
+	// skipped the rewrite and then returned the credential anyway, so the caller sent a production
+	// token to whatever --api it had been pointed at. The refusal lived in requireOperatorCredentials,
+	// which only three publish paths called; release, doctor, engine-lane and toolchain-publish all came
+	// through here and inherited nothing. A guard that most callers bypass is not a guard.
+	//
+	// A STORED credential names the control plane it was issued for and must not travel anywhere else.
+	// Environment-provided credentials carry no issuing host and are trusted as given, which is what
+	// makes CI injection work without weakening this rule.
+	if creds.Source == "config" && strings.TrimSpace(creds.APIBase) != "" &&
+		!apiTargetMatchesCredential(targetAPIBase, creds.APIBase) {
+		return operatorCredentials{}, &credentialOriginMismatchError{
+			CredentialOrigin: creds.APIBase,
+			TargetOrigin:     targetAPIBase,
+		}
+	}
+
 	if creds.Source != "config" || normalizeCredentialKind(creds.CredentialKind, creds.Token) != credentialKindFirebase {
 		return creds, nil
 	}
@@ -682,6 +723,33 @@ func currentOperatorCredentialsForRequest(configPath string, targetAPIBase strin
 //   - empty stored api_base -> match (cannot prove a mismatch; do not silently
 //     regress refresh for credentials that predate api_base being recorded).
 //   - otherwise -> match only when the parsed hostnames are equal.
+//
+// credentialOriginMismatchError is returned when a STORED credential would otherwise be sent to a
+// control plane it was not issued for.
+//
+// It is a distinct type on purpose. Callers legitimately treat "no credential available" as "carry on
+// unauthenticated" -- for example when delegating to soroqctl, which may not need one. If the origin
+// refusal arrives as an ordinary error it gets swallowed by that same branch, and a LOUD refusal
+// silently becomes an unauthenticated call. The token still does not leak, but the developer loses the
+// one message that explains what happened, so callers must be able to tell the two apart.
+type credentialOriginMismatchError struct {
+	CredentialOrigin string
+	TargetOrigin     string
+}
+
+func (e *credentialOriginMismatchError) Error() string {
+	return fmt.Sprintf(
+		"stored credentials were issued for %s but this command targets %s; refusing to send them "+
+			"to a different control plane. Pass --api %s, or run `soroq login` against %s.",
+		e.CredentialOrigin, e.TargetOrigin, e.CredentialOrigin, e.TargetOrigin)
+}
+
+// isCredentialOriginMismatch reports whether err is the cross-origin refusal.
+func isCredentialOriginMismatch(err error) bool {
+	var mismatch *credentialOriginMismatchError
+	return errors.As(err, &mismatch)
+}
+
 func apiTargetMatchesCredential(targetAPIBase string, credAPIBase string) bool {
 	targetHost := apiHost(targetAPIBase)
 	credHost := apiHost(credAPIBase)

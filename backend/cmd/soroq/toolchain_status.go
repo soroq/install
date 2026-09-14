@@ -38,12 +38,19 @@ func listInstalledToolchains() ([]installedToolchain, error) {
 	}
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		// EMPTY, NOT ABSENT. Returning nil here made `soroq toolchain list --json` print `null` on a
+		// machine with nothing installed -- the initialisation below never ran. "No toolchains" and
+		// "the cache directory does not exist yet" are the same answer to a caller, and that answer is
+		// an empty array.
+		return []installedToolchain{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	var out []installedToolchain
+	// AN EMPTY LIST IS `[]`, NOT `null`. A nil slice marshals to `null`, and a consumer that does
+	// `for x in result` then fails on a machine where nothing is installed -- the exact machine a
+	// first run happens on. The command declares JSON; an empty array is what "no entries" looks like.
+	out := []installedToolchain{}
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
@@ -83,6 +90,13 @@ func runToolchainList(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("toolchain list", fs.Args(), nil); err != nil {
 		return err
 	}
 	installed, err := listInstalledToolchains()
@@ -136,6 +150,13 @@ func runToolchainDoctor(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("toolchain doctor", fs.Args(), nil); err != nil {
 		return err
 	}
 

@@ -80,7 +80,9 @@ func TestParseFrontendManifest(t *testing.T) {
 	  "schema": "soroq.frontend.v1",
 	  "soroq_frontend_version": "soroq-flutter-frontend-abc-def",
 	  "flutter_revision": "` + expectedFlutterRevision + `",
-	  "dart_revision": "3.13.0-103.1.beta",
+	  "dart_revision": "` + expectedDartRevision + `",
+	  "engine_revision": "` + repeatHex(40) + `",
+	  "compatible_toolchain_ids": ["soroq-ios-3.44.2-production"],
 	  "archive": {"url": "https://x/y.tar.gz", "sha256": "` + repeatHex(64) + `", "compressed_bytes": 10, "uncompressed_bytes": 20}
 	}`)
 	m, err := parseFrontendManifest(good)
@@ -98,10 +100,29 @@ func TestParseFrontendManifest(t *testing.T) {
 	if _, err := parseFrontendManifest([]byte(`{"schema":"nope","soroq_frontend_version":"v"}`)); err == nil {
 		t.Fatal("expected wrong-schema refusal")
 	}
-	// Wrong flutter revision is refused by the identity check.
+	// A DIFFERENT but well-formed revision is now ACCEPTED, and that is the point of catalog v2: the
+	// matrix pins 3.44.2 and 3.44.9 for iOS at once, so an equality check against one compiled-in
+	// revision would refuse the other outright. The signature over the manifest is what authorises the
+	// identity; what binds it to reality is verifyFrontendTreeMatchesManifest, which proves the extracted
+	// tree declares these same revisions.
 	m.FlutterRevision = "0000000000000000000000000000000000000000"
+	if err := checkFrontendIdentity(m); err != nil {
+		t.Fatalf("a well-formed non-default revision must be accepted under the version matrix: %v", err)
+	}
+	// What is still refused is a manifest that identifies NOTHING, or pairs with nothing.
+	m.FlutterRevision = "not-a-revision"
 	if err := checkFrontendIdentity(m); err == nil {
-		t.Fatal("expected flutter-revision-mismatch refusal")
+		t.Fatal("expected a malformed flutter_revision to be refused")
+	}
+	m.FlutterRevision = expectedFlutterRevision
+	m.EngineRevision = ""
+	if err := checkFrontendIdentity(m); err == nil {
+		t.Fatal("expected a manifest with no engine_revision to be refused")
+	}
+	m.EngineRevision = repeatHex(40)
+	m.CompatibleToolchainIDs = nil
+	if err := checkFrontendIdentity(m); err == nil {
+		t.Fatal("expected a frontend that pairs with no toolchain to be refused")
 	}
 }
 

@@ -396,6 +396,12 @@ func engineLaneDelegateEnv(args []string) ([]string, error) {
 	}
 	target := apiFlagFromArgs(args)
 	creds, err := currentOperatorCredentialsForRequest("", target)
+	// A cross-origin refusal must stay LOUD. "No credential" legitimately means "carry on
+	// unauthenticated", but "you have a credential for somewhere else" is a refusal the developer needs
+	// to read -- and swallowing it here is how a loud guard becomes a silent one.
+	if isCredentialOriginMismatch(err) {
+		return nil, err
+	}
 	if err != nil || strings.TrimSpace(creds.Token) == "" {
 		return env, nil
 	}

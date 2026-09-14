@@ -71,6 +71,13 @@ printed and nothing is deleted.`)
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("uninstall", fs.Args(), nil); err != nil {
+		return err
+	}
 
 	stateDir, err := soroqStateDir()
 	if err != nil {

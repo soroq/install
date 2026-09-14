@@ -82,6 +82,23 @@ func performSelfUpdate(c selfUpdateConfig) error {
 		return err
 	}
 
+	// Step 2b: REPAIR AN INTERRUPTED UPDATE before deciding anything else.
+	//
+	// installBinaries rolls back on every error it can see. It cannot see a process that is KILLED
+	// between the two renames -- a terminal closing, a laptop sleeping, an out-of-memory kill -- and
+	// that window leaves one binary replaced and the other sitting in a .bak file. Worse, the natural
+	// recovery ("run soroq update again") used to short-circuit at "already up to date" and never reach
+	// the code that could fix it, so the install stayed broken for as long as no new release appeared.
+	//
+	// Under --check this only REPORTS, because --check makes zero filesystem changes.
+	repaired, interrupted := repairInterruptedUpdate(c.installDir, c.checkOnly)
+	for _, line := range repaired {
+		fmt.Fprintln(c.stdout, line)
+	}
+	if c.checkOnly && interrupted {
+		fmt.Fprintln(c.stdout, "Run `soroq update` to repair it.")
+	}
+
 	// Step 3: resolve the latest STABLE release (network only; no FS change).
 	rel, err := c.resolveLatestStable()
 	if err != nil {
@@ -555,4 +572,61 @@ func displayVersion(v string) string {
 		return "v" + v
 	}
 	return v
+}
+
+// repairInterruptedUpdate restores an installation left inconsistent by a killed update.
+//
+// THE ONE RULE, and the reason this cannot be a blind restore: a PRESENT binary is never overwritten
+// from a backup. A crash can also happen AFTER both renames and the version check, with only the
+// backup cleanup left to do -- restoring there would replace the newer binary with the older one, which
+// is the exact silent downgrade this product must not perform. So:
+//
+//	target missing, backup present  -> restore the backup. The only safe move, and the only one that
+//	                                   returns a working CLI.
+//	target present, backup present  -> the update got at least this far. Drop the backup.
+//	staged .new files               -> leftovers from a run that never reached the rename. Remove them.
+//
+// Returns the lines to show the operator and whether anything was found to be interrupted. When
+// reportOnly is set nothing is changed, so `soroq update --check` keeps its promise of zero writes.
+func repairInterruptedUpdate(dir string, reportOnly bool) ([]string, bool) {
+	var lines []string
+	interrupted := false
+
+	for _, pair := range []struct{ name, target, backup, staged string }{
+		{soroqBinName, filepath.Join(dir, soroqBinName), filepath.Join(dir, ".soroq.bak"), filepath.Join(dir, ".soroq.new")},
+		{soroqctlBinName, filepath.Join(dir, soroqctlBinName), filepath.Join(dir, ".soroqctl.bak"), filepath.Join(dir, ".soroqctl.new")},
+	} {
+		hasBackup := fileExists(pair.backup)
+		hasTarget := fileExists(pair.target)
+		hasStaged := fileExists(pair.staged)
+		if !hasBackup && !hasStaged {
+			continue
+		}
+		interrupted = true
+
+		switch {
+		case hasBackup && !hasTarget:
+			lines = append(lines, fmt.Sprintf(
+				"A previous update was interrupted and left no %s. Restoring the previous one.", pair.name))
+			if !reportOnly {
+				if err := osRename(pair.backup, pair.target); err != nil {
+					lines = append(lines, fmt.Sprintf(
+						"Could not restore %s from %s: %v. Reinstall Soroq to repair it.",
+						pair.name, pair.backup, err))
+					continue
+				}
+			}
+		case hasBackup:
+			// The target is there, so it is at least as new as the backup. Never restore over it.
+			lines = append(lines, fmt.Sprintf(
+				"Cleaning up a leftover backup of %s from an interrupted update.", pair.name))
+			if !reportOnly {
+				os.Remove(pair.backup)
+			}
+		}
+		if hasStaged && !reportOnly {
+			os.Remove(pair.staged)
+		}
+	}
+	return lines, interrupted
 }

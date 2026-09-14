@@ -79,7 +79,7 @@ probe.dart:5:13: Error: The method 'restorePrepare' isn't defined for the type '
 // states a constraint rather than a resolution.
 func TestUnresolvedProjectIsRefusedClearly(t *testing.T) {
 	dir := t.TempDir()
-	mustWriteFile(t, filepath.Join(dir, "pubspec.yaml"), "name: app\ndependencies:\n  soroq_flutter: ^0.2.4\n")
+	mustWriteFile(t, filepath.Join(dir, "pubspec.yaml"), "name: app\ndependencies:\n  soroq_flutter: any\n")
 	err := verifyFreehandRuntimeCompatibility(dir, t.TempDir())
 	if err == nil {
 		t.Fatal("a project with no package_config.json was accepted")

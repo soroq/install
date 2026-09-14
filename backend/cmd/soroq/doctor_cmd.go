@@ -64,6 +64,12 @@ everything needing network/creds/download/Xcode/pub stays advisory.
 		}
 		return err
 	}
+	// `soroq doctor ios` was byte-identical to `soroq doctor`, at exit 0. Doctor takes no positional
+	// -- its own help declares none -- so a word here is a reader expecting platform-scoped output and
+	// silently getting the unscoped answer.
+	if err := refuseUnconsumedArguments("doctor", fs.Args(), nil); err != nil {
+		return err
+	}
 
 	absDir, err := filepath.Abs(*projectDir)
 	if err != nil {

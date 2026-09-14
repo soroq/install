@@ -51,6 +51,13 @@ toolchainPinnedPublicKeyHex is owner-gated — see docs/toolchain-signing-key-ro
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("toolchain keygen", fs.Args(), nil); err != nil {
+		return err
+	}
 	if strings.TrimSpace(*out) == "" {
 		return errors.New("--out is required: keygen writes the PRIVATE seed to a 0600 file (it is never printed). Pass a path on a trusted disk, then move the seed to a secret store and delete the file. See docs/toolchain-signing-key-rotation.md")
 	}

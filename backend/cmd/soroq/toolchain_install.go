@@ -199,6 +199,14 @@ A verified cache entry short-circuits (offline OK); --force re-downloads.`)
 		result.BundleVerified = true
 	}
 
+	// 6b. THE SIGNED MANIFEST AND THE EXTRACTED BUNDLE MUST AGREE. This is what replaces the hardcoded
+	// flutter-revision coupling relaxed in checkToolchainIdentity: the CLI no longer dictates which
+	// revision a toolchain may carry, so it must instead prove the bundle it extracted is the one the
+	// signature describes. Before the swap, so a disagreeing bundle never reaches the cache.
+	if err := verifyManifestMatchesEngine(manifest, filepath.Join(tmpDir, subdir)); err != nil {
+		return fmt.Errorf("REFUSED: %w", err)
+	}
+
 	// 7. Verify passed: atomically swap the temp dir into versionDir (remove stale, rename). Only now is
 	// the last-working toolchain replaced.
 	if err := os.RemoveAll(versionDir); err != nil {
@@ -287,11 +295,131 @@ func checkToolchainIdentity(m cliManifest) error {
 	if mode != "profile" && mode != "release" {
 		return fmt.Errorf("build_mode %q is not profile|release", m.BuildMode)
 	}
-	if !strings.EqualFold(strings.TrimSpace(m.FlutterRevision), id.flutterRevision) {
-		return fmt.Errorf("flutter revision mismatch: %s manifest %q, this CLI is wired for %q", platform, short(m.FlutterRevision), short(id.flutterRevision))
+	// IDENTITY MUST BE PRESENT AND WELL-FORMED -- not equal to one hardcoded revision.
+	//
+	// A single wired-in revision is exactly what makes a version MATRIX impossible: catalog v2 pins two
+	// iOS engines at once (3.44.2 and 3.44.9), and an equality check here refuses whichever one the CLI
+	// was not compiled against. The signature over this manifest has already been verified against the
+	// pinned production key, so the publisher has asserted this identity.
+	//
+	// What must still be refused is a manifest that asserts NOTHING: an empty or malformed revision would
+	// sail through and leave the post-extract engine.json cross-check comparing blanks to blanks. That
+	// cross-check (verifyManifestMatchesEngine) is what REPLACES the dropped equality -- the CLI no longer
+	// dictates which revision a toolchain carries, so it proves instead that the bundle it extracted is
+	// the one the signature describes.
+	if err := checkRevisionWellFormed("flutter_revision", m.FlutterRevision, true); err != nil {
+		return fmt.Errorf("%s manifest: %w", platform, err)
 	}
-	if !strings.EqualFold(strings.TrimSpace(m.DartRevision), id.dartRevision) {
-		return fmt.Errorf("dart revision mismatch: %s manifest %q, this CLI is wired for %q", platform, short(m.DartRevision), short(id.dartRevision))
+	if err := checkRevisionWellFormed("dart_revision", m.DartRevision, id.dartRevisionIsGitSHA); err != nil {
+		return fmt.Errorf("%s manifest: %w", platform, err)
+	}
+	if strings.TrimSpace(m.SoroqEngineRevision) == "" {
+		return fmt.Errorf("%s manifest declares no soroq_engine_revision, so it identifies no engine", platform)
+	}
+	return nil
+}
+
+// checkRevisionWellFormed refuses a missing or malformed revision. `gitSHA` demands the 40-hex commit
+// form; where a platform legitimately publishes a version string instead (Android's dart_revision) only
+// non-emptiness is required.
+func checkRevisionWellFormed(field, value string, gitSHA bool) error {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return fmt.Errorf("%s is empty; a manifest that identifies no revision cannot be verified against its bundle", field)
+	}
+	if !gitSHA {
+		return nil
+	}
+	if len(v) != 40 {
+		return fmt.Errorf("%s %q is not a 40-character git revision", field, short(v))
+	}
+	for _, c := range v {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return fmt.Errorf("%s %q is not hexadecimal", field, short(v))
+		}
+	}
+	return nil
+}
+
+// engineBundleIdentity is the identity engine.json declares inside an extracted toolchain bundle.
+type engineBundleIdentity struct {
+	SoroqEngineRevision string            `json:"soroq_engine_revision"`
+	FlutterCommit       string            `json:"flutter_commit"`
+	DartRevision        string            `json:"dart_revision"`
+	Artifacts           map[string]string `json:"artifacts"`
+	Capabilities        *struct {
+		HonouredKinds        []string `json:"honoured_kinds"`
+		IdentityCapabilities []string `json:"identity_capabilities"`
+	} `json:"soroq_freehand_redirect_capabilities"`
+}
+
+// verifyManifestMatchesEngine is the check that REPLACES the hardcoded revision coupling.
+//
+// Dropping the equality check means the CLI no longer decides which Flutter a toolchain may carry. What
+// it must still guarantee is that the bundle on disk is the one the signature covers: a signed manifest
+// and an unrelated extracted bundle would otherwise install happily together. So the manifest and the
+// bundle must agree with each other on who they say they are.
+//
+// Runs after extraction and BEFORE the atomic swap into the cache, so a mismatch never reaches it.
+func verifyManifestMatchesEngine(m cliManifest, bundleDir string) error {
+	raw, err := os.ReadFile(filepath.Join(bundleDir, "engine.json"))
+	if err != nil {
+		return fmt.Errorf("read engine.json from the extracted bundle: %w", err)
+	}
+	var e engineBundleIdentity
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return fmt.Errorf("parse engine.json from the extracted bundle: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(e.SoroqEngineRevision), strings.TrimSpace(m.SoroqEngineRevision)) {
+		return fmt.Errorf("engine identity mismatch: signed manifest says soroq_engine_revision %q, the extracted bundle says %q",
+			m.SoroqEngineRevision, e.SoroqEngineRevision)
+	}
+	if !strings.EqualFold(strings.TrimSpace(e.FlutterCommit), strings.TrimSpace(m.FlutterRevision)) {
+		return fmt.Errorf("flutter revision mismatch: signed manifest says %q, the extracted bundle's engine.json says %q",
+			short(m.FlutterRevision), short(e.FlutterCommit))
+	}
+	if !strings.EqualFold(strings.TrimSpace(e.DartRevision), strings.TrimSpace(m.DartRevision)) {
+		return fmt.Errorf("dart revision mismatch: signed manifest says %q, the extracted bundle's engine.json says %q",
+			short(m.DartRevision), short(e.DartRevision))
+	}
+
+	// CAPABILITIES ARE PART OF THE IDENTITY. The freehand guard reads them from the base to decide what
+	// may be patched, so a bundle claiming a capability its signed manifest does not is a privilege the
+	// publisher never signed for. Malformed or duplicated entries are refused rather than normalised.
+	if e.Capabilities != nil {
+		seen := map[string]bool{}
+		for _, c := range e.Capabilities.IdentityCapabilities {
+			t := strings.TrimSpace(c)
+			if t == "" {
+				return errors.New("engine.json declares an empty identity capability")
+			}
+			if seen[t] {
+				return fmt.Errorf("engine.json declares identity capability %q twice", t)
+			}
+			seen[t] = true
+		}
+		for _, k := range e.Capabilities.HonouredKinds {
+			if strings.TrimSpace(k) == "" {
+				return errors.New("engine.json declares an empty honoured kind")
+			}
+		}
+	}
+
+	// EVERY ARTIFACT HASH the manifest signs must be the hash the bundle carries, and the bundle must
+	// not carry an artifact the manifest never mentioned.
+	if len(e.Artifacts) != len(m.Artifacts) {
+		return fmt.Errorf("artifact count mismatch: signed manifest lists %d, the extracted engine.json lists %d",
+			len(m.Artifacts), len(e.Artifacts))
+	}
+	for _, a := range m.Artifacts {
+		got, ok := e.Artifacts[a.Name]
+		if !ok {
+			return fmt.Errorf("the extracted engine.json is missing artifact %q, which the signed manifest lists", a.Name)
+		}
+		if !strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(a.SHA256)) {
+			return fmt.Errorf("artifact %q hash mismatch: signed manifest %s, extracted engine.json %s",
+				a.Name, short(a.SHA256), short(got))
+		}
 	}
 	return nil
 }

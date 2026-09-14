@@ -50,13 +50,23 @@ import (
 
 // runFlutterPubGetIn runs `flutter pub get` in dir with the Soroq frontend Flutter. Overridable in tests.
 var runFlutterPubGetIn = func(dir string) error {
+	// NO PATH FALLBACK. This used to fall back to exec.LookPath("flutter") when the Soroq frontend
+	// could not be resolved, which silently handed the resolve to whatever Flutter happened to be
+	// first in PATH -- on a developer machine, typically a stable-channel install with an older Dart.
+	// The failure is not a clean error either: the system SDK resolves the app's dependencies against
+	// the WRONG constraints and reports
+	//
+	//   The current Dart SDK version is 3.9.2.
+	//   Because <app> depends on dynamic_modules from path which requires SDK version ^3.12.0-0,
+	//   version solving failed.
+	//
+	// which reads as a defect in the app's pubspec rather than as "Soroq resolved with the wrong SDK".
+	// This is the same hazard the frontend resolver closed in v0.2.7 by deleting its own PATH
+	// fallbacks; it survived here in a different function. Fail closed and name the frontend problem.
 	flutterBin, err := resolveSoroqFlutterBin()
 	if err != nil {
-		if path, lookErr := exec.LookPath("flutter"); lookErr == nil {
-			flutterBin = path
-		} else {
-			return fmt.Errorf("flutter not found for dependency resolution: %w", err)
-		}
+		return fmt.Errorf("cannot resolve dependencies: no Soroq frontend Flutter is available, and "+
+			"falling back to a Flutter on PATH would resolve against a different Dart SDK: %w", err)
 	}
 	cmd := exec.Command(flutterBin, "pub", "get")
 	cmd.Dir = dir

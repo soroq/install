@@ -21,10 +21,15 @@ import (
 // buildFixtureToolchainArchive builds a minimal but STRUCTURALLY VALID toolchain archive (tar.gz) whose
 // bundle subdir is ios/, containing engine.json + the 5 iOS artifacts. Enough for the extract step's
 // engine.json presence check; the verifyEngineBundle gate is exercised via the runVerifyEngineBundle seam.
+const fixtureToolchainEngineRev = "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"
+
 func buildFixtureToolchainArchive(t *testing.T) []byte {
 	t.Helper()
 	files := map[string]string{
-		"ios/engine.json":               `{"schema":"soroq.ios_engine.v2"}`,
+		// engine.json must now AGREE with the signed manifest: install cross-checks the two, which is what
+		// replaced the hardcoded revision pin. A bare schema line no longer identifies anything.
+		"ios/engine.json": `{"schema":"soroq.ios_engine.v2","soroq_engine_revision":"` + fixtureToolchainEngineRev +
+			`","flutter_commit":"` + expectedFlutterRevision + `","dart_revision":"` + expectedDartRevision + `"}`,
 		"ios/flutter_framework":         "fixture-flutter-framework-bytes",
 		"ios/dart2bytecode":             "fixture-dart2bytecode-bytes",
 		"ios/flutter_compile_interface": "fixture-flutter-compile-interface-bytes",
@@ -86,6 +91,7 @@ func TestToolchainInstallVerifyBeforeSwap(t *testing.T) {
 			Tier:                  "experimental_profile",
 			FlutterRevision:       expectedFlutterRevision,
 			DartRevision:          expectedDartRevision,
+			SoroqEngineRevision:   fixtureToolchainEngineRev,
 			Archive: cliManifestArchive{
 				URL:             srv.URL + "/archive",
 				SHA256:          archiveSHA,

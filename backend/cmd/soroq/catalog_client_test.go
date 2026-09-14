@@ -64,13 +64,15 @@ func catalogArtifactServer(t *testing.T, signer interface {
 	frontendBytes, _ = json.Marshal(frontendManifest{
 		Schema: frontendManifestSchema, SoroqFrontendVersion: frontendVersion,
 		FlutterRevision: expectedFlutterRevision, CompatibleToolchainIDs: compat,
+		DartRevision: expectedDartRevision, EngineRevision: strings.Repeat("e", 40),
 		Archive: frontendManifestArchive{URL: srv.URL + "/archives/frontend", SHA256: strings.Repeat("a", 64), CompressedBytes: 1},
 	})
 	toolchainBytes, _ = json.Marshal(cliManifest{
 		Schema: toolchainManifestSchema, SoroqToolchainVersion: toolchainVersion,
 		Platform: "ios", Arch: "arm64", BuildMode: "profile", Tier: "experimental_profile",
 		FlutterRevision: expectedFlutterRevision, DartRevision: expectedDartRevision,
-		Archive: cliManifestArchive{URL: srv.URL + "/archives/toolchain", SHA256: strings.Repeat("b", 64), CompressedBytes: 1},
+		SoroqEngineRevision: strings.Repeat("e", 40),
+		Archive:             cliManifestArchive{URL: srv.URL + "/archives/toolchain", SHA256: strings.Repeat("b", 64), CompressedBytes: 1},
 	})
 	var err error
 	frontendSig, err = signer.SignToolchainManifest(frontendBytes)

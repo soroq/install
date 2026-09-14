@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 
 	"soroq/backend/internal/domain"
@@ -50,6 +51,17 @@ func runRollback(args []string) error {
 		}
 		return runRollbackConfigLane(args[0], stripFlag(args[1:], "patch-record", true))
 	}
+	// A WORD THAT IS NOT A PLATFORM IS A MISTAKE, NOT A NO-OP.
+	//
+	// `soroq release` and `soroq patch` both end their positional switch with a default arm that
+	// prints usage. `rollback` had no switch: anything that was not android/ios/ios-engine fell
+	// through to flag.Parse, which leaves a leading non-flag argument in fs.Args() and never reads it.
+	// So `soroq rollback androd` DISCARDED the word and rolled back whatever platform the lockfile
+	// held. On an iOS-only project a mistyped `androd` rolled back iOS -- a typo acting on a different
+	// fleet, silently, with an exit code of zero.
+	//
+	// An audit proved it at the boundary rather than by reading: `rollback`, `rollback bogusx` and
+	// `rollback android` produced byte-identical output.
 	fs := flag.NewFlagSet("rollback", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
 	apiBase := fs.String("api", defaultAPIBase(), "control plane base URL")
@@ -68,8 +80,40 @@ func runRollback(args []string) error {
 		}
 		return err
 	}
+	// Anything left here is a word the command parsed and would never read. See
+	// refuseUnconsumedArguments for why this is checked AFTER the parse rather than at args[0].
+	//
+	// The hint names the ORDER, not just the words. `soroq rollback --api URL android` is refused
+	// because the platform is routed by the first argument, and a message that only listed the valid
+	// platforms would tell a reader their correctly-spelled word was invalid.
+	if leftover := fs.Args(); len(leftover) > 0 {
+		if err := refuseUnconsumedArguments("rollback", leftover, []string{
+			"a platform as the FIRST argument: `soroq rollback android [flags]`",
+			"`soroq rollback ios`",
+			"`soroq rollback ios-engine`",
+			"or no platform at all, to roll back the one this project has released",
+		}); err != nil {
+			return err
+		}
+	}
 	if strings.TrimSpace(*patchID) == "" {
-		return errors.New("--patch-id is required")
+		// PROJECT-AWARE BY DEFAULT. The quickstart tells a beginner to run `soroq rollback`, and until
+		// now that answered "--patch-id is required" -- demanding the raw identifier the product exists
+		// to keep people away from. When the current directory is a Soroq project that has released
+		// exactly one platform, that platform is the answer, and the platform-aware path already knows
+		// how to find the newest rollback-able patch.
+		//
+		// An independent audit found this: the documentation checker verified the command and its flags
+		// EXIST and never ran it, so a documented beginner step errored out while the docs scored clean.
+		if platform, err := soleReleasedPlatform(releaseProjectDir(args)); err == nil {
+			return runRollbackConfigLane(platform, args)
+		} else if err != errNotASoroqProject {
+			return err
+		}
+		return errors.New(
+			"--patch-id is required outside a Soroq project.\n" +
+				"Inside one, `soroq rollback` finds the patch for you; or name the platform: " +
+				"`soroq rollback android` / `soroq rollback ios`")
 	}
 	if *verifyCurrentPatchNumber < 0 {
 		return errors.New("--verify-current-patch-number must be zero or greater")
@@ -310,4 +354,44 @@ func containsInt(values []int, value int) bool {
 		}
 	}
 	return false
+}
+
+// errNotASoroqProject says the current directory is not a Soroq project, so nothing could be inferred
+// from it. It is distinguished from every other failure because the caller falls back rather than
+// stopping: running `soroq rollback --patch-id X` from anywhere at all is still supported.
+var errNotASoroqProject = errors.New("not a soroq project")
+
+// soleReleasedPlatform returns the one platform this project has released, when there is exactly one.
+//
+// EXACTLY ONE, on purpose. A project that has released both Android and iOS has two possible answers,
+// and picking one would roll back a fleet the developer was not talking about. Ambiguity is reported
+// with both names rather than resolved.
+func soleReleasedPlatform(projectDir string) (string, error) {
+	status, err := inspectProject(projectDir)
+	if err != nil || !status.HasSoroqConfig {
+		return "", errNotASoroqProject
+	}
+	lock, lockErr := loadSoroqLock(projectDir)
+	if lockErr != nil {
+		return "", errNotASoroqProject
+	}
+	var released []string
+	for platform, pin := range lock.Platforms {
+		if strings.TrimSpace(pin.ReleaseID) != "" {
+			released = append(released, platform)
+		}
+	}
+	sort.Strings(released)
+	switch len(released) {
+	case 1:
+		return released[0], nil
+	case 0:
+		return "", fmt.Errorf(
+			"this project has no registered release to roll back; run `soroq release android` " +
+				"(or `soroq release ios`) first")
+	default:
+		return "", fmt.Errorf(
+			"this project has released %s; say which one: `soroq rollback %s`",
+			strings.Join(released, " and "), released[0])
+	}
 }

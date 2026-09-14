@@ -99,14 +99,22 @@ const (
 // default; Android (candidate) is added without touching the iOS values. An UNKNOWN platform has no
 // entry and is refused (the unsupported-platform guard).
 type toolchainPlatformIdentity struct {
+	// flutterRevision/dartRevision are the REFERENCE identity for this platform (what doctor reports and
+	// what the historical lane shipped). They are NOT an accept list: a signed manifest declaring a
+	// different revision installs, because the signature is what authorises the identity. Catalog v2
+	// pins two iOS engines at once, so an accept list here would refuse one of them outright.
 	flutterRevision string
 	dartRevision    string
 	bundleSubdir    string // cached-bundle subdir + tar prefix: "ios" | "android"
+	// dartRevisionIsGitSHA says whether this platform's dart_revision is a 40-hex commit or a version
+	// string. Android supplies "3.13.0-103.1.beta" because no SHA was ever published for it, so the
+	// well-formedness check must not demand hex there.
+	dartRevisionIsGitSHA bool
 }
 
 var toolchainPlatformIdentities = map[string]toolchainPlatformIdentity{
-	"ios":     {flutterRevision: expectedFlutterRevision, dartRevision: expectedDartRevision, bundleSubdir: "ios"},
-	"android": {flutterRevision: expectedAndroidFlutterRevision, dartRevision: expectedAndroidDartRevision, bundleSubdir: "android"},
+	"ios":     {flutterRevision: expectedFlutterRevision, dartRevision: expectedDartRevision, bundleSubdir: "ios", dartRevisionIsGitSHA: true},
+	"android": {flutterRevision: expectedAndroidFlutterRevision, dartRevision: expectedAndroidDartRevision, bundleSubdir: "android", dartRevisionIsGitSHA: false},
 }
 
 // cliManifest is the CLI-side view of the packer's FLAT soroq.toolchain.v1 manifest. It matches the

@@ -132,6 +132,58 @@ func iosPatchLaneNote(carriesCode bool) string {
 	return "note: signed JSON config/data OTA (no executable code) — ordinary remote config. No native code, dylib, Mach-O, replacement engine, or JIT is downloaded."
 }
 
+// isHelpFlag reports whether an argument is one of the spellings that ask for help.
+func isHelpFlag(arg string) bool {
+	return arg == "--help" || arg == "-h" || arg == "help"
+}
+
+// patchesReadSubcommands are the subcommands `soroq patches` offers. The publishing targets --
+// android, ios, ios-engine, config -- belong to `soroq patch` and are deliberately absent.
+var patchesReadSubcommands = []string{"list", "status", "health", "promote", "rollout", "set-track"}
+
+// runPatches routes the READ side of the patch surface.
+//
+// It shares an implementation with `soroq patch`, and that sharing is what produced the defect: a
+// bare alias printed the publishing command's usage. Routing through here means every path -- no
+// argument, --help, a real subcommand, an unknown one -- answers as `patches`.
+func runPatches(args []string) error {
+	if len(args) == 0 || isHelpFlag(args[0]) {
+		patchesUsage()
+		return nil
+	}
+	known := false
+	for _, name := range patchesReadSubcommands {
+		if args[0] == name {
+			known = true
+			break
+		}
+	}
+	if !known {
+		patchesUsage()
+		return fmt.Errorf("`soroq patches` has no subcommand %q", args[0])
+	}
+	return runPatch(args)
+}
+
+// patchesUsage describes the READ side. `soroq patches` and `soroq patch` share a dispatch table, so
+// without this the alias printed the publishing command's usage and named neither itself nor what it
+// does.
+func patchesUsage() {
+	fmt.Fprintln(os.Stdout, `usage: soroq patches <subcommand> [flags]
+
+Inspect and manage updates you have already published. To publish one, use `+"`soroq patch`"+`.
+
+subcommands:
+  list       list patches in the control plane
+  status     inspect a patch record
+  health     inspect patch install health and rollback state
+  promote    promote a patch to 100 percent rollout
+  rollout    update a patch rollout percentage
+  set-track  set a patch track such as stable, staging, or beta
+
+Run `+"`soroq patches <subcommand> --help`"+` for a subcommand's flags.`)
+}
+
 func patchUsage() {
 	fmt.Fprintln(os.Stdout, `usage: soroq patch --platforms=android,ios --rollout 100        (canonical)
    or: soroq patch <target> [flags]                        (platform-specific)
@@ -166,6 +218,13 @@ func runPatchSetTrack(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("patches set-track", fs.Args(), nil); err != nil {
 		return err
 	}
 
@@ -311,6 +370,13 @@ func runPatchList(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("patches list", fs.Args(), nil); err != nil {
+		return err
+	}
 
 	query := url.Values{}
 	resolvedAppID := strings.TrimSpace(*appID)
@@ -389,6 +455,13 @@ func runPatchStatus(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("patches status", fs.Args(), nil); err != nil {
+		return err
+	}
 	resolvedPatchID := strings.TrimSpace(*patchID)
 	if resolvedPatchID == "" {
 		return errors.New("--patch-id is required")
@@ -432,6 +505,13 @@ func runPatchHealth(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("patches health", fs.Args(), nil); err != nil {
 		return err
 	}
 	resolvedPatchID := strings.TrimSpace(*patchID)
@@ -1308,6 +1388,13 @@ func runPatchIOS(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("patch ios", fs.Args(), nil); err != nil {
+		return err
+	}
 	if strings.TrimSpace(*configFilePath) == "" {
 		return errors.New("--config-file is required")
 	}
@@ -1504,6 +1591,13 @@ func runPatchConfig(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("patch config", fs.Args(), nil); err != nil {
 		return err
 	}
 	if strings.TrimSpace(*configFilePath) == "" || strings.TrimSpace(*releaseID) == "" {

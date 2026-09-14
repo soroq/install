@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"soroq/backend/internal/domain"
@@ -75,8 +76,18 @@ func TestLocalAPITargetDoesNotMutateProdCredential(t *testing.T) {
 	}))
 	defer local.Close()
 
-	if err := runAppList([]string{"--api", local.URL, "--json"}); err != nil {
-		t.Fatalf("runAppList(local) error = %v", err)
+	// THE RULE GOT STRONGER, AND SO DID THIS TEST. It used to require the local command to SUCCEED
+	// while merely not refreshing the prod credential -- which means the prod token was still sent to
+	// the local origin. That is the leak, described as a pass. A stored credential must not travel to
+	// another control plane at all, so the command must be REFUSED, and the file must still be
+	// untouched afterwards. Both halves are asserted: refusing while corrupting the file would be a
+	// different bug.
+	err = runAppList([]string{"--api", local.URL, "--json"})
+	if err == nil {
+		t.Fatal("a local --api command was allowed to use the stored prod credential; it must be refused")
+	}
+	if !strings.Contains(err.Error(), "refusing to send them to a different control plane") {
+		t.Fatalf("expected a cross-origin refusal, got: %v", err)
 	}
 
 	after, err := os.ReadFile(configPath)
@@ -116,8 +127,14 @@ func TestLocalWhoamiDoesNotMutateProdCredential(t *testing.T) {
 	}))
 	defer local.Close()
 
-	if err := runWhoami([]string{"--api", local.URL, "--config", configPath, "--json"}); err != nil {
-		t.Fatalf("runWhoami(local) error = %v", err)
+	// Same stronger rule as the app-list case above: a stored prod credential must be REFUSED for a
+	// foreign origin, not merely left unrefreshed while still being sent to it.
+	whoamiErr := runWhoami([]string{"--api", local.URL, "--config", configPath, "--json"})
+	if whoamiErr == nil {
+		t.Fatal("whoami used the stored prod credential against a local origin; it must be refused")
+	}
+	if !strings.Contains(whoamiErr.Error(), "refusing to send them to a different control plane") {
+		t.Fatalf("expected a cross-origin refusal, got: %v", whoamiErr)
 	}
 
 	after, err := os.ReadFile(configPath)

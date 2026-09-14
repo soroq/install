@@ -345,6 +345,27 @@ func computeFreehandPatchPlan(projectDir, flutterRoot string) (*FreehandPatchPla
 	if !rep.Supported {
 		return nil, fmt.Errorf("freehand diff did not produce a supported patch (no changed patchable declarations)")
 	}
+	// PRIVATE-IDENTITY GATE — refuse a redirect that gen_snapshot can never have marked patchable.
+	//
+	// gen_snapshot decides eligibility by an exact `\nlibrary::class::member\n` match against the
+	// --soroq_manifest bytes, but the names it compares carry the VM's library-private mangling suffix
+	// (`_CleanHomeState@57413802`), while the manifest the analyzer emits does not. A private class or
+	// member therefore CANNOT hit, is never marked patchable, and — because a freehand batch is
+	// all-or-nothing — takes every other redirect in the same batch down with it. Measured on one
+	// gen_snapshot run over one file: `CleanApp::build hit=1` next to `_CleanHomeState@57413802::build
+	// hit=0`.
+	//
+	// Publishing such a batch produced a patch that fetched, verified, staged and loaded on device and
+	// then committed zero redirects. Refusing here costs a developer one message instead of a silent
+	// no-op rollout.
+	if blocked := freehandPrivateIdentities(rep.ChangedPatchable); len(blocked) > 0 {
+		return nil, fmt.Errorf("freehand patch refused — %d changed declaration(s) are library-private, "+
+			"and gen_snapshot compares mangled private names against an unmangled manifest, so the base "+
+			"can never have marked them patchable and the whole batch would commit zero redirects:\n  - %s\n"+
+			"Make the declaration or its enclosing class public, or keep it out of the patch.",
+			len(blocked), joinLines(blocked))
+	}
+
 	// CAPABILITY GATE — the diff has produced changed-patchable declarations, and nothing has been
 	// synthesised yet. Every identity here is about to become a redirect on the device, so this is the
 	// last point at which "the base's engine cannot honour this kind" is a message to a developer rather
@@ -1872,10 +1893,36 @@ func compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, baseRelDi
 	return nil
 }
 
+// freehandPrivateIdentities returns the stable identities whose class or member is library-private.
+// Identity shape is "library::class::member"; a leading underscore on either the class or the member is
+// Dart's library-private marker, and it is exactly what the VM mangles with an `@<id>` suffix. A private
+// class name is the common case (`_MyHomeState`), which is why this is a refusal rather than a warning.
+func freehandPrivateIdentities(ids []string) []string {
+	var blocked []string
+	for _, id := range ids {
+		parts := strings.Split(id, "::")
+		if len(parts) < 3 {
+			continue
+		}
+		cls, member := parts[len(parts)-2], parts[len(parts)-1]
+		// A constructor identity is "Class." / "Class.named"; judge it on the class, which the loop
+		// already does, and on the member name after the dot.
+		if strings.HasPrefix(cls, "_") || strings.HasPrefix(member, "_") {
+			blocked = append(blocked, id)
+		}
+	}
+	return blocked
+}
+
 // flutterProfilePlatformDillFromToolchain finds the flutter platform_strong.dill within the iOS toolchain
 // bundle (the fix for the Flutter-import compile: --target flutter needs the flutter platform, not vm).
 func flutterProfilePlatformDillFromToolchain(bundleDir string) (string, error) {
 	for _, rel := range []string{
+		// The canonical v2 pack carries the dill FLAT, as the declared `platform_strong` artifact. Only
+		// the older build-lane packs nest it. This list was build-lane-only, so a bundle that packed the
+		// dill correctly still failed the patch compile with "no flutter platform_strong.dill under
+		// .../build_lane/*/" -- a message that describes a layout the bundle was never meant to have.
+		"platform_strong",
 		filepath.Join("build_lane", "ios_profile", "flutter_patched_sdk", "platform_strong.dill"),
 		filepath.Join("build_lane", "host_profile_unopt", "flutter_patched_sdk", "platform_strong.dill"),
 	} {
@@ -1884,7 +1931,7 @@ func flutterProfilePlatformDillFromToolchain(bundleDir string) (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("no flutter platform_strong.dill under %s/build_lane/*/flutter_patched_sdk/", bundleDir)
+	return "", fmt.Errorf("no flutter platform dill in %s: looked for the packed platform_strong artifact and build_lane/*/flutter_patched_sdk/platform_strong.dill", bundleDir)
 }
 
 func joinLines(xs []string) string {

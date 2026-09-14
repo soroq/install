@@ -18,6 +18,14 @@ import (
 	"soroq/backend/internal/signing"
 )
 
+// The identity the fixture archive's tree actually carries. Install now cross-checks these against the
+// signed manifest, so a fixture manifest must declare exactly what its fixture tree contains.
+const (
+	fixtureFrontendFlutterRev = expectedFlutterRevision
+	fixtureFrontendDartRev    = "d684a576a6aa954ae107a03b2b4e1d61c3bebe93"
+	fixtureFrontendEngineRev  = "engine-rev-fixture"
+)
+
 // buildFixtureFrontendArchive builds a minimal but STRUCTURALLY VALID frontend archive (tar.gz) whose top
 // entry is flutter-sdk-src/, containing an executable bin/flutter and the required soroq_metadata.dart.
 func buildFixtureFrontendArchive(t *testing.T) []byte {
@@ -30,6 +38,13 @@ func buildFixtureFrontendArchive(t *testing.T) []byte {
 		{"flutter-sdk-src/bin/flutter", 0o755, "#!/bin/sh\necho fixture flutter\n"},
 		{"flutter-sdk-src/packages/flutter_tools/lib/src/soroq_metadata.dart", 0o644, "// soroq asset bundler fixture\n"},
 		{"flutter-sdk-src/.git/HEAD", 0o644, "ref: refs/heads/main\n"},
+		// The three revision markers the install cross-checks against the signed manifest. The framework
+		// revision is the tree's own git HEAD, so the archive carries enough git metadata to resolve it.
+		{"flutter-sdk-src/.git/config", 0o644, "[core]\n\trepositoryformatversion = 0\n"},
+		{"flutter-sdk-src/.git/refs/heads/main", 0o644, fixtureFrontendFlutterRev + "\n"},
+		{"flutter-sdk-src/.git/objects/info/packs", 0o644, ""},
+		{"flutter-sdk-src/bin/cache/dart-sdk/revision", 0o644, fixtureFrontendDartRev + "\n"},
+		{"flutter-sdk-src/bin/internal/engine.version", 0o644, fixtureFrontendEngineRev + "\n"},
 	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -81,11 +96,13 @@ func TestFrontendInstallSafety(t *testing.T) {
 	var srv *httptest.Server
 	buildManifest := func() ([]byte, string) {
 		m := frontendManifest{
-			Schema:               frontendManifestSchema,
-			SoroqFrontendVersion: version,
-			FlutterRevision:      expectedFlutterRevision,
-			DartRevision:         "3.13.0-103.1.beta",
-			SigningKeyID:         toolchainPinnedKeyID,
+			Schema:                 frontendManifestSchema,
+			SoroqFrontendVersion:   version,
+			FlutterRevision:        fixtureFrontendFlutterRev,
+			DartRevision:           fixtureFrontendDartRev,
+			EngineRevision:         fixtureFrontendEngineRev,
+			CompatibleToolchainIDs: []string{"soroq-ios-3.44.2-production"},
+			SigningKeyID:           toolchainPinnedKeyID,
 			Archive: frontendManifestArchive{
 				URL:             srv.URL + "/archive",
 				SHA256:          archiveSHA,

@@ -93,6 +93,13 @@ func runAppCreate(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("app create", fs.Args(), nil); err != nil {
+		return err
+	}
 
 	resolvedName := strings.TrimSpace(*name)
 	if resolvedName == "" {
@@ -159,6 +166,13 @@ func runAppStatus(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("app status", fs.Args(), nil); err != nil {
+		return err
+	}
 
 	status, resolvedAppID, err := resolveAppIDForProject(*projectDir, *appID)
 	if err != nil {
@@ -197,6 +211,13 @@ func runAppList(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("app list", fs.Args(), nil); err != nil {
 		return err
 	}
 
