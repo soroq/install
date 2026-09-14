@@ -116,10 +116,13 @@ func IsKnownPatchTrack(track string) bool {
 }
 
 type App struct {
-	ID          string    `json:"id"`
-	DisplayName string    `json:"display_name"`
-	OwnerEmail  string    `json:"owner_email,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	OwnerEmail  string `json:"owner_email,omitempty"`
+	// OrgID is empty for a personal-workspace app, which is what every app created before
+	// organizations existed is. It is never a replacement for OwnerEmail; it is an addition.
+	OrgID     string    `json:"org_id,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type Release struct {
@@ -193,6 +196,9 @@ type CreateAppRequest struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`
 	OwnerEmail  string `json:"owner_email,omitempty"`
+	// OrgID creates the app inside an organization instead of the caller's personal workspace. Empty
+	// keeps the historical behaviour, which is what every existing caller wants.
+	OrgID string `json:"org_id,omitempty"`
 }
 
 type CreateReleaseRequest struct {
@@ -231,8 +237,11 @@ type UpdatePatchRolloutRequest struct {
 }
 
 type UpdatePatchTrackRequest struct {
-	Track          string `json:"track"`
-	RolloutPercent int    `json:"rollout_percent,omitempty"`
+	Track string `json:"track"`
+	// NO omitempty. `omitempty` drops a zero, so `set-track --rollout 0` never reached the wire at all
+	// and the server saw an absent field -- which it then defaulted to 100, publishing to every client
+	// the operator was trying to exclude. Zero is a value this field must be able to carry.
+	RolloutPercent int `json:"rollout_percent"`
 }
 
 type PatchDescriptor struct {
@@ -295,6 +304,19 @@ type RuntimeEvent struct {
 	// to report it. Unknown values are counted under their own key rather than dropped — a taxonomy
 	// that silently discards what it does not recognise is how a gap like this one reappears.
 	FailureClass string `json:"failure_class,omitempty"`
+
+	// EventID and ReportedAt exist for ONE purpose: deciding whether an event may drive an AUTOMATIC
+	// ROLLBACK. They are optional, and an event without them is still counted exactly as before -- a
+	// fielded client that has never heard of them keeps reporting, because losing telemetry to tighten
+	// a control would be trading the thing being measured for the measurement.
+	//
+	// EventID is the reporter's own identifier for this event. A second event carrying an id already
+	// seen for this patch inside the freshness window is a REPLAY and cannot count again.
+	EventID string `json:"event_id,omitempty"`
+	// ReportedAt is when the reporter observed the event. An event older than the freshness window is
+	// STALE: it may describe a patch that has since been superseded, and acting on it would withdraw
+	// code from a fleet on the strength of something that stopped being true.
+	ReportedAt *time.Time `json:"reported_at,omitempty"`
 }
 
 // Failure classes the runtime reports today. These are the values Soroq's own client emits; the field
@@ -321,6 +343,11 @@ type BootReportRequest struct {
 	ClientID          string         `json:"client_id"`
 	ActivePatchNumber *int           `json:"active_patch_number,omitempty"`
 	Events            []RuntimeEvent `json:"events"`
+
+	// Verified is set by the HTTP boundary from the CREDENTIAL on the request, never from the body.
+	// `json:"-"` is the whole guarantee: a client that posts {"verified": true} cannot set it, because
+	// the field does not participate in decoding at all.
+	Verified bool `json:"-"`
 }
 
 type BootReportResponse struct {
@@ -339,6 +366,39 @@ type PatchHealth struct {
 	// five times is one failing device, and counting events would inflate a refusal rate by exactly
 	// the retry behaviour that a refusal causes.
 	FailureClasses map[string]int `json:"failure_classes,omitempty"`
+
+	// PROVENANCE. POST /v1/boot-reports carries no device credential -- fielded apps have none to give
+	// -- so anyone who knows an app_id, runtime_id and channel can post one. That is tolerable for
+	// counting and NOT tolerable for deployment decisions: three anonymous failure reports used to be
+	// enough to withdraw a production patch from every device.
+	//
+	// These are SUBSETS of the sets above, holding the clients whose report arrived with an operator
+	// credential authorized for the app. Every report is still recorded -- losing telemetry is worse
+	// than holding unverified telemetry -- but a deployment can now decide what it acts on.
+	VerifiedSuccessfulClientIDs []string `json:"verified_successful_client_ids,omitempty"`
+	VerifiedFailedClientIDs     []string `json:"verified_failed_client_ids,omitempty"`
+
+	// ROLLBACK ELIGIBILITY IS NARROWER THAN PROVENANCE, and the two are kept apart on purpose.
+	//
+	// Verified means only "this report arrived with an operator credential authorized for the app".
+	// Eligible means verified AND bound to the right release and version AND carrying an unseen event
+	// id AND fresh. A credentialed but stale report is still VERIFIED -- saying otherwise would make
+	// the analytics surface report a false thing about where the report came from -- and it is not
+	// eligible to withdraw code from a fleet.
+	RollbackEligibleSuccessfulClientIDs []string `json:"rollback_eligible_successful_client_ids,omitempty"`
+	RollbackEligibleFailedClientIDs     []string `json:"rollback_eligible_failed_client_ids,omitempty"`
+
+	// SeenEvents holds the event ids already counted for this patch, with when they were reported, so
+	// a replay can be recognised. It is pruned to the freshness window rather than to a fixed length:
+	// a count cap would let a busy patch evict a recent id, and a replay of that id would then pass
+	// both the replay check and the freshness check. Pruning by the same window the freshness check
+	// uses makes the two compose with no gap between them.
+	SeenEvents []SeenRuntimeEvent `json:"seen_events,omitempty"`
+
+	// Observed says whether ANY report has ever arrived for this patch. Zero successes and no reports
+	// at all are different facts, and rendering the second as "0% adoption" is a delivery claim about
+	// devices that were never heard from.
+	Observed bool `json:"observed"`
 
 	LastEventKind RuntimeEventKind `json:"last_event_kind,omitempty"`
 	LastEventAt   time.Time        `json:"last_event_at,omitempty"`
@@ -485,4 +545,68 @@ type CLIToken struct {
 	Scopes      []string
 	CreatedAt   time.Time
 	RevokedAt   *time.Time
+}
+
+// Role is a member's authority inside an organization.
+//
+// The order matters and is checked with AtLeast rather than by comparing strings at each call site: a
+// permission test written as `role == "admin" || role == "owner"` silently omits whichever role is added
+// next, which is how a viewer eventually gets to publish.
+type Role string
+
+const (
+	RoleViewer    Role = "viewer"
+	RoleDeveloper Role = "developer"
+	RoleAdmin     Role = "admin"
+	RoleOwner     Role = "owner"
+)
+
+func (r Role) rank() int {
+	switch r {
+	case RoleViewer:
+		return 1
+	case RoleDeveloper:
+		return 2
+	case RoleAdmin:
+		return 3
+	case RoleOwner:
+		return 4
+	default:
+		return 0 // an unknown role has NO authority; it must never outrank viewer
+	}
+}
+
+// AtLeast reports whether r carries at least the authority of want. An unrecognised role is refused,
+// so a typo or a future role added to the database cannot accidentally grant access.
+func (r Role) AtLeast(want Role) bool {
+	if r.rank() == 0 || want.rank() == 0 {
+		return false
+	}
+	return r.rank() >= want.rank()
+}
+
+func (r Role) Valid() bool { return r.rank() > 0 }
+
+// Organization owns apps on behalf of more than one person.
+type Organization struct {
+	ID          string    `json:"id"`
+	DisplayName string    `json:"display_name,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	CreatedBy   string    `json:"created_by,omitempty"`
+}
+
+// SeenRuntimeEvent is one event id already counted toward rollback eligibility, with its report time.
+type SeenRuntimeEvent struct {
+	EventID    string    `json:"event_id"`
+	ReportedAt time.Time `json:"reported_at"`
+}
+
+// Membership is one person's role in one organization. Email is the identity used everywhere else in
+// this schema, so it is the identity here too.
+type Membership struct {
+	OrgID     string    `json:"org_id"`
+	Email     string    `json:"email"`
+	Role      Role      `json:"role"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }

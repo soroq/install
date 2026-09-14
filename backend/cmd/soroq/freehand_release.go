@@ -223,8 +223,26 @@ func installFreehandAnalyzer(flutterRoot string) (string, string, error) {
 	}
 	dst := filepath.Join(flutterRoot, filepath.FromSlash(freehandAnalyzerRelPath))
 	if fileExists(dst) {
-		if dstSha, err := sha256OfPath(dst); err == nil && dstSha == srcSha {
+		dstSha, shaErr := sha256OfPath(dst)
+		if shaErr == nil && dstSha == srcSha {
 			return dst, dstSha, nil
+		}
+		// A CANDIDATE FRONTEND IS IMMUTABLE. This function writes into whatever frontend directory it
+		// is handed, and the analyzer it copies comes from resolveBundledAnalyzerSource -- which
+		// prefers the INSTALLED frontend. Building against a candidate therefore silently replaced the
+		// candidate's own analyzer with the installed one, so the candidate no longer matched the sha
+		// its manifest advertises and `soroq frontend use-candidate` refused it. The bytes under test
+		// were destroyed by the act of testing them.
+		//
+		// Refuse instead. A frontend that declares an analyzer sha owns those bytes; if a different
+		// analyzer is wanted, name it explicitly with SOROQ_FREEHAND_ANALYZER and rebuild the
+		// candidate, rather than having a build mutate an artifact that is about to be published.
+		if shaErr == nil && frontendDeclaresAnalyzerSha(flutterRoot, dstSha) {
+			return "", "", fmt.Errorf(
+				"refusing to overwrite the analyzer of a frontend that declares it: %s carries %s, "+
+					"which its manifest advertises, and the resolved source is %s. A candidate is "+
+					"immutable once built; set SOROQ_FREEHAND_ANALYZER and rebuild the candidate if a "+
+					"different analyzer is intended", dst, dstSha[:12], srcSha[:12])
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -244,6 +262,63 @@ func installFreehandAnalyzer(flutterRoot string) (string, string, error) {
 	}
 	return dst, dstSha, nil
 }
+
+// frontendDeclaresAnalyzerSha reports whether the frontend rooted at flutterRoot advertises exactly
+// this analyzer in its own metadata. Only such a frontend is treated as immutable: a plain SDK
+// checkout with a stray analyzer file has nothing to protect.
+//
+// Two declaration shapes are honoured, and BOTH are required for the guard to be armed on real
+// artifacts. A candidate carries the full 64-hex digest in its manifest. A PUBLISHED frontend does
+// not: its manifest has no analyzer field at all, and the only place the analyzer appears is the
+// 8-hex suffix of soroq_frontend_version (…-70bae0fd). Matching the full digest alone therefore made
+// this guard inert for exactly the artifact that most needed protecting -- and the published
+// frontend's analyzer was in fact silently overwritten by a candidate build before the prefix arm
+// existed. A guard that cannot fire on the important case is not a guard.
+func frontendDeclaresAnalyzerSha(flutterRoot, sha string) bool {
+	sha = strings.ToLower(strings.TrimSpace(sha))
+	if len(sha) < freehandAnalyzerIDPrefixLen {
+		return false
+	}
+	prefix := sha[:freehandAnalyzerIDPrefixLen]
+	// <frontend>/flutter-sdk-src is flutterRoot, so the metadata sits one level up.
+	for _, rel := range []string{
+		filepath.Join(flutterRoot, "..", "soroq_frontend_metadata.json"),
+		filepath.Join(flutterRoot, "..", "manifest.json"),
+	} {
+		b, err := os.ReadFile(filepath.Clean(rel))
+		if err != nil {
+			continue
+		}
+		body := strings.ToLower(string(b))
+		// Shape 1: the full digest appears verbatim (candidate manifests).
+		if strings.Contains(body, sha) {
+			return true
+		}
+		// Shape 2: the digest prefix is the trailing id segment of the declared frontend version
+		// (published manifests). Anchor on the version string so an unrelated hex run elsewhere in
+		// the file cannot arm the guard by coincidence.
+		if v := frontendDeclaredVersion(body); v != "" {
+			if i := strings.LastIndex(v, "-"); i >= 0 && v[i+1:] == prefix {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// freehandAnalyzerIDPrefixLen is how many hex characters of the analyzer digest a frontend id carries.
+const freehandAnalyzerIDPrefixLen = 8
+
+// frontendDeclaredVersion extracts soroq_frontend_version from already-lowercased manifest bytes.
+func frontendDeclaredVersion(body string) string {
+	m := frontendVersionRe.FindStringSubmatch(body)
+	if len(m) != 2 {
+		return ""
+	}
+	return m[1]
+}
+
+var frontendVersionRe = regexp.MustCompile(`"soroq_frontend_version"\s*:\s*"([^"]+)"`)
 
 const freehandConfigRelPath = ".soroq/freehand_config.json"
 

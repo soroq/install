@@ -142,6 +142,13 @@ func runCacheList(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("cache list", fs.Args(), nil); err != nil {
+		return err
+	}
 
 	activeFrontends, activeToolchains := activeCacheSets()
 	frontendsDir, err := frontendsRoot()
@@ -216,6 +223,22 @@ active frontend/toolchain(s) and any soroq.lock-pinned version are always kept.`
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	// REFUSE, RATHER THAN INVENT TARGETING. `cache clean` is documented as "remove cached versions no
+	// active pointer references"; there is no documented per-version target, so `cache clean --delete
+	// tc-1` had no correct meaning to honour -- and what it actually did was ignore `tc-1` and delete
+	// ALL four unreferenced versions. Adding a target would be a new feature; refusing is the honest
+	// reading of a command that was never asked to take one.
+	if err := refuseUnconsumedArguments("cache clean", fs.Args(), []string{
+		"no positional arguments -- it removes every cached version no active pointer references",
+		"`--delete` to actually remove them (the default is a dry run)",
+		"`soroq cache list` to see what is cached",
+	}); err != nil {
 		return err
 	}
 

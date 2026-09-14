@@ -47,6 +47,13 @@ fails, the previous binaries are restored and the install stays usable.
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("update", fs.Args(), nil); err != nil {
+		return err
+	}
 
 	// Resolve the install dir = the directory holding the CURRENTLY-RUNNING soroq
 	// binary (typically ~/.soroq/bin). We deliberately do NOT fall back to any

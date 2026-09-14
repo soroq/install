@@ -114,6 +114,13 @@ func runPreviewIOSEngine(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("preview ios-engine", fs.Args(), nil); err != nil {
+		return err
+	}
 	resolvedAppID := strings.TrimSpace(*appID)
 	if resolvedAppID == "" {
 		return errors.New("--app-id is required")
@@ -295,6 +302,13 @@ func runPreviewAndroid(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("preview android", fs.Args(), nil); err != nil {
 		return err
 	}
 	if *currentPatchNumber < 0 {

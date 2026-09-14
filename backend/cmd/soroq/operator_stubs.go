@@ -21,3 +21,7 @@ func runFrontendPublish(args []string) error {
 func runCatalogPublish(args []string) error {
 	return errors.New("`soroq catalog publish` is an operator-only command and is not built into the public CLI")
 }
+
+func runCatalogPublishV2(args []string) error {
+	return errors.New("`soroq catalog publish-v2` is an operator-only command and is not built into the public CLI")
+}

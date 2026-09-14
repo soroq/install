@@ -12,6 +12,11 @@ import (
 // frontend's bundled .git (git rev-parse HEAD) rather than the SHORTENED revision that plain
 // `flutter --version` prints (which caused a one-time first-run `frontend doctor` false negative).
 func TestFlutterRevisionOfPrefersGitOverShortVersion(t *testing.T) {
+	// ITS OWN PREDICATE, NOT FLUTTER'S. This test shells out to git. Routing it through the Flutter
+	// check -- which an earlier version effectively did by leaving it unguarded while guarding the
+	// Flutter journeys -- meant that on a machine without git it FAILED rather than skipping, which is
+	// the same "one dependency over" defect the Flutter guard was added to fix.
+	requireTool(t, "git")
 	root := t.TempDir()
 	binDir := filepath.Join(root, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
@@ -51,4 +56,5 @@ func TestFlutterRevisionOfPrefersGitOverShortVersion(t *testing.T) {
 	if got != fullHead {
 		t.Fatalf("expected FULL git revision %q, got %q (short-version false negative not fixed)", fullHead, got)
 	}
+	journeyCompleted(t)
 }

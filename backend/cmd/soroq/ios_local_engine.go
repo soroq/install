@@ -264,7 +264,84 @@ func completeIOSLocalEngineLayout(iosBundleDir, flutterBin string) error {
 			return fmt.Errorf("link stock %s: %w", filepath.Base(dst), err)
 		}
 	}
+	return materializeIOSSoroqPatchedSDK(iosBundleDir, commonEngine, targetOut, hostOut)
+}
+
+// materializeIOSSoroqPatchedSDK replaces the stock `flutter_patched_sdk` link in each local-engine lane
+// with the SOROQ platform dill the bundle packs.
+//
+// WHY THIS EXISTS. The stock link above comes from the frontend's bin/cache, and that platform dill has
+// no `dart:_internal` declaration for soroqRedirectToPatch / soroqRollbackPatch /
+// soroqTransitionBatchByIdentity. Every freehand app build therefore died inside
+// kernel_snapshot_program with three "Method not found" errors, before one byte of application Dart was
+// compiled. The failure named the generated bootstrap file, never the missing artifact, so the toolchain
+// looked broken and the packer -- which had simply dropped the dill -- looked fine.
+//
+// `vm_platform` is NOT a substitute: it is the plain Dart VM platform and carries no dart:ui, so the
+// front end crashes in DillLoader.loadExtraRequiredLibraries. The artifact required here is the Flutter
+// patched SDK built from the SOROQ Dart SDK sources, packed as `platform_strong`.
+//
+// FAIL CLOSED. If engine.json declares `platform_strong`, the file must be present and hash-matching or
+// the layout is refused; falling back to stock would reproduce the original silent failure. A bundle
+// that declares nothing is refused too, naming the artifact, so an operator on such a toolchain gets a
+// diagnosable message instead of three "Method not found" lines.
+//
+// Only the platform dill is replaced. `vm_outline_strong.dill` stays stock: it carries declarations for
+// modular summaries, not the bodies the program snapshot links, and the packed bundle has no outline.
+func materializeIOSSoroqPatchedSDK(iosBundleDir, commonEngine string, lanes ...string) error {
+	declared, err := iosToolchainDeclaredArtifactSHA(iosBundleDir, "platform_strong")
+	if err != nil {
+		return err
+	}
+	packed := filepath.Join(iosBundleDir, "platform_strong")
+	if declared == "" {
+		return fmt.Errorf(
+			"the toolchain's engine.json declares no %q artifact, so this bundle cannot build a Soroq iOS app: "+
+				"the stock Flutter patched SDK has no soroq dart:_internal intrinsics and the kernel snapshot "+
+				"fails with \"Method not found: 'soroqRedirectToPatch'\". Install a toolchain version that packs it.",
+			"platform_strong")
+	}
+	got, err := sha256OfPath(packed)
+	if err != nil {
+		return fmt.Errorf("the toolchain's engine.json declares platform_strong but the artifact is unreadable: %w", err)
+	}
+	if !strings.EqualFold(got, declared) {
+		return fmt.Errorf("toolchain platform_strong sha256 %s does not match the %s declared in engine.json", got, declared)
+	}
+	for _, lane := range lanes {
+		lanePatched := filepath.Join(lane, "flutter_patched_sdk")
+		if err := os.RemoveAll(lanePatched); err != nil {
+			return fmt.Errorf("replace the stock flutter_patched_sdk link in %s: %w", lane, err)
+		}
+		if err := os.MkdirAll(lanePatched, 0o755); err != nil {
+			return err
+		}
+		if err := copyFileContents(packed, filepath.Join(lanePatched, "platform_strong.dill")); err != nil {
+			return fmt.Errorf("materialize the soroq platform_strong.dill in %s: %w", lane, err)
+		}
+		if err := symlinkForce(filepath.Join(commonEngine, "flutter_patched_sdk", "vm_outline_strong.dill"),
+			filepath.Join(lanePatched, "vm_outline_strong.dill")); err != nil {
+			return fmt.Errorf("link the stock vm_outline_strong.dill in %s: %w", lane, err)
+		}
+	}
 	return nil
+}
+
+// iosToolchainDeclaredArtifactSHA reads one entry of engine.json's `artifacts` map. It returns an empty
+// string when the bundle declares no such artifact, which callers treat as a refusal rather than a
+// default.
+func iosToolchainDeclaredArtifactSHA(iosBundleDir, name string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(iosBundleDir, "engine.json"))
+	if err != nil {
+		return "", fmt.Errorf("read the toolchain's engine.json: %w", err)
+	}
+	var meta struct {
+		Artifacts map[string]string `json:"artifacts"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return "", fmt.Errorf("parse the toolchain's engine.json: %w", err)
+	}
+	return strings.TrimSpace(meta.Artifacts[name]), nil
 }
 
 // overwriteFileContents copies src bytes over dst (truncating dst), following symlinks on src. Unlike

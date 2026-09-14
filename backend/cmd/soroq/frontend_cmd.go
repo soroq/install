@@ -237,11 +237,93 @@ func parseFrontendManifest(b []byte) (frontendManifest, error) {
 // checkFrontendIdentity refuses a manifest whose flutter_revision does not match the revision this CLI is
 // wired for (the strong upstream anchor; the frontend must match the toolchain/engine pair).
 func checkFrontendIdentity(m frontendManifest) error {
-	if !strings.EqualFold(strings.TrimSpace(m.FlutterRevision), expectedFlutterRevision) {
-		return fmt.Errorf("flutter revision mismatch: manifest %q, this CLI is wired for %q",
-			short(m.FlutterRevision), short(expectedFlutterRevision))
+	// It used to require flutter_revision == expectedFlutterRevision (3.44.2). That made the accept list
+	// one revision long, which is precisely what catalog v2 exists to end: the matrix pins 3.44.2 and
+	// 3.44.9 for iOS simultaneously, and an equality check refuses whichever the CLI was not built
+	// against. The signature over this manifest has already been checked against the pinned key, so what
+	// remains to refuse is a manifest that identifies nothing or pairs with nothing.
+	if err := checkRevisionWellFormed("flutter_revision", m.FlutterRevision, true); err != nil {
+		return fmt.Errorf("frontend manifest: %w", err)
+	}
+	// dart_revision must be a commit SHA, EXCEPT for the enumerated legacy artifacts that predate that
+	// convention (see dart_revision_compat.go). The exemption is keyed on this manifest's own immutable
+	// version AND the exact value it declares, so it cannot widen to any other frontend.
+	if err := checkRevisionWellFormed("dart_revision", m.DartRevision, true); err != nil {
+		if !allowsLegacyNonSHADartRevision(m.SoroqFrontendVersion, m.DartRevision) {
+			return fmt.Errorf("frontend manifest: %w", err)
+		}
+	}
+	if strings.TrimSpace(m.EngineRevision) == "" {
+		return errors.New("frontend manifest declares no engine_revision, so it identifies no engine")
+	}
+	if len(m.CompatibleToolchainIDs) == 0 {
+		return errors.New("frontend manifest lists no compatible_toolchain_ids; a frontend that pairs with nothing cannot be built against")
+	}
+	seen := map[string]bool{}
+	for _, id := range m.CompatibleToolchainIDs {
+		t := strings.TrimSpace(id)
+		if t == "" {
+			return errors.New("frontend manifest lists an empty compatible toolchain id")
+		}
+		if seen[t] {
+			return fmt.Errorf("frontend manifest lists compatible toolchain %q twice", t)
+		}
+		seen[t] = true
 	}
 	return nil
+}
+
+// verifyFrontendTreeMatchesManifest is what REPLACES the hardcoded revision pin.
+//
+// The CLI no longer decides which Flutter a frontend may carry, so it must instead prove the tree it
+// extracted is the tree the signature describes. The archive SHA-256 already binds the BYTES; this binds
+// their MEANING: the SDK's own git HEAD, bin/cache/dart-sdk/revision and bin/internal/engine.version must
+// each equal what the signed manifest declares. Runs before the cache swap, and again on every offline
+// re-verification of an installed SIGNED frontend.
+func verifyFrontendTreeMatchesManifest(m frontendManifest, sdkDir string) error {
+	flutterRev, dartRev, engineRev, err := frontendTreeRevisions(sdkDir)
+	if err != nil {
+		return err
+	}
+	for _, c := range []struct{ what, manifest, tree string }{
+		{"flutter revision", m.FlutterRevision, flutterRev},
+		{"dart revision (bin/cache/dart-sdk/revision)", m.DartRevision, dartRev},
+		{"engine revision (bin/internal/engine.version)", m.EngineRevision, engineRev},
+	} {
+		if !strings.EqualFold(strings.TrimSpace(c.manifest), strings.TrimSpace(c.tree)) {
+			return fmt.Errorf("%s mismatch: signed manifest says %q, the extracted frontend tree says %q",
+				c.what, short(c.manifest), short(c.tree))
+		}
+	}
+	return nil
+}
+
+// frontendTreeRevisions reads the three revision markers the shipped Flutter SDK tree carries.
+func frontendTreeRevisions(sdkDir string) (flutterRev, dartRev, engineRev string, err error) {
+	readTrim := func(rel string) (string, error) {
+		b, rerr := os.ReadFile(filepath.Join(sdkDir, rel))
+		if rerr != nil {
+			return "", fmt.Errorf("read %s from the extracted frontend: %w", rel, rerr)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	if dartRev, err = readTrim(filepath.Join("bin", "cache", "dart-sdk", "revision")); err != nil {
+		return "", "", "", err
+	}
+	if engineRev, err = readTrim(filepath.Join("bin", "internal", "engine.version")); err != nil {
+		return "", "", "", err
+	}
+	// The framework revision is the tree's own git HEAD; the archive ships self-contained git metadata.
+	cmd := exec.Command("git", "-C", sdkDir, "rev-parse", "HEAD")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, gerr := cmd.Output()
+	if gerr != nil {
+		return "", "", "", fmt.Errorf("read the extracted frontend's flutter revision: %w: %s",
+			gerr, strings.TrimSpace(stderr.String()))
+	}
+	flutterRev = strings.TrimSpace(string(out))
+	return flutterRev, dartRev, engineRev, nil
 }
 
 // --- install ---
@@ -429,6 +511,15 @@ func reverifyInstalledFrontend(version, versionDir string) (frontendManifest, bo
 	if err != nil {
 		return frontendManifest{}, false, err
 	}
+	if err := checkFrontendIdentity(manifest); err != nil {
+		return frontendManifest{}, false, err
+	}
+	// The cached tree must still agree with its cached signed manifest. A cache edited after install is
+	// exactly what an offline re-verification exists to catch. Only the SIGNED path reaches here -- the
+	// candidate branch above returns early, because a candidate is a deliberately modified local tree.
+	if err := verifyFrontendTreeMatchesManifest(manifest, filepath.Join(versionDir, manifest.subdir())); err != nil {
+		return frontendManifest{}, false, err
+	}
 	binPath := filepath.Join(versionDir, manifest.subdir(), "bin", "flutter")
 	if info, err := os.Stat(binPath); err != nil || info.IsDir() {
 		return frontendManifest{}, false, fmt.Errorf("installed frontend missing %s", binPath)
@@ -490,6 +581,12 @@ func extractFrontendArchive(archivePath, versionDir string, m frontendManifest, 
 		return err
 	}
 
+	// THE EXTRACTED TREE MUST BE THE TREE THE SIGNATURE DESCRIBES. This is what replaced the hardcoded
+	// flutter-revision pin, so it runs BEFORE the swap: a disagreeing tree never reaches the cache.
+	if err := verifyFrontendTreeMatchesManifest(m, filepath.Join(tmpDir, subdir)); err != nil {
+		return fmt.Errorf("REFUSED: %w", err)
+	}
+
 	if err := os.RemoveAll(versionDir); err != nil {
 		return err
 	}
@@ -539,6 +636,13 @@ func runFrontendPath(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("frontend path", fs.Args(), nil); err != nil {
+		return err
+	}
 	bin, err := resolveInstalledFrontendFlutterBin()
 	if err != nil {
 		return err
@@ -561,6 +665,13 @@ func runFrontendList(args []string) error {
 		}
 		return err
 	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("frontend list", fs.Args(), nil); err != nil {
+		return err
+	}
 	root, err := frontendsRoot()
 	if err != nil {
 		return err
@@ -579,7 +690,10 @@ func runFrontendList(args []string) error {
 		SignatureValid bool   `json:"signature_valid"`
 		Note           string `json:"note,omitempty"`
 	}
-	var out []listed
+	// AN EMPTY LIST IS `[]`, NOT `null`. A nil slice marshals to `null`, and a consumer that does
+	// `for x in result` then fails on a machine where nothing is installed -- the exact machine a
+	// first run happens on. The command declares JSON; an empty array is what "no entries" looks like.
+	out := []listed{}
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
@@ -634,6 +748,13 @@ func runFrontendDoctor(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	// VALIDATE BEFORE ANY SIDE EFFECT. Go's flag package stops at the first non-flag
+	// argument and leaves the rest in fs.Args(). A command that never reads them accepts
+	// any number of words and silently ignores them -- and, worse, every flag AFTER such a
+	// word is never parsed at all.
+	if err := refuseUnconsumedArguments("frontend doctor", fs.Args(), nil); err != nil {
 		return err
 	}
 	report := doctorReport{}
@@ -725,9 +846,15 @@ func frontendInstalledCheck() doctorCheck {
 	if err != nil {
 		return doctorCheck{Name: "Soroq Flutter frontend", Status: "error", Message: "bin/flutter --version failed: " + err.Error()}
 	}
-	if !strings.HasPrefix(strings.TrimSpace(rev), strings.TrimSpace(short(expectedFlutterRevision))) {
+	// Compared against THIS FRONTEND'S OWN SIGNED MANIFEST, not a revision compiled into the CLI. The
+	// constant was 3.44.2, so doctor reported a correctly signed 3.44.9 frontend as broken.
+	if !strings.HasPrefix(strings.TrimSpace(rev), strings.TrimSpace(short(manifest.FlutterRevision))) {
 		return doctorCheck{Name: "Soroq Flutter frontend", Status: "error",
-			Message: fmt.Sprintf("bin/flutter revision %s != pinned %s", short(rev), short(expectedFlutterRevision))}
+			Message: fmt.Sprintf("bin/flutter revision %s != the signed manifest's %s", short(rev), short(manifest.FlutterRevision))}
+	}
+	if err := verifyFrontendTreeMatchesManifest(manifest, filepath.Join(versionDir, manifest.subdir())); err != nil {
+		return doctorCheck{Name: "Soroq Flutter frontend", Status: "error", Message: err.Error(),
+			Fix: "soroq frontend install " + active.Version + " --force --api " + defaultControlPlaneAPI}
 	}
 	return doctorCheck{Name: "Soroq Flutter frontend", Status: "ok",
 		Message: fmt.Sprintf("%s installed + signature-valid + revision %s (%s)", active.Version, short(rev), binPath)}

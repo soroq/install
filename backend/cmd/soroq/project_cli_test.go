@@ -212,7 +212,10 @@ func TestRunInitAddsSoroqFlutterDependencyByDefault(t *testing.T) {
 		t.Fatalf("ReadFile(pubspec.yaml) error = %v", err)
 	}
 	pubspecText := string(pubspecBytes)
-	if !strings.Contains(pubspecText, "soroq_flutter: ^0.1.13") {
+	// The assertion is that a soroq_flutter dependency LINE was written, not which version it names.
+	// Pinning a version here made the test a place package releases had to be remembered, and it was
+	// three years of releases out of date.
+	if !strings.Contains(pubspecText, "soroq_flutter:") {
 		t.Fatalf("expected soroq_flutter dependency, got %q", pubspecText)
 	}
 	if !strings.Contains(pubspecText, "- soroq.yaml") {
@@ -856,7 +859,10 @@ func stubFlutterPubAddSoroqFlutter(t *testing.T) *int {
 		if !strings.Contains(text, "\ndependencies:") && !strings.HasPrefix(text, "dependencies:") {
 			text += "\ndependencies:\n"
 		}
-		text += "  soroq_flutter: ^0.1.13\n"
+		// `any`, matching testSoroqFlutterPubspec. A pinned version here is a fixture that rots:
+		// this stub only stands in for `flutter pub add` having written SOME dependency line, and
+		// nothing about the test depends on which version it names.
+		text += "  soroq_flutter: any\n"
 		return os.WriteFile(pubspecPath, []byte(text), 0o644)
 	}
 	t.Cleanup(func() {

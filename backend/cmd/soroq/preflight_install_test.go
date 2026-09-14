@@ -71,12 +71,13 @@ func TestFrontendInstallJSONByteStability(t *testing.T) {
 	var srv *httptest.Server
 	buildManifest := func() ([]byte, string) {
 		m := frontendManifest{
-			Schema:               frontendManifestSchema,
-			SoroqFrontendVersion: version,
-			FlutterRevision:      expectedFlutterRevision,
-			DartRevision:         "3.13.0-103.1.beta",
-			EngineRevision:       "engine-rev-fixture",
-			SigningKeyID:         toolchainPinnedKeyID,
+			Schema:                 frontendManifestSchema,
+			SoroqFrontendVersion:   version,
+			FlutterRevision:        expectedFlutterRevision,
+			DartRevision:           fixtureFrontendDartRev,
+			EngineRevision:         fixtureFrontendEngineRev,
+			CompatibleToolchainIDs: []string{"soroq-ios-3.44.2-production"},
+			SigningKeyID:           toolchainPinnedKeyID,
 			Archive: frontendManifestArchive{
 				URL:               srv.URL + "/archive",
 				SHA256:            archiveSHA,
@@ -142,6 +143,7 @@ func TestToolchainInstallJSONByteStability(t *testing.T) {
 			Tier:                  "experimental_profile",
 			FlutterRevision:       expectedFlutterRevision,
 			DartRevision:          expectedDartRevision,
+			SoroqEngineRevision:   fixtureToolchainEngineRev,
 			Archive: cliManifestArchive{
 				URL:               srv.URL + "/archive",
 				SHA256:            archiveSHA,
@@ -230,11 +232,13 @@ func TestFrontendInstallFreeDiskAbort(t *testing.T) {
 	var srv *httptest.Server
 	buildManifest := func() ([]byte, string) {
 		m := frontendManifest{
-			Schema:               frontendManifestSchema,
-			SoroqFrontendVersion: version,
-			FlutterRevision:      expectedFlutterRevision,
-			DartRevision:         "3.13.0-103.1.beta",
-			SigningKeyID:         toolchainPinnedKeyID,
+			Schema:                 frontendManifestSchema,
+			SoroqFrontendVersion:   version,
+			FlutterRevision:        expectedFlutterRevision,
+			DartRevision:           fixtureFrontendDartRev,
+			EngineRevision:         fixtureFrontendEngineRev,
+			CompatibleToolchainIDs: []string{"soroq-ios-3.44.2-production"},
+			SigningKeyID:           toolchainPinnedKeyID,
 			Archive: frontendManifestArchive{
 				URL:               srv.URL + "/archive",
 				SHA256:            archiveSHA,

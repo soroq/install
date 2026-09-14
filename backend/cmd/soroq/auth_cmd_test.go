@@ -126,14 +126,6 @@ func TestRunLoginStoresCredentialsAndWhoamiVerifies(t *testing.T) {
 func TestStoredLoginCredentialsAreUsedByControlPlaneCommands(t *testing.T) {
 	clearOperatorEnv(t)
 	configPath := filepath.Join(t.TempDir(), "config.json")
-	if err := saveAuthConfig(configPath, authConfig{
-		SchemaVersion: 1,
-		APIBase:       "https://example.invalid",
-		OperatorEmail: "owner@example.com",
-		OperatorToken: "stored-secret",
-	}); err != nil {
-		t.Fatalf("saveAuthConfig() error = %v", err)
-	}
 	t.Setenv("SOROQ_CONFIG", configPath)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -152,6 +144,19 @@ func TestStoredLoginCredentialsAreUsedByControlPlaneCommands(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+
+	// The stored origin must MATCH the server this test targets. The fixture used to say
+	// "https://example.invalid" while pointing at a local httptest server, and it only worked because a
+	// stored credential could be sent to a foreign origin. That is refused now, so the credential is
+	// seeded for the origin it is actually used against -- which is what this test means to exercise.
+	if err := saveAuthConfig(configPath, authConfig{
+		SchemaVersion: 1,
+		APIBase:       server.URL,
+		OperatorEmail: "owner@example.com",
+		OperatorToken: "stored-secret",
+	}); err != nil {
+		t.Fatalf("saveAuthConfig() error = %v", err)
+	}
 
 	if err := runAppList([]string{"--api", server.URL, "--json"}); err != nil {
 		t.Fatalf("runAppList() error = %v", err)
@@ -415,15 +420,6 @@ func TestBrowserLoginDefaultSurfaceUsesProductDomain(t *testing.T) {
 func TestStoredFirebaseCredentialsAreUsedByControlPlaneCommands(t *testing.T) {
 	clearOperatorEnv(t)
 	configPath := filepath.Join(t.TempDir(), "config.json")
-	if err := saveAuthConfig(configPath, authConfig{
-		SchemaVersion:   1,
-		CredentialKind:  credentialKindFirebase,
-		APIBase:         "https://hosted.example/api",
-		OperatorEmail:   "owner@example.com",
-		FirebaseIDToken: "firebase-id-token",
-	}); err != nil {
-		t.Fatalf("saveAuthConfig() error = %v", err)
-	}
 	t.Setenv("SOROQ_CONFIG", configPath)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -442,6 +438,18 @@ func TestStoredFirebaseCredentialsAreUsedByControlPlaneCommands(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+
+	// Seeded for the origin this test actually targets. It previously named hosted.example while
+	// pointing at a local server, which only worked while a stored credential could cross origins.
+	if err := saveAuthConfig(configPath, authConfig{
+		SchemaVersion:   1,
+		CredentialKind:  credentialKindFirebase,
+		APIBase:         server.URL,
+		OperatorEmail:   "owner@example.com",
+		FirebaseIDToken: "firebase-id-token",
+	}); err != nil {
+		t.Fatalf("saveAuthConfig() error = %v", err)
+	}
 
 	if err := runAppList([]string{"--api", server.URL, "--json"}); err != nil {
 		t.Fatalf("runAppList() error = %v", err)
