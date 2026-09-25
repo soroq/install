@@ -14,7 +14,7 @@ func TestRetention_MissingEvidenceRefusesRelease(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
 	m := fullMeta()
 	m.Retention = nil
-	_, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph())
+	_, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph(), "")
 	if err == nil || !strings.Contains(err.Error(), "retention") {
 		t.Fatalf("release must refuse a base without verified retention, got %v", err)
 	}
@@ -28,7 +28,7 @@ func TestRetention_ReleaseRefusesTamperedCallerFields(t *testing.T) {
 		proj, dill, srcDill, man, graph := seedFixture(t)
 		m := fullMeta()
 		m.Retention = &FreehandRetentionEvidence{Verified: false, AnalysisID: strings.Repeat("a", 64)}
-		if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph()); err == nil || !strings.Contains(err.Error(), "not verified") {
+		if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph(), ""); err == nil || !strings.Contains(err.Error(), "not verified") {
 			t.Fatalf("release must refuse unverified retention, got %v", err)
 		}
 	})
@@ -36,7 +36,7 @@ func TestRetention_ReleaseRefusesTamperedCallerFields(t *testing.T) {
 		proj, dill, srcDill, man, graph := seedFixture(t)
 		m := fullMeta()
 		m.Retention = &FreehandRetentionEvidence{Verified: true, AnalysisID: "not-a-content-address"}
-		if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph()); err == nil || !strings.Contains(err.Error(), "analysis_id") {
+		if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph(), ""); err == nil || !strings.Contains(err.Error(), "analysis_id") {
 			t.Fatalf("release must refuse a non-content-addressed analysis_id, got %v", err)
 		}
 	})
@@ -46,7 +46,7 @@ func TestRetention_ReleaseRefusesTamperedCallerFields(t *testing.T) {
 // caller-supplied — from the validated manifest.
 func TestRetention_RecordedInBaselineReceipt(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestRetention_RequireGateCases(t *testing.T) {
 // nested retention field is tampered — before any patch delegate runs.
 func TestRetention_VerifyExistingBaselineFailsOnTamper(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestRetention_ImmutableInputsIncludeEveryRetentionField(t *testing.T) {
 // same guard computeFreehandPatchPlan applies right after verifyExistingBaseline).
 func TestRetention_PatchRefusesBaseWithoutEvidence(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}

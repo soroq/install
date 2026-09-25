@@ -70,16 +70,42 @@ func (h *iosRefusalHarness) assertNoSideEffects(t *testing.T) {
 const ordinaryPubspec = "name: example_app\nversion: 1.0.0+1\nflutter:\n  uses-material-design: true\n"
 const modulePubspec = "name: example_module\nversion: 1.0.0+1\nflutter:\n  module:\n    androidX: true\n"
 
-func TestIOSReleaseRefusesFlavorBeforeAnySideEffect(t *testing.T) {
+// The config baseline (no --build) builds nothing, so a flavor there is refused before anything runs.
+func TestIOSReleaseRefusesFlavorOnConfigBaselineBeforeAnySideEffect(t *testing.T) {
 	h := newIOSRefusalHarness(t, ordinaryPubspec)
-	err := h.run(t, "--build", "--toolchain", "tc-1", "--", "--flavor", "prod")
+	err := h.run(t, "--flavor", "prod")
 	if err == nil {
-		t.Fatal("a flavored iOS build must be refused")
+		t.Fatal("a flavor on the iOS config baseline must be refused")
 	}
-	if !strings.Contains(err.Error(), "no flavor support") {
+	if !strings.Contains(err.Error(), "not supported on this route") {
 		t.Errorf("expected the flavor refusal, got: %v", err)
 	}
 	h.assertNoSideEffects(t)
+}
+
+// The --build app leg supports a flavor: it reaches the build with exactly one `--flavor prod`,
+// whichever way the developer spelled it.
+func TestIOSReleaseBuildLegPassesFlavorThrough(t *testing.T) {
+	for name, extra := range map[string][]string{
+		"flag":        {"--build", "--toolchain", "tc-1", "--flavor", "prod"},
+		"passthrough": {"--build", "--toolchain", "tc-1", "--", "--flavor=prod"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newIOSRefusalHarness(t, ordinaryPubspec)
+			var got []string
+			iosReleaseBuildFn = func(_ string, _ string, args []string) error {
+				atomic.AddInt32(&h.buildCalls, 1)
+				got = args
+				return nil
+			}
+			if err := h.run(t, extra...); err != nil {
+				t.Fatalf("flavored iOS build leg: %v", err)
+			}
+			if strings.Join(got, " ") != "--flavor prod" {
+				t.Fatalf("build args = %q, want exactly --flavor prod", got)
+			}
+		})
+	}
 }
 
 func TestIOSReleaseRefusesObfuscationBeforeAnySideEffect(t *testing.T) {
@@ -88,7 +114,7 @@ func TestIOSReleaseRefusesObfuscationBeforeAnySideEffect(t *testing.T) {
 	if err == nil {
 		t.Fatal("an obfuscated iOS build must be refused")
 	}
-	if !strings.Contains(err.Error(), "not verified") {
+	if !strings.Contains(err.Error(), "cannot bind an obfuscated base") {
 		t.Errorf("expected the unverified-binding refusal, got: %v", err)
 	}
 	h.assertNoSideEffects(t)
@@ -119,7 +145,7 @@ func TestIOSReleaseAcceptsOrdinaryAndCustomEntrypointProjects(t *testing.T) {
 			// It may still fail later (the fake control plane returns 500), but it must NOT fail with a
 			// shape refusal, and it MUST have reached the build.
 			if err != nil {
-				for _, refusal := range []string{"no flavor support", "not verified", "add-to-app"} {
+				for _, refusal := range []string{"not supported on this route", "cannot bind an obfuscated base", "add-to-app"} {
 					if strings.Contains(err.Error(), refusal) {
 						t.Fatalf("a supported project was refused as %q: %v", refusal, err)
 					}

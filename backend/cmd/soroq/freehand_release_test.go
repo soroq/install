@@ -321,7 +321,7 @@ func TestFreehandFinalizeBuild_FailedBuildIsAtomic(t *testing.T) {
 	persistCalls, delegateCalls := 0, 0
 	origPersist, origDelegate := freehandPersistFn, freehandReleaseDelegate
 	defer func() { freehandPersistFn, freehandReleaseDelegate = origPersist, origDelegate }()
-	freehandPersistFn = func(projectDir, appDill, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest string) (string, error) {
+	freehandPersistFn = func(projectDir, appDill, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath string, _ *freehandObfuscationAuthorization, _ string) (string, error) {
 		persistCalls++
 		return "", errors.New("persist must never be called on a failed build")
 	}
@@ -331,7 +331,7 @@ func TestFreehandFinalizeBuild_FailedBuildIsAtomic(t *testing.T) {
 	}
 
 	err := freehandFinalizeBuild(nil, proj, filepath.Join(proj, "app.dill"),
-		errors.New("gen_snapshot/kernel build failed"), "analyzer-sha", t.TempDir(), "toolchain-x", "")
+		errors.New("gen_snapshot/kernel build failed"), "analyzer-sha", t.TempDir(), "toolchain-x", "", "", nil, "")
 	if err == nil {
 		t.Fatal("failed build must return a non-nil error")
 	}
@@ -360,7 +360,7 @@ func TestFreehandFinalizeBuild_SuccessInvokesDelegateOnce(t *testing.T) {
 	var gotArgs []string
 	origPersist, origDelegate := freehandPersistFn, freehandReleaseDelegate
 	defer func() { freehandPersistFn, freehandReleaseDelegate = origPersist, origDelegate }()
-	freehandPersistFn = func(projectDir, ad, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest string) (string, error) {
+	freehandPersistFn = func(projectDir, ad, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath string, _ *freehandObfuscationAuthorization, _ string) (string, error) {
 		return relDir, nil
 	}
 	freehandReleaseDelegate = func(verb string, args []string) error {
@@ -370,7 +370,7 @@ func TestFreehandFinalizeBuild_SuccessInvokesDelegateOnce(t *testing.T) {
 	}
 
 	if err := freehandFinalizeBuild([]string{"ios", "--engine", "--build"}, proj, appDill, nil,
-		"analyzer-sha", t.TempDir(), "toolchain-x", ""); err != nil {
+		"analyzer-sha", t.TempDir(), "toolchain-x", "", "", nil, ""); err != nil {
 		t.Fatalf("successful finalize must not error: %v", err)
 	}
 	if delegateCalls != 1 {
@@ -558,7 +558,7 @@ func TestPatchArtifact_ConcurrentIdenticalAndInterrupted(t *testing.T) {
 	planSHA := freehandSHA256Bytes(planBytes)
 	moduleSrcBytes := []byte("// m")
 	moduleBCBytes := []byte("BC")
-	aid := computeFreehandArtifactID(planSHA, bd, manifestSHA, descriptor.DescriptorDigest)
+	aid := computeFreehandArtifactID(planSHA, bd, manifestSHA, descriptor.DescriptorDigest, "")
 	write := func(d string, complete bool) {
 		os.MkdirAll(d, 0o700)
 		os.WriteFile(filepath.Join(d, "soroq_freehand_module.dart"), moduleSrcBytes, 0o600)
@@ -634,7 +634,7 @@ func TestFreehandFinalizeBuild_ForwardsAPIToDelegate(t *testing.T) {
 			}
 			origPersist, origDelegate := freehandPersistFn, freehandReleaseDelegate
 			defer func() { freehandPersistFn, freehandReleaseDelegate = origPersist, origDelegate }()
-			freehandPersistFn = func(string, string, string, string, string, string) (string, error) {
+			freehandPersistFn = func(string, string, string, string, string, string, string, *freehandObfuscationAuthorization, string) (string, error) {
 				return relDir, nil
 			}
 			var got []string
@@ -643,7 +643,7 @@ func TestFreehandFinalizeBuild_ForwardsAPIToDelegate(t *testing.T) {
 				return nil
 			}
 			if err := freehandFinalizeBuild(tc.head, proj, filepath.Join(proj, "app.dill"),
-				nil, "analyzer-sha", t.TempDir(), "toolchain-x", ""); err != nil {
+				nil, "analyzer-sha", t.TempDir(), "toolchain-x", "", "", nil, ""); err != nil {
 				t.Fatal(err)
 			}
 			v, ok := flagValue(got, "api")

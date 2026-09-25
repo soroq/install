@@ -208,6 +208,7 @@ func runRollbackConfigLane(platform string, args []string) error {
 	verifyClientID := fs.String("verify-client-id", "soroq-rollback-verify", "client id to use for rollback patch-check verification")
 	verifyCurrentPatchNumber := fs.Int("verify-current-patch-number", 0, "current patch number to report during rollback verification")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	flavorFlag := fs.String("flavor", "", "android only: the Flutter build flavor whose release to roll back; a flavor declared in soroq.yaml `flavors:` uses its own channel. Defaults to pubspec.yaml flutter.default-flavor.")
 	fs.Usage = func() {
 		// --runtime-id is listed because the engine lane's multiple-baseline refusal tells the operator
 		// to use it; a remedy named in an error has to be discoverable in the usage text too.
@@ -244,8 +245,28 @@ func runRollbackConfigLane(platform string, args []string) error {
 	if !flagWasSet(fs, "api") && lastRelease != nil && strings.TrimSpace(lastRelease.APIBase) != "" {
 		resolvedAPIBase = strings.TrimRight(lastRelease.APIBase, "/")
 	}
+	flavorName := ""
+	if platform == "android" {
+		rf, _, err := resolveCommandFlavor(status.ProjectDir, *flavorFlag, nil)
+		if err != nil {
+			return err
+		}
+		flavorName = rf.Name
+	} else if strings.TrimSpace(*flavorFlag) != "" {
+		return fmt.Errorf("--flavor is supported for `soroq rollback android` only")
+	}
+	flavorChannel, flavorChannelDeclared, err := resolveReleaseFlavorChannel(fs, status.ProjectDir, flavorName, *channelOverride)
+	if err != nil {
+		return err
+	}
 	channel := *channelOverride
-	if !flagWasSet(fs, "channel") && lastRelease != nil && strings.TrimSpace(lastRelease.Channel) != "" {
+	if flavorChannelDeclared {
+		channel = flavorChannel
+		// A recorded release on another flavor's channel is not this flavor's release.
+		if lastRelease != nil && strings.TrimSpace(lastRelease.Channel) != flavorChannel {
+			lastRelease = nil
+		}
+	} else if !flagWasSet(fs, "channel") && lastRelease != nil && strings.TrimSpace(lastRelease.Channel) != "" {
 		channel = lastRelease.Channel
 	}
 	projectConfig, err := resolveProjectCommandConfig(status, channel)
@@ -255,10 +276,17 @@ func runRollbackConfigLane(platform string, args []string) error {
 
 	resolvedReleaseID := strings.TrimSpace(*releaseID)
 	if resolvedReleaseID == "" {
-		if pin, ok := loadSoroqLockPin(status.ProjectDir, platform, ""); ok && strings.TrimSpace(pin.ReleaseID) != "" {
+		if fp, ok := loadSoroqLockFlavorPin(status.ProjectDir, platform, flavorName); ok && flavorChannelDeclared {
+			resolvedReleaseID = strings.TrimSpace(fp.ReleaseID)
+		} else if pin, ok := loadSoroqLockPin(status.ProjectDir, platform, ""); ok && strings.TrimSpace(pin.ReleaseID) != "" &&
+			(!flavorChannelDeclared || releaseRecordedAsFlavor(status.ProjectDir, platform, strings.TrimSpace(pin.ReleaseID), flavorName)) {
 			resolvedReleaseID = strings.TrimSpace(pin.ReleaseID)
 		} else if lastRelease != nil {
 			resolvedReleaseID = strings.TrimSpace(lastRelease.ReleaseID)
+		} else if flavorChannelDeclared {
+			if id, ok := latestRecordedFlavorRelease(status.ProjectDir, platform, flavorName); ok {
+				resolvedReleaseID = id
+			}
 		}
 	}
 	if resolvedReleaseID == "" {
@@ -377,6 +405,9 @@ func soleReleasedPlatform(projectDir string) (string, error) {
 	}
 	var released []string
 	for platform, pin := range lock.Platforms {
+		if isSoroqLockFlavorKey(platform) {
+			continue // a per-flavor pin, not a platform
+		}
 		if strings.TrimSpace(pin.ReleaseID) != "" {
 			released = append(released, platform)
 		}

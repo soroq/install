@@ -38,7 +38,21 @@ const (
 	freehandBaseIdentityAssetSchema = "soroq.base_identity_asset.v1"
 	// Mirrored by soroqBaseIdentityAssetName in packages/soroq_flutter/lib/src/base_identity.dart.
 	freehandBaseIdentityAssetName = "soroq_base_identity.json"
+	// freehandObfuscatedBaseIdentitySchema versions the OBFUSCATION block. It is a sidecar, deliberately
+	// outside the four-field rich identity and outside its digest: that digest is pinned by a vector on
+	// both sides, and the R5 identity and contract must stay byte-for-byte what they are.
+	freehandObfuscatedBaseIdentitySchema = "soroq.freehand.obfuscated_base_identity.v1"
 )
+
+// freehandObfuscatedBaseIdentity is the ONLY obfuscation fact the app carries: a digest, never a map.
+// It is what lets the device refuse a patch built against a different base's identifiers before it
+// downloads or stages anything.
+type freehandObfuscatedBaseIdentity struct {
+	Schema                  string `json:"schema"`
+	Obfuscated              bool   `json:"obfuscated"`
+	BaseObfuscationMapSHA25 string `json:"base_obfuscation_map_sha256"`
+	Capability              string `json:"capability"`
+}
 
 type freehandBaseIdentityAsset struct {
 	Schema          string `json:"schema"`
@@ -47,9 +61,11 @@ type freehandBaseIdentityAsset struct {
 	ContractDigest  string `json:"contract_digest"`
 	RetentionDigest string `json:"retention_digest"`
 	Digest          string `json:"digest"`
+	// Obfuscation is absent for every non-obfuscated base, so the asset an R5 app carries is unchanged.
+	Obfuscation *freehandObfuscatedBaseIdentity `json:"obfuscation,omitempty"`
 }
 
-func freehandBaseIdentityAssetBytes(id FreehandRichBaseIdentity) ([]byte, error) {
+func freehandBaseIdentityAssetBytes(id FreehandRichBaseIdentity, obf *FreehandObfuscationBinding) ([]byte, error) {
 	if id.Digest == "" {
 		return nil, fmt.Errorf("refusing to write an identity asset with no digest")
 	}
@@ -59,14 +75,25 @@ func freehandBaseIdentityAssetBytes(id FreehandRichBaseIdentity) ([]byte, error)
 	if id.Digest != want {
 		return nil, fmt.Errorf("identity digest does not recompute from its own fields")
 	}
-	b, err := json.MarshalIndent(freehandBaseIdentityAsset{
+	asset := freehandBaseIdentityAsset{
 		Schema:          freehandBaseIdentityAssetSchema,
 		RuntimeID:       id.RuntimeID,
 		BaseFingerprint: id.BaseFingerprint,
 		ContractDigest:  id.ContractDigest,
 		RetentionDigest: id.RetentionDigest,
 		Digest:          id.Digest,
-	}, "", "  ")
+	}
+	if obf.isEnabled() {
+		// ONLY the digest and the capability. The map names every private declaration in the app and
+		// must never be delivered.
+		asset.Obfuscation = &freehandObfuscatedBaseIdentity{
+			Schema:                  freehandObfuscatedBaseIdentitySchema,
+			Obfuscated:              true,
+			BaseObfuscationMapSHA25: obf.MapSHA256,
+			Capability:              obf.Capability,
+		}
+	}
+	b, err := json.MarshalIndent(asset, "", "  ")
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +101,7 @@ func freehandBaseIdentityAssetBytes(id FreehandRichBaseIdentity) ([]byte, error)
 }
 
 // findIOSAppBundles returns every `*.app` directory the iOS build produced under the project.
-func findIOSAppBundles(projectDir string) ([]string, error) {
+func findIOSAppBundles(projectDir, flavor string) ([]string, error) {
 	root := filepath.Join(projectDir, "build", "ios")
 	var out []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -85,7 +112,10 @@ func findIOSAppBundles(projectDir string) ([]string, error) {
 			return nil
 		}
 		if filepath.Ext(path) == ".app" {
-			out = append(out, path)
+			// A flavored build owns only its own bundles; another flavor's leftover is not stamped.
+			if iosBundleBelongsToFlavor(projectDir, path, flavor) {
+				out = append(out, path)
+			}
 			return filepath.SkipDir // never descend into a bundle: nested .app dirs are extensions
 		}
 		return nil
@@ -102,12 +132,12 @@ func findIOSAppBundles(projectDir string) ([]string, error) {
 // FAIL CLOSED: finding no bundle is an error. A release that printed success while delivering no
 // identity would produce an app that refuses every patch on device, and the operator would learn it
 // from a phone rather than from the command that was supposed to do it.
-func writeFreehandBaseIdentityAsset(projectDir string, id FreehandRichBaseIdentity) ([]string, error) {
-	payload, err := freehandBaseIdentityAssetBytes(id)
+func writeFreehandBaseIdentityAsset(projectDir string, id FreehandRichBaseIdentity, obf *FreehandObfuscationBinding, flavor string) ([]string, error) {
+	payload, err := freehandBaseIdentityAssetBytes(id, obf)
 	if err != nil {
 		return nil, err
 	}
-	bundles, err := findIOSAppBundles(projectDir)
+	bundles, err := findIOSAppBundles(projectDir, flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -146,5 +176,9 @@ func deliverFreehandBaseIdentity(projectDir, relDir string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return writeFreehandBaseIdentityAsset(projectDir, id)
+	flavor := ""
+	if meta.SourceKernelRecipe != nil {
+		flavor = meta.SourceKernelRecipe.Flavor // the flavor this baseline was built with
+	}
+	return writeFreehandBaseIdentityAsset(projectDir, id, meta.Obfuscation, flavor)
 }

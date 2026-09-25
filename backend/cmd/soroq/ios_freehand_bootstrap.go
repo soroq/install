@@ -282,7 +282,7 @@ func prepareFreehandZeroTouch(projectDir, pinnedKeyHex string, developerPassthro
 		return "", errors.New("pubspec.yaml is missing a top-level package name")
 	}
 
-	soroqBytes, err := os.ReadFile(filepath.Join(projectDir, "soroq.yaml"))
+	soroqBytes, err := readProjectSoroqYAML(projectDir)
 	if err != nil {
 		return "", fmt.Errorf("read soroq.yaml: %w", err)
 	}

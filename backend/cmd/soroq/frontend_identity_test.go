@@ -152,8 +152,76 @@ func TestFrontendTreeMissingItsRevisionMarkersIsRefused(t *testing.T) {
 	}
 }
 
-// PAIR BINDING is deliberately NOT retested here. This branch keeps the product CLI's own pair checks
-// rather than importing the r5 line's assertFrontendToolchainPair helper: the v1 path already refuses an
-// unbound pair (TestCatalogReferencePreflightRefusesUnboundPair) and the v2 path refuses a disagreeing
-// one inside validatePairIdentity (TestPublishV2RefusesDartRevisionMismatch). Adding a second helper
-// that no production path called would have been dead code carrying a test that proved nothing shipped.
+// --- PAIR BINDING -------------------------------------------------------------------------------
+
+func psToolchainManifest() cliManifest {
+	m := iosManifest(psFlutter, psDart, psEngine)
+	m.SoroqToolchainVersion = psToolchain
+	return m
+}
+
+func TestDeclaredPairIsAccepted(t *testing.T) {
+	if err := assertFrontendToolchainPair(frontendFor(psFlutter, psDart, psEngine, psToolchain), psToolchainManifest()); err != nil {
+		t.Fatalf("the declared, agreeing pair was refused: %v", err)
+	}
+}
+
+// The mismatch that cost a build: a 3.44.2 frontend against the 3.44.9 toolchain dies inside
+// kernel_snapshot_program with an empty app.dill. It must be refused before Flutter is invoked.
+func TestUndeclaredToolchainIsRefused(t *testing.T) {
+	fm := frontendFor(r2Flutter, r2Dart, r2Engine, "soroq-ios-3.44.2-release-f74781f6-production-r2")
+	err := assertFrontendToolchainPair(fm, psToolchainManifest())
+	if err == nil {
+		t.Fatal("a frontend that never declared this toolchain was accepted")
+	}
+	if !strings.Contains(err.Error(), psToolchain) {
+		t.Fatalf("the refusal does not name the toolchain it refused: %v", err)
+	}
+}
+
+// A STALE compatibility entry must not re-admit the mismatch: declared compatibility is necessary, and
+// agreement on what each was built from is also required.
+func TestStaleCompatibilityEntryStillRefusesADisagreeingPair(t *testing.T) {
+	for name, fm := range map[string]frontendManifest{
+		"flutter disagrees": frontendFor(r2Flutter, psDart, psEngine, psToolchain),
+		"dart disagrees":    frontendFor(psFlutter, r2Dart, psEngine, psToolchain),
+	} {
+		if err := assertFrontendToolchainPair(fm, psToolchainManifest()); err == nil {
+			t.Fatalf("%s: a declared-but-disagreeing pair was accepted", name)
+		}
+	}
+}
+
+// A toolchain manifest with no version identifies nothing, so no pair can be affirmed from it.
+func TestPairCheckRefusesAnUnidentifiedToolchain(t *testing.T) {
+	tm := psToolchainManifest()
+	tm.SoroqToolchainVersion = "  "
+	if err := assertFrontendToolchainPair(frontendFor(psFlutter, psDart, psEngine, psToolchain), tm); err == nil {
+		t.Fatal("a toolchain manifest carrying no version was accepted as a pair")
+	}
+}
+
+// The live 3.44.2 production iOS pair declares the same Dart in two forms (the frontend's version
+// string, the toolchain's commit). assertFrontendToolchainPair -- on the iOS build path since the Option A
+// line merged in -- must accept exactly that enumerated pair, as validatePairIdentity does, and nothing
+// that merely resembles it.
+func TestPairCheckAcceptsOnlyTheEnumeratedLegacyDartPair(t *testing.T) {
+	const legacyFrontend = "soroq-flutter-frontend-f74781f6-7277aaec-1a113cf9-clean-r5"
+	const legacyToolchain = "soroq-ios-3.44.2-production-f74781f6-3499c008-clean-r5"
+	fm := frontendFor(expectedFlutterRevision, "3.13.0-103.1.beta", "e", legacyToolchain)
+	fm.SoroqFrontendVersion = legacyFrontend
+	tm := iosManifest(expectedFlutterRevision, "9576691c37d84d3b66a9722e4fadacc764f04b21", "e")
+	tm.SoroqToolchainVersion = legacyToolchain
+	if err := assertFrontendToolchainPair(fm, tm); err != nil {
+		t.Fatalf("the enumerated legacy production pair was refused: %v", err)
+	}
+	tm.DartRevision = "d684a576a6aa954ae107a03b2b4e1d61c3bebe93"
+	if err := assertFrontendToolchainPair(fm, tm); err == nil {
+		t.Fatal("the legacy pair with a different toolchain Dart was accepted")
+	}
+	tm.DartRevision = "9576691c37d84d3b66a9722e4fadacc764f04b21"
+	fm.SoroqFrontendVersion = "soroq-flutter-frontend-some-other"
+	if err := assertFrontendToolchainPair(fm, tm); err == nil {
+		t.Fatal("a non-enumerated frontend declaring the legacy values was accepted")
+	}
+}

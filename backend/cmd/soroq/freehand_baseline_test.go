@@ -106,7 +106,7 @@ func seedFixture(t *testing.T) (proj, dill, srcDill, man, graph string) {
 
 func TestFreehandBaseline_PersistProvenanceAndPerms(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,11 +137,11 @@ func TestFreehandBaseline_PersistProvenanceAndPerms(t *testing.T) {
 
 func TestFreehandBaseline_IdempotentIdentical(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	d1, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	d1, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	d2, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	d2, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatalf("identical re-run must be idempotent: %v", err)
 	}
@@ -168,12 +168,12 @@ func TestFreehandBaseline_DiffersOnAnyImmutableInput(t *testing.T) {
 	for name, mut := range mutate {
 		t.Run(name, func(t *testing.T) {
 			proj, dill, srcDill, man, graph := seedFixture(t)
-			if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph()); err != nil {
+			if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), ""); err != nil {
 				t.Fatal(err)
 			}
 			m := fullMeta()
 			mut(&m)
-			if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph()); err == nil {
+			if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph(), ""); err == nil {
 				t.Fatalf("differing %s under same runtime-id must fail closed", name)
 			}
 		})
@@ -181,11 +181,11 @@ func TestFreehandBaseline_DiffersOnAnyImmutableInput(t *testing.T) {
 	// differing manifest content (hash) also fails
 	t.Run("manifest-content", func(t *testing.T) {
 		proj, dill, srcDill, man, graph := seedFixture(t)
-		if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph()); err != nil {
+		if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), ""); err != nil {
 			t.Fatal(err)
 		}
 		man2 := writeTmp(t, proj, "manifest2.txt", "pkg::Cls::DIFFERENT\n")
-		if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man2, graph, testDepGraph()); err == nil {
+		if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man2, graph, testDepGraph(), ""); err == nil {
 			t.Fatal("differing manifest content must fail closed")
 		}
 	})
@@ -193,11 +193,11 @@ func TestFreehandBaseline_DiffersOnAnyImmutableInput(t *testing.T) {
 
 func TestFreehandBaseline_OverwriteRefusedKeepsOriginal(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph()); err != nil {
+	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), ""); err != nil {
 		t.Fatal(err)
 	}
 	dillB := writeTmp(t, proj, "appB.dill", "KERNEL-BYTES-B-DIFFERENT")
-	if _, err := persistFreehandBaseline(proj, fullMeta(), dillB, srcDill, man, graph, testDepGraph()); err == nil {
+	if _, err := persistFreehandBaseline(proj, fullMeta(), dillB, srcDill, man, graph, testDepGraph(), ""); err == nil {
 		t.Fatal("differing app.dill must be refused")
 	}
 	got, _ := os.ReadFile(filepath.Join(freehandReleaseDir(proj, "rt-aaaa"), "app.dill"))
@@ -210,7 +210,7 @@ func TestFreehandBaseline_MismatchedKernelRefused(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
 	m := fullMeta()
 	m.AppDillSHA256 = "deadbeef"
-	if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph()); err == nil {
+	if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph(), ""); err == nil {
 		t.Fatal("mismatched-kernel must be refused")
 	}
 	if _, err := os.Stat(freehandReleaseDir(proj, "rt-aaaa")); err == nil {
@@ -241,12 +241,12 @@ func TestFreehandBaseline_CompleteValidationOfExisting(t *testing.T) {
 	for name, breakIt := range corrupt {
 		t.Run(name, func(t *testing.T) {
 			proj, dill, srcDill, man, graph := seedFixture(t)
-			relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+			relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 			if err != nil {
 				t.Fatal(err)
 			}
 			breakIt(relDir)
-			if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph()); err == nil {
+			if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), ""); err == nil {
 				t.Fatalf("%s: corrupt existing baseline must ERROR, not idempotent-succeed", name)
 			}
 		})
@@ -269,7 +269,7 @@ func TestFreehandBaseline_RuntimeIDPathSafety(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
 	m := fullMeta()
 	m.RuntimeID = "../../escape"
-	if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph()); err == nil {
+	if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph(), ""); err == nil {
 		t.Fatal("traversal runtime-id must be refused by persist")
 	}
 	if _, err := os.Stat(filepath.Join(proj, "escape")); err == nil {
@@ -287,7 +287,7 @@ func TestFreehandBaseline_FaultInjectionAtomicity(t *testing.T) {
 			// pre-existing DIFFERENT-runtime baseline that must remain untouched
 			pre := fullMeta()
 			pre.RuntimeID = "rt-preexisting"
-			if _, err := persistFreehandBaseline(proj, pre, dill, srcDill, man, graph, testDepGraph()); err != nil {
+			if _, err := persistFreehandBaseline(proj, pre, dill, srcDill, man, graph, testDepGraph(), ""); err != nil {
 				t.Fatal(err)
 			}
 			preDill, _ := os.ReadFile(filepath.Join(freehandReleaseDir(proj, "rt-preexisting"), "app.dill"))
@@ -300,7 +300,7 @@ func TestFreehandBaseline_FaultInjectionAtomicity(t *testing.T) {
 			}
 			defer func() { freehandFaultInjection = nil }()
 
-			if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph()); err == nil {
+			if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), ""); err == nil {
 				t.Fatalf("fault at %s must fail", stage)
 			}
 			// no visible final baseline for the faulted runtime-id
@@ -334,7 +334,7 @@ func TestFreehandBaseline_ConcurrentWritersSameContent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+			d, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 			mu.Lock()
 			if err != nil {
 				errs++
@@ -368,7 +368,7 @@ func TestFreehandBaseline_ConcurrentWritersDifferentContent(t *testing.T) {
 			defer wg.Done()
 			// each writer has a DIFFERENT app.dill but the SAME runtime-id
 			d := writeTmp(t, proj, "app.dill."+string(rune('a'+i)), "KERNEL-VARIANT-"+string(rune('a'+i)))
-			_, err := persistFreehandBaseline(proj, fullMeta(), d, srcDill, man, graph, testDepGraph())
+			_, err := persistFreehandBaseline(proj, fullMeta(), d, srcDill, man, graph, testDepGraph(), "")
 			mu.Lock()
 			if err == nil {
 				ok++
@@ -395,7 +395,7 @@ func TestFreehandBaseline_PatchableCountDerivedAndVerified(t *testing.T) {
 	graph := writeTmp(t, proj, "graph.json", "{}")
 	m := fullMeta()
 	m.PatchableCount = 0 // caller supplies zero -> MUST be derived from the manifest (3)
-	relDir, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +411,7 @@ func TestFreehandBaseline_PatchableCountDerivedAndVerified(t *testing.T) {
 	got.PatchableCount = 99
 	nb, _ := json.MarshalIndent(got, "", "  ")
 	os.WriteFile(filepath.Join(relDir, "baseline.json"), nb, 0o600)
-	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph()); err == nil {
+	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), ""); err == nil {
 		t.Fatal("tampered patchable_symbols count must be refused")
 	}
 }
@@ -422,7 +422,7 @@ func TestFreehandBaseline_EmptyManifestRefused(t *testing.T) {
 	srcDill := writeTmp(t, proj, "source_app.dill", "SOURCE-K")
 	man := writeTmp(t, proj, "manifest.txt", "\n   \n") // 0 entries
 	graph := writeTmp(t, proj, "graph.json", "{}")
-	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph()); err == nil {
+	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), ""); err == nil {
 		t.Fatal("zero patchable symbols must be refused (provenance requires >0)")
 	}
 }
@@ -448,7 +448,7 @@ func TestFreehandBaseline_ProvenanceRequiredOnWrite(t *testing.T) {
 			graph := writeTmp(t, proj, "graph.json", "{}")
 			m := fullMeta()
 			mut(&m)
-			if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph()); err == nil {
+			if _, err := persistFreehandBaseline(proj, m, dill, srcDill, man, graph, testDepGraph(), ""); err == nil {
 				t.Fatalf("missing %s provenance must be refused", name)
 			}
 		})
@@ -461,7 +461,7 @@ func TestFreehandBaseline_TamperedProvenanceRefusedOnReuse(t *testing.T) {
 	srcDill := writeTmp(t, proj, "source_app.dill", "SOURCE-K")
 	man := writeTmp(t, proj, "manifest.txt", "x::y::z\n")
 	graph := writeTmp(t, proj, "graph.json", "{}")
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +472,7 @@ func TestFreehandBaseline_TamperedProvenanceRefusedOnReuse(t *testing.T) {
 	got["framework_revision"] = ""
 	nb, _ := json.Marshal(got)
 	os.WriteFile(filepath.Join(relDir, "baseline.json"), nb, 0o600)
-	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph()); err == nil {
+	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), ""); err == nil {
 		t.Fatal("emptied provenance in an existing baseline must fail closed")
 	}
 }
@@ -480,7 +480,7 @@ func TestFreehandBaseline_TamperedProvenanceRefusedOnReuse(t *testing.T) {
 // v2 dual-kernel: source_app.dill is persisted, hash-verified, and part of the immutable input set.
 func TestFreehandBaseline_DualKernelPersistedAndImmutable(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +504,7 @@ func TestFreehandBaseline_DualKernelPersistedAndImmutable(t *testing.T) {
 	}
 	// a DIFFERENT source kernel under the same runtime-id must fail closed (immutable input)
 	srcDillB := writeTmp(t, proj, "source_appB.dill", "SOURCE-KERNEL-DIFFERENT")
-	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDillB, man, graph, testDepGraph()); err == nil {
+	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDillB, man, graph, testDepGraph(), ""); err == nil {
 		t.Fatal("differing source_app.dill under same runtime-id must be refused")
 	}
 }
@@ -512,7 +512,7 @@ func TestFreehandBaseline_DualKernelPersistedAndImmutable(t *testing.T) {
 // A v1 (pre-dual-kernel) baseline must be refused on reuse with a clear "create a new base release".
 func TestFreehandBaseline_V1WithoutSourceKernelRefused(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +539,7 @@ func TestFreehandBaseline_V1WithoutSourceKernelRefused(t *testing.T) {
 // A tampered source_app.dill (bytes changed after persistence) must fail existing-baseline verification.
 func TestFreehandBaseline_TamperedSourceKernelRefused(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +552,7 @@ func TestFreehandBaseline_TamperedSourceKernelRefused(t *testing.T) {
 // A tampered source_kernel_recipe (recipe field changed without updating the digest) must be refused.
 func TestFreehandBaseline_TamperedRecipeRefused(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +575,7 @@ func TestFreehandBaseline_TamperedRecipeRefused(t *testing.T) {
 func TestFreehandBaseline_PersistsAndBindsBaseDependencyGraph(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
 	want := testDepGraph()
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, want)
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, want, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +612,7 @@ func TestFreehandBaseline_RefusesInvalidBaseDependencyGraph(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
 	bad := testDepGraph()
 	bad.GraphDigest = strings.Repeat("0", 64) // digest does not match content
-	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, bad); err == nil {
+	if _, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, bad, ""); err == nil {
 		t.Fatal("a baseline must never be written with an invalid base dependency graph")
 	}
 }
@@ -623,7 +623,7 @@ func TestFreehandBaseline_TamperedDependencyGraphFileRefused(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			proj, dill, srcDill, man, graph := seedFixture(t)
-			relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+			relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -644,7 +644,7 @@ func TestFreehandBaseline_TamperedDependencyGraphFileRefused(t *testing.T) {
 // (here: a dangling runtime edge) is semantic, not a hash comparison.
 func TestFreehandBaseline_ReboundDependencyGraphTamperStillRefused(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -687,7 +687,7 @@ func TestFreehandBaseline_ReboundDependencyGraphTamperStillRefused(t *testing.T)
 
 func TestFreehandBaseline_PreDependencyOTABaselineGetsActionableMessage(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}

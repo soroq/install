@@ -20,7 +20,7 @@ func testIdentity(t *testing.T) FreehandRichBaseIdentity {
 // GREEN CONTROL. The asset must be exactly what the device re-derives, or every launch refuses.
 func TestBaseIdentityAssetRoundTrips(t *testing.T) {
 	id := testIdentity(t)
-	raw, err := freehandBaseIdentityAssetBytes(id)
+	raw, err := freehandBaseIdentityAssetBytes(id, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestBaseIdentityAssetRoundTrips(t *testing.T) {
 func TestBaseIdentityAssetRefusesInconsistentDigest(t *testing.T) {
 	id := testIdentity(t)
 	id.BaseFingerprint = "edited-after-the-digest-was-taken"
-	if _, err := freehandBaseIdentityAssetBytes(id); err == nil {
+	if _, err := freehandBaseIdentityAssetBytes(id, nil); err == nil {
 		t.Fatal("an inconsistent digest was written instead of refused")
 	}
 }
@@ -54,7 +54,7 @@ func TestBaseIdentityAssetRefusesInconsistentDigest(t *testing.T) {
 func TestBaseIdentityAssetRefusesEmptyDigest(t *testing.T) {
 	id := testIdentity(t)
 	id.Digest = ""
-	if _, err := freehandBaseIdentityAssetBytes(id); err == nil {
+	if _, err := freehandBaseIdentityAssetBytes(id, nil); err == nil {
 		t.Fatal("an identity with no digest was written")
 	}
 }
@@ -75,7 +75,7 @@ func TestBaseIdentityAssetWritesEveryBundle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	written, err := writeFreehandBaseIdentityAsset(proj, testIdentity(t))
+	written, err := writeFreehandBaseIdentityAsset(proj, testIdentity(t), nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestBaseIdentityAssetWritesEveryBundle(t *testing.T) {
 // and the operator finds out from a phone.
 func TestBaseIdentityAssetRefusesWhenThereIsNoBundle(t *testing.T) {
 	proj := t.TempDir()
-	_, err := writeFreehandBaseIdentityAsset(proj, testIdentity(t))
+	_, err := writeFreehandBaseIdentityAsset(proj, testIdentity(t), nil, "")
 	if err == nil {
 		t.Fatal("a release with no app bundle reported success")
 	}

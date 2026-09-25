@@ -71,6 +71,9 @@ func runRelease(args []string) error {
 		if err := validateCombinedPlatformFlags("release", platforms, rest); err != nil {
 			return err
 		}
+		if err := refuseFlavorOnUnsupportedPlatforms("release", platforms, rest); err != nil {
+			return err
+		}
 		return runPerPlatform("release", platforms, func(p string) error {
 			return releasePlatform(p, rest)
 		})
@@ -243,8 +246,9 @@ func runReleaseAndroid(args []string) error {
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	verbose := fs.Bool("verbose", false, "stream raw Flutter build output (default: phase timeline plus durable log)")
 	quiet := fs.Bool("quiet", false, "suppress build progress while preserving final command output")
+	flavorFlag := fs.String("flavor", "", "Flutter build flavor (passed to `flutter build --flavor`; recorded with the release so patches must use the same flavor). Defaults to pubspec.yaml flutter.default-flavor.")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stdout, `usage: soroq release android [--artifact build/app/outputs/bundle/release/app-release.aab] [--build=false] [--artifact-type aab|apk] [--toolchain <version>] [--project-dir .] [--api https://api.soroq.dev] [--release-id my-release] [--version 1.2.3+45] [--arch arm64-v8a] [--channel stable] [--manifest-key-id prod-primary] [--upload-artifact=true] [--json] [--verbose|--quiet] [-- <flutter build flags>]`)
+		fmt.Fprintln(os.Stdout, `usage: soroq release android [--artifact build/app/outputs/bundle/release/app-release.aab] [--build=false] [--artifact-type aab|apk] [--flavor <name>] [--toolchain <version>] [--project-dir .] [--api https://api.soroq.dev] [--release-id my-release] [--version 1.2.3+45] [--arch arm64-v8a] [--channel stable] [--manifest-key-id prod-primary] [--upload-artifact=true] [--json] [--verbose|--quiet] [-- <flutter build flags>]`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -258,13 +262,26 @@ func runReleaseAndroid(args []string) error {
 	configureCLIOutput(*verbose, *quiet, *jsonOut)
 	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
-	if err := guardUnverifiedBuildFlags(flutterBuildArgs); err != nil {
-		return err
+	// [soroq] Android obfuscation is decided below, once the toolchain is resolved: it is permitted
+	// only when that toolchain can seed a patch from this base's map (android_obfuscation_seed.go).
+	androidObfuscationRequested := len(detectObfuscationFlags(flutterBuildArgs)) > 0
+	if !androidObfuscationRequested {
+		if err := guardUnverifiedBuildFlags(flutterBuildArgs, nil); err != nil {
+			return err
+		}
 	}
-	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
+	flavor, flutterBuildArgs, err := resolveCommandFlavor(*projectDir, *flavorFlag, flutterBuildArgs)
+	if err != nil {
 		return err
 	}
 	if err := guardSupportedApplicationShape(*projectDir); err != nil {
+		return err
+	}
+	if err := recoverInterruptedFlavorChannelSwap(*projectDir); err != nil {
+		return err
+	}
+	flavorChannel, flavorChannelDeclared, err := resolveReleaseFlavorChannel(fs, *projectDir, flavor.Name, *channel)
+	if err != nil {
 		return err
 	}
 
@@ -278,6 +295,11 @@ func runReleaseAndroid(args []string) error {
 	resolvedArtifactPath := strings.TrimSpace(*artifactPath)
 	if len(flutterBuildArgs) > 0 && (resolvedArtifactPath != "" || !*buildBeforeDiscover) {
 		return errors.New("Flutter build passthrough args require automatic build; omit --artifact and keep --build=true")
+	}
+	if resolvedArtifactPath != "" {
+		if err := checkExplicitArtifactFlavor(resolvedArtifactPath, flavor.Name, "--artifact"); err != nil {
+			return err
+		}
 	}
 	// P3: when --toolchain is absent, default it from `soroq setup`'s active.json (the setup->release
 	// link — this is the first reader of active.json). If neither the flag nor active.json provides one,
@@ -296,6 +318,7 @@ func runReleaseAndroid(args []string) error {
 	// build and resolves no toolchain) it stays false, so NO soroq.lock pin is written for that release.
 	soroqBuilt := false
 	var soroqBuildStartedAt time.Time
+	var obfPlan *androidObfuscationPlan
 	if resolvedArtifactPath == "" && *buildBeforeDiscover {
 		if envErr := androidReleaseEnvGuardFn(resolvedToolchainVersion, flutterBuildArgs); envErr != nil {
 			return envErr
@@ -303,7 +326,11 @@ func runReleaseAndroid(args []string) error {
 		// Check the control plane BEFORE spending ten to fifteen minutes in Gradle. A duplicate
 		// release cannot be accepted no matter how long the build takes, and the two ways out
 		// (reuse it, or bump the version) are both cheaper to describe now than after the wait.
-		if preflightConfig, cfgErr := resolveProjectCommandConfig(status, channelOverrideForPreflight(fs, *channel)); cfgErr == nil {
+		preflightChannel := channelOverrideForPreflight(fs, *channel)
+		if flavorChannelDeclared {
+			preflightChannel = flavorChannel
+		}
+		if preflightConfig, cfgErr := resolveProjectCommandConfig(status, preflightChannel); cfgErr == nil {
 			preflightVersion := strings.TrimSpace(*version)
 			if preflightVersion == "" {
 				preflightVersion, _ = inferFlutterProjectVersion(filepath.Join(status.ProjectDir, "pubspec.yaml"))
@@ -329,6 +356,18 @@ func runReleaseAndroid(args []string) error {
 						return localReleaseSnapshotDigest(status.ProjectDir, id)
 					},
 				})
+			// The preflight matches on app+channel+version, which two flavors share. Only trust its
+			// verdict when the existing release is provably this flavor; otherwise build and let the
+			// post-build flavor guards decide with the real runtime id in hand.
+			if preflight.Existing != nil {
+				other, known, ferr := knownReleaseFlavor(status.ProjectDir, "android", preflight.Existing.ID)
+				if ferr != nil {
+					return ferr
+				}
+				if !((known && other == flavor.Name) || (!known && flavor.Name == "")) {
+					preflight.Verdict = releasePreflightUnknown
+				}
+			}
 			switch preflight.Verdict {
 			case releasePreflightConflict:
 				return releaseConflictError(preflight, status.ProjectDir)
@@ -338,15 +377,31 @@ func runReleaseAndroid(args []string) error {
 				return reportIdempotentRelease(preflight, status.ProjectDir, *jsonOut)
 			}
 		}
+		obfPlan, err = planAndroidReleaseObfuscation(status.ProjectDir, resolvedToolchainVersion, flutterBuildArgs)
+		if err != nil {
+			return err
+		}
+		defer obfPlan.cleanup()
+		buildArgs := append(append([]string{}, flutterBuildArgs...), obfPlan.ExtraArgs...)
 		soroqBuildStartedAt = time.Now()
-		if err := androidReleaseBuildFn(status.ProjectDir, *buildArtifactType, resolvedToolchainVersion, flutterBuildArgs); err != nil {
+		build := func() error {
+			return androidReleaseBuildFn(status.ProjectDir, *buildArtifactType, resolvedToolchainVersion, buildArgsWithFlavor(buildArgs, flavor.Name))
+		}
+		if flavorChannelDeclared {
+			if err := withFlavorChannel(status.ProjectDir, flavorChannel, build); err != nil {
+				return err
+			}
+		} else if err := build(); err != nil {
 			return err
 		}
 		soroqBuilt = true
 	}
 	if resolvedArtifactPath == "" {
-		resolvedArtifactPath, err = discoverDefaultAndroidArtifact(status.ProjectDir)
+		resolvedArtifactPath, err = discoverDefaultAndroidArtifactForFlavor(status.ProjectDir, flavor.Name)
 		if errors.Is(err, os.ErrNotExist) {
+			if flavor.Name != "" {
+				return fmt.Errorf("no Android release artifact found for %s in its Flutter output locations (build/app/outputs/flutter-apk/app-%s-release.apk, apk/%s/release/, bundle/%sRelease/); pass --artifact", describeFlavor(flavor.Name), strings.ToLower(flavor.Name), flavor.Name, flavor.Name)
+			}
 			return errors.New("no Android release artifact found; run `soroq release android` with a working Flutter toolchain or pass --artifact")
 		}
 		if err != nil {
@@ -363,7 +418,10 @@ func runReleaseAndroid(args []string) error {
 		return err
 	}
 	channelOverride := *channel
-	if !flagWasSet(fs, "channel") && strings.TrimSpace(snapshot.Metadata.Soroq.Channel) != "" {
+	if flavorChannelDeclared {
+		// The artifact must carry this flavor's channel; the mismatch check below proves the build used it.
+		channelOverride = flavorChannel
+	} else if !flagWasSet(fs, "channel") && strings.TrimSpace(snapshot.Metadata.Soroq.Channel) != "" {
 		channelOverride = snapshot.Metadata.Soroq.Channel
 	}
 	projectConfig, err := resolveProjectCommandConfig(status, channelOverride)
@@ -384,7 +442,7 @@ func runReleaseAndroid(args []string) error {
 	}
 	// The shipped trust anchor and runtime id must be the ones this project currently defines --
 	// Flutter's asset cache can otherwise carry a stale soroq_metadata.json into the artifact.
-	if err := verifyArtifactMetadataMatchesProject(status.ProjectDir, snapshot); err != nil {
+	if err := verifyArtifactMetadataMatchesProject(status.ProjectDir, snapshot, declaredChannel(flavorChannel, flavorChannelDeclared)); err != nil {
 		return err
 	}
 
@@ -398,7 +456,13 @@ func runReleaseAndroid(args []string) error {
 	}
 	resolvedReleaseID := strings.TrimSpace(*releaseID)
 	if resolvedReleaseID == "" {
-		resolvedReleaseID = defaultReleaseID(projectConfig.AppID, resolvedVersion, resolvedArch)
+		resolvedReleaseID = defaultAndroidReleaseID(projectConfig.AppID, resolvedVersion, resolvedArch, flavor.Name)
+	}
+	// Two flavors at one version share a runtime_id, and the control plane selects patches by
+	// runtime_id: refuse before registering anything the server could not keep apart.
+	if err := guardAndroidReleaseFlavorCollision(status.ProjectDir, *apiBase, projectConfig.AppID, resolvedReleaseID,
+		strings.TrimSpace(snapshot.Metadata.Soroq.RuntimeID), flavor.Name); err != nil {
+		return err
 	}
 	resolvedManifestKeyID := strings.TrimSpace(*manifestKeyID)
 	// Bundled manifest_trust keys are app/device verification keys. They are not
@@ -417,9 +481,22 @@ func runReleaseAndroid(args []string) error {
 		ManifestSigningKeyID: resolvedManifestKeyID,
 	}
 
+	// [soroq] Commit the base obfuscation map BEFORE registering: a registered obfuscated release
+	// without its map could never be patched without renaming what the running app persisted.
+	obfRecord, err := commitAndroidReleaseObfuscation(status.ProjectDir, resolvedReleaseID, resolvedToolchainVersion, obfPlan)
+	if err != nil {
+		return err
+	}
 	release, err := createRelease(*apiBase, req, projectConfig.AppID)
 	if err != nil {
 		return err
+	}
+	if obfRecord != nil && release.ID != resolvedReleaseID {
+		return fmt.Errorf("control plane registered release %q, not the requested %q; the obfuscation map was recorded under %q", release.ID, resolvedReleaseID, resolvedReleaseID)
+	}
+	if obfRecord != nil {
+		fmt.Fprintf(os.Stderr, "soroq: obfuscated base; map captured (%d entries, sha256 %s) under .soroq/releases/%s. Keep it: every patch for this release is seeded from it.\n",
+			obfRecord.MapEntries, obfRecord.MapSHA256[:12], resolvedReleaseID)
 	}
 	var releaseArtifact *domain.ReleaseArtifact
 	if *uploadArtifact {
@@ -429,7 +506,7 @@ func runReleaseAndroid(args []string) error {
 		}
 		releaseArtifact = &artifact
 	}
-	if err := rememberAndroidRelease(status.ProjectDir, *apiBase, snapshot, release); err != nil {
+	if err := rememberAndroidRelease(status.ProjectDir, *apiBase, snapshot, release, flavor.Name); err != nil {
 		return err
 	}
 	// P3: pin the toolchain that built this release into the committed project-root soroq.lock, but
@@ -441,9 +518,22 @@ func runReleaseAndroid(args []string) error {
 			Version:          release.Version,
 			ToolchainVersion: resolvedToolchainVersion,
 			FrontendVersion:  resolvedFrontendVersion,
+			Flavor:           flavor.Name,
 			RecordedAt:       time.Now().UTC(),
 		}); err != nil {
 			return err
+		}
+		if flavor.Name != "" {
+			if err := recordSoroqLockPin(status.ProjectDir, soroqLockFlavorKey("android", flavor.Name), soroqLockPin{
+				ReleaseID:        release.ID,
+				Version:          release.Version,
+				ToolchainVersion: resolvedToolchainVersion,
+				FrontendVersion:  resolvedFrontendVersion,
+				Flavor:           flavor.Name,
+				RecordedAt:       time.Now().UTC(),
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	releaseArtifactPath := projectReleaseArtifactPath(status.ProjectDir, release.ID, snapshot.Artifact.Path)
@@ -467,6 +557,9 @@ func runReleaseAndroid(args []string) error {
 	fmt.Fprintf(os.Stdout, "version: %s\n", release.Version)
 	fmt.Fprintf(os.Stdout, "channel: %s\n", release.Channel)
 	fmt.Fprintf(os.Stdout, "arch: %s\n", release.Arch)
+	if flavor.Name != "" {
+		fmt.Fprintf(os.Stdout, "flavor: %s (from %s)\n", flavor.Name, flavor.Source)
+	}
 	fmt.Fprintf(os.Stdout, "artifact: %s\n", snapshot.Artifact.Path)
 	fmt.Fprintf(os.Stdout, "release_artifact: %s\n", releaseArtifactPath)
 	if releaseArtifact != nil {
@@ -494,6 +587,7 @@ func runReleaseIOS(args []string) error {
 	verbose := fs.Bool("verbose", false, "stream raw Flutter build output (default: phase timeline plus durable log)")
 	quiet := fs.Bool("quiet", false, "suppress build progress while preserving final command output")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	flavorFlag := fs.String("flavor", "", "Flutter build flavor (Xcode scheme) for the --build app-build leg only")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stdout, `usage: soroq release ios [--project-dir .] [--api https://api.soroq.dev] [--release-id my-ios-release] [--version 1.2.3+45] [--runtime-id ios-config-runtime] [--arch arm64] [--channel stable] [--manifest-key-id prod-primary] [--build --toolchain <version>] [--verbose|--quiet] [--json] [-- <flutter build flags>]`)
 	}
@@ -509,11 +603,19 @@ func runReleaseIOS(args []string) error {
 	configureCLIOutput(*verbose, *quiet, *jsonOut)
 	defer resetCLIOutput()
 	flutterBuildArgs := fs.Args()
-	if err := guardUnverifiedBuildFlags(flutterBuildArgs); err != nil {
+	if err := guardUnverifiedBuildFlags(flutterBuildArgs, nil); err != nil {
 		return err
 	}
-	if err := guardFlavoredBuild(flutterBuildArgs); err != nil {
+	flavor, flutterBuildArgs, err := resolveCommandFlavor(*projectDir, *flavorFlag, flutterBuildArgs)
+	if err != nil {
 		return err
+	}
+	if !*build {
+		// The config baseline builds nothing and its runtime id does not depend on the flavor.
+		if err := guardUnsupportedFlavorRoute("`soroq release ios` (config baseline)",
+			"The config baseline builds nothing, and its runtime id is derived from the app id and channel only,\nso a flavor here would be a label with no effect on what devices receive.", flavor.Name); err != nil {
+			return err
+		}
 	}
 	if err := guardSupportedIOSApplicationShape(*projectDir); err != nil {
 		return err
@@ -528,7 +630,10 @@ func runReleaseIOS(args []string) error {
 	// emit app.dill for the ios-engine patch lane. Decoupled from the config-lane control-plane
 	// registration below so a fresh dev can produce app.dill without a control-plane round-trip.
 	if *build {
-		return iosReleaseBuildFn(status.ProjectDir, strings.TrimSpace(*toolchainVersion), flutterBuildArgs)
+		// Flutter maps the flavor to the Xcode scheme of the same name (and the <Mode>-<flavor> build
+		// configuration), and copies the product to build/ios/iphoneos/, where locateBuiltIOSApp looks.
+		// This leg registers nothing, so there is no baseline to record the flavor in.
+		return iosReleaseBuildFn(status.ProjectDir, strings.TrimSpace(*toolchainVersion), buildArgsWithFlavor(flutterBuildArgs, flavor.Name))
 	}
 	if len(flutterBuildArgs) > 0 {
 		return errors.New("release ios does not build or upload an IPA without --build; remove passthrough build arguments or pass --build --toolchain <version>")
@@ -776,7 +881,7 @@ func preferredAndroidABI(abis []string) string {
 	return abis[0]
 }
 
-func rememberAndroidRelease(projectDir string, apiBase string, snapshot *androidrelease.Snapshot, release domain.Release) error {
+func rememberAndroidRelease(projectDir string, apiBase string, snapshot *androidrelease.Snapshot, release domain.Release, flavor string) error {
 	state, err := loadProjectCLIState(projectDir)
 	if err != nil {
 		return err
@@ -796,6 +901,17 @@ func rememberAndroidRelease(projectDir string, apiBase string, snapshot *android
 		Arch:                 release.Arch,
 		ArtifactPath:         stashedArtifactPath,
 		ManifestSigningKeyID: strings.TrimSpace(release.ManifestSigningKeyID),
+		Flavor:               &flavor,
+	}
+	// The per-release record is what later proves this release's flavor to `soroq patch`, including
+	// after cli-state.json has moved on to a newer release.
+	if err := writeReleaseFlavorRecord(projectDir, releaseFlavorRecord{
+		Platform:  "android",
+		ReleaseID: release.ID,
+		RuntimeID: release.RuntimeID,
+		Flavor:    flavor,
+	}); err != nil {
+		return err
 	}
 	return saveProjectCLIState(projectDir, state)
 }

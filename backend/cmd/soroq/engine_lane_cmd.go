@@ -179,12 +179,21 @@ func runReleaseIOSEngineBuild(args []string) error {
 	// any of those would refuse a shape only after having already changed the developer's project.
 	//
 	// Both branches below (freehand and scaffolded) are covered because this precedes the split.
-	if err := guardUnverifiedBuildFlags(passthrough); err != nil {
+	// Obfuscation authorization comes from the TOOLCHAIN THAT WILL BUILD, resolved from its engine
+	// bundle's own capability declaration -- never from the command line. An unresolvable toolchain
+	// yields no authorization, and the guard then refuses exactly as it did before R6.
+	obfAuth, err := authorizeObfuscationForToolchain(toolchain)
+	if err != nil {
 		return err
 	}
-	if err := guardFlavoredBuild(passthrough); err != nil {
+	if err := guardUnverifiedBuildFlags(passthrough, obfAuth); err != nil {
 		return err
 	}
+	iosFlavor, err := resolveIOSEngineFlavorRoute("the iOS engine release lane", projectDir, head, passthrough)
+	if err != nil {
+		return err
+	}
+	head, passthrough = iosFlavor.head, iosFlavor.passthrough
 	if err := guardSupportedIOSApplicationShape(projectDir); err != nil {
 		return err
 	}
@@ -198,7 +207,9 @@ func runReleaseIOSEngineBuild(args []string) error {
 	if freehand, ferr := isFreehandIOSBuild(projectDir); ferr != nil {
 		return ferr
 	} else if freehand {
-		return engineLaneFreehandFn(head, passthrough, projectDir, toolchain)
+		return runWithFlavorChannel(projectDir, iosFlavor.channel, func() error {
+			return engineLaneFreehandFn(head, passthrough, projectDir, toolchain)
+		})
 	}
 	// Self-heal a missing manifest_trust before scaffolding/building so a fresh iOS engine-lane build
 	// never fails with the fork's `Expected soroq.yaml to define "manifest_trust"`. Idempotent: a valid
@@ -275,12 +286,14 @@ func runPatchIOSEngineScaffolded(args []string) error {
 	// This precedes requireIOSEngineEnabled (which reads project config), prepareSoroqBuildResolution
 	// (which writes) and the freehand/scaffolded split, so both branches are covered and a refusal
 	// costs the project nothing.
-	if err := guardUnverifiedBuildFlags(passthrough); err != nil {
+	if err := guardUnverifiedBuildFlags(passthrough, nil); err != nil {
 		return err
 	}
-	if err := guardFlavoredBuild(passthrough); err != nil {
+	iosFlavor, err := resolveIOSEngineFlavorRoute("the iOS engine patch lane", projectDir, head, passthrough)
+	if err != nil {
 		return err
 	}
+	head, passthrough = iosFlavor.head, iosFlavor.passthrough
 	if err := guardSupportedIOSApplicationShape(projectDir); err != nil {
 		return err
 	}
@@ -307,7 +320,9 @@ func runPatchIOSEngineScaffolded(args []string) error {
 	if freehand, ferr := isFreehandIOSBuild(projectDir); ferr != nil {
 		return ferr
 	} else if freehand {
-		return engineLanePatchFreehandFn(head, passthrough, projectDir)
+		return runWithFlavorChannel(projectDir, iosFlavor.channel, func() error {
+			return engineLanePatchFreehandFn(head, passthrough, projectDir)
+		})
 	}
 	manifestPath, err := engineLaneGenerateScaffoldFn(projectDir)
 	if err != nil {

@@ -215,9 +215,16 @@ func runToolchainDoctor(args []string) error {
 	return nil
 }
 
+// toolchainTrustDomainCheck reports what actually establishes trust: the pinned key.
+//
+// It used to say the CLI was "wired for" the reference revisions, which was true when identity was pinned
+// to a compile-time constant and became a false claim the moment it stopped being. An operator reading
+// "wired for ios(flutter=f74781f62134)" next to a correctly installed 6b182d2c toolchain would reasonably
+// conclude the install was wrong. The revisions are still shown, named as what they are.
 func toolchainTrustDomainCheck() doctorCheck {
 	return doctorCheck{Name: "Toolchain trust domain", Status: "ok",
-		Message: fmt.Sprintf("pinned key %s; wired for ios(flutter=%s dart=%s) + android-candidate(flutter=%s dart=%s)",
+		Message: fmt.Sprintf("pinned key %s authorises any correctly signed toolchain; reference revisions "+
+			"ios(flutter=%s dart=%s) + android-candidate(flutter=%s dart=%s)",
 			toolchainPinnedKeyID,
 			short(expectedFlutterRevision), short(expectedDartRevision),
 			short(expectedAndroidFlutterRevision), expectedAndroidDartRevision)}

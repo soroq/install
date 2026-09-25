@@ -14,8 +14,20 @@ func runToolchainPublish(args []string) error {
 	return errors.New("`soroq toolchain publish` is an operator-only command and is not built into the public CLI")
 }
 
+func runToolchainStageArchive(args []string) error {
+	return errors.New("`soroq toolchain stage-archive` is an operator-only command and is not built into the public CLI")
+}
+
 func runFrontendPublish(args []string) error {
 	return errors.New("`soroq frontend publish` is an operator-only command and is not built into the public CLI")
+}
+
+func runFrontendStageArchive(args []string) error {
+	return errors.New("`soroq frontend stage-archive` is an operator-only command and is not built into the public CLI")
+}
+
+func runFrontendAdoptArchive(args []string) error {
+	return errors.New("`soroq frontend adopt-archive` is an operator-only command and is not built into the public CLI")
 }
 
 func runCatalogPublish(args []string) error {

@@ -37,6 +37,9 @@ type androidReleaseState struct {
 	Arch                 string    `json:"arch"`
 	ArtifactPath         string    `json:"artifact_path"`
 	ManifestSigningKeyID string    `json:"manifest_signing_key_id,omitempty"`
+	// Flavor is the Flutter build flavor of this release. nil = not recorded (a state written before
+	// flavor support); a pointer to "" = recorded as unflavored.
+	Flavor *string `json:"flavor,omitempty"`
 }
 
 type iosReleaseState struct {
@@ -913,7 +916,13 @@ func discoverDefaultAndroidArtifact(projectDir string) (string, error) {
 }
 
 func discoverCompatibleCandidateArtifact(projectDir string, baseSnapshot *androidrelease.Snapshot) (string, error) {
-	artifacts, err := discoverAndroidArtifacts(projectDir)
+	return discoverCompatibleCandidateArtifactForFlavor(projectDir, baseSnapshot, "")
+}
+
+// discoverCompatibleCandidateArtifactForFlavor is discoverCompatibleCandidateArtifact restricted to one
+// flavor's output locations ("" = the unflavored locations, unchanged).
+func discoverCompatibleCandidateArtifactForFlavor(projectDir string, baseSnapshot *androidrelease.Snapshot, flavor string) (string, error) {
+	artifacts, err := discoverAndroidArtifactsForFlavor(projectDir, flavor)
 	if err != nil {
 		return "", err
 	}
@@ -935,7 +944,11 @@ func discoverCompatibleCandidateArtifact(projectDir string, baseSnapshot *androi
 }
 
 func discoverSamePathCandidateArtifactAfterBuild(projectDir string, baseSnapshot *androidrelease.Snapshot) (string, error) {
-	artifactPath, err := discoverDefaultAndroidArtifact(projectDir)
+	return discoverSamePathCandidateArtifactAfterBuildForFlavor(projectDir, baseSnapshot, "")
+}
+
+func discoverSamePathCandidateArtifactAfterBuildForFlavor(projectDir string, baseSnapshot *androidrelease.Snapshot, flavor string) (string, error) {
+	artifactPath, err := discoverDefaultAndroidArtifactForFlavor(projectDir, flavor)
 	if err != nil {
 		return "", err
 	}

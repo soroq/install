@@ -35,19 +35,21 @@ func TestIOSReleaseTakesIdentityFromExplicitFlagsNotDiscovery(t *testing.T) {
 	}
 }
 
-// A flavored iOS build must be refused by the same guard as Android, on the iOS path.
-func TestIOSFlavoredBuildIsRefused(t *testing.T) {
-	if err := guardFlavoredBuild([]string{"--flavor", "prod"}); err == nil {
-		t.Fatal("a flavored build must be refused on the iOS path too")
+// A flavor on the iOS config-baseline route (no --build) is refused: it builds nothing and its runtime
+// id ignores the flavor. A dart-define that merely NAMES a flavor is not a flavored build.
+func TestIOSConfigBaselineFlavorIsRefused(t *testing.T) {
+	if err := guardUnsupportedFlavorRoute("release ios", "why", "prod"); err == nil {
+		t.Fatal("a flavor on an unsupported iOS route must be refused")
 	}
-	if err := guardFlavoredBuild([]string{"--dart-define=FLAVOR=prod"}); err != nil {
-		t.Fatalf("a dart-define naming a flavor is not a flavored build: %v", err)
+	rf, _, err := resolveCommandFlavor(t.TempDir(), "", []string{"--dart-define=FLAVOR=prod"})
+	if err != nil || rf.Name != "" {
+		t.Fatalf("a dart-define naming a flavor is not a flavored build: %+v %v", rf, err)
 	}
 }
 
 // Obfuscated and add-to-app shapes must be refused before an iOS release registers.
 func TestIOSUnsupportedShapesAreRefused(t *testing.T) {
-	if err := guardUnverifiedBuildFlags([]string{"--obfuscate"}); err == nil {
+	if err := guardUnverifiedBuildFlags([]string{"--obfuscate"}, nil); err == nil {
 		t.Error("an obfuscated iOS build must be refused")
 	}
 	dir := t.TempDir()
@@ -61,8 +63,8 @@ func TestIOSUnsupportedShapesAreRefused(t *testing.T) {
 func TestIOSReleasePathWiresEveryShapeGuard(t *testing.T) {
 	src := iosReleaseSourceForTest(t)
 	for _, want := range []string{
-		"guardUnverifiedBuildFlags(flutterBuildArgs)",
-		"guardFlavoredBuild(flutterBuildArgs)",
+		"guardUnverifiedBuildFlags(flutterBuildArgs,",
+		"resolveCommandFlavor(*projectDir, *flavorFlag, flutterBuildArgs)",
 		// The iOS routes take the iOS-SPECIFIC variant: it adds the ios/Runner host inspection on top
 		// of the platform-neutral add-to-app rule. The neutral one would silently drop the host check.
 		"guardSupportedIOSApplicationShape(*projectDir)",
@@ -76,7 +78,7 @@ func TestIOSReleasePathWiresEveryShapeGuard(t *testing.T) {
 	// ordering is additionally MEASURED in ios_release_command_refusal_test.go rather than only read
 	// off the source here.
 	buildIdx := strings.Index(src, "iosReleaseBuildFn(")
-	for _, guard := range []string{"guardUnverifiedBuildFlags", "guardFlavoredBuild", "guardSupportedIOSApplicationShape"} {
+	for _, guard := range []string{"guardUnverifiedBuildFlags", "resolveCommandFlavor", "guardUnsupportedFlavorRoute", "guardSupportedIOSApplicationShape"} {
 		if idx := strings.Index(src, guard); idx < 0 || idx > buildIdx {
 			t.Errorf("%s must run before the iOS build starts", guard)
 		}

@@ -37,7 +37,7 @@ func TestVerifyArtifactMetadataAcceptsMatchingBuild(t *testing.T) {
 	want := expectedMetadataFor(t, dir)
 	snapshot := &androidrelease.Snapshot{Metadata: want}
 	snapshot.Artifact.Path = "/tmp/app-release.aab"
-	if err := verifyArtifactMetadataMatchesProject(dir, snapshot); err != nil {
+	if err := verifyArtifactMetadataMatchesProject(dir, snapshot, ""); err != nil {
 		t.Fatalf("an artifact built from the current project must verify: %v", err)
 	}
 }
@@ -49,7 +49,7 @@ func TestVerifyArtifactMetadataRejectsStaleRuntimeID(t *testing.T) {
 	snapshot := &androidrelease.Snapshot{Metadata: stale}
 	snapshot.Artifact.Path = "/tmp/app-release.aab"
 
-	err := verifyArtifactMetadataMatchesProject(dir, snapshot)
+	err := verifyArtifactMetadataMatchesProject(dir, snapshot, "")
 	if err == nil {
 		t.Fatal("a stale embedded runtime_id must block registration, not ship silently")
 	}
@@ -71,7 +71,7 @@ func TestVerifyArtifactMetadataRejectsStaleTrustFingerprint(t *testing.T) {
 	snapshot := &androidrelease.Snapshot{Metadata: stale}
 	snapshot.Artifact.Path = "/tmp/app-release.aab"
 
-	err := verifyArtifactMetadataMatchesProject(dir, snapshot)
+	err := verifyArtifactMetadataMatchesProject(dir, snapshot, "")
 	if err == nil {
 		t.Fatal("an artifact carrying a different trust anchor than the project must be refused")
 	}

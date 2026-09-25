@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,6 +85,10 @@ type FreehandPatchPlan struct {
 	relDir              string                     `json:"-"`
 	inputDigest         string                     `json:"-"`
 	capabilityMapPath   string                     `json:"-"`
+	// obfuscation is the VERIFIED baseline's own binding, carried here so every downstream step reads
+	// obfuscation state from the base rather than from this command's arguments. Nil for a base that
+	// was not obfuscated, which is every base built before R6.
+	obfuscation *FreehandObfuscationBinding `json:"-"`
 }
 
 // cleanup removes the plan's transient artifacts (candidate kernel + diff dir).
@@ -220,8 +225,8 @@ func runFreehandAnalyzerDiff(flutterRoot, baselineSourceDill, candidateSourceDil
 // computeFreehandPatchPlan loads+verifies the v2 baseline, compiles the candidate source kernel via the
 // recorded recipe, diffs, and returns a fully-bound plan. Fails closed on incompatible/tampered baseline
 // or any unsupported change. Produces NOTHING persistent (the caller decides on module-gen/registration).
-func computeFreehandPatchPlan(projectDir, flutterRoot string) (*FreehandPatchPlan, error) {
-	soroqConfig, err := os.ReadFile(filepath.Join(projectDir, "soroq.yaml"))
+func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string) (*FreehandPatchPlan, error) {
+	soroqConfig, err := readProjectSoroqYAML(projectDir)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +304,7 @@ func computeFreehandPatchPlan(projectDir, flutterRoot string) (*FreehandPatchPla
 	// the recipe's tool/config inputs still match; a drift (e.g. a different frontend/platform/pkgconfig)
 	// means the candidate would be compiled differently than the base — refuse.
 	recipe := *base.SourceKernelRecipe
-	if err := assertRecipeReproducible(projectDir, flutterRoot, recipe); err != nil {
+	if err := assertRecipeReproducible(projectDir, flutterRoot, recipe, flavor); err != nil {
 		return nil, fmt.Errorf("candidate source-kernel recipe is not reproducible against this baseline: %w", err)
 	}
 	candKernel, err := os.CreateTemp("", "soroq-cand-source-*.dill")
@@ -358,12 +363,45 @@ func computeFreehandPatchPlan(projectDir, flutterRoot string) (*FreehandPatchPla
 	// Publishing such a batch produced a patch that fetched, verified, staged and loaded on device and
 	// then committed zero redirects. Refusing here costs a developer one message instead of a silent
 	// no-op rollout.
-	if blocked := freehandPrivateIdentities(rep.ChangedPatchable); len(blocked) > 0 {
-		return nil, fmt.Errorf("freehand patch refused — %d changed declaration(s) are library-private, "+
+	privateClassIDs, privateMemberIDs := freehandPrivateIdentitySplit(rep.ChangedPatchable)
+
+	// A private MEMBER is refused whatever the base's engine can do: its own name carries the VM's
+	// mangling suffix, no capability in this tranche canonicalizes it, and enabling it would widen the
+	// patchable surface far past the shape that was measured.
+	if len(privateMemberIDs) > 0 {
+		return nil, fmt.Errorf("freehand patch refused — %d changed declaration(s) are library-private MEMBERS, "+
 			"and gen_snapshot compares mangled private names against an unmangled manifest, so the base "+
 			"can never have marked them patchable and the whole batch would commit zero redirects:\n  - %s\n"+
-			"Make the declaration or its enclosing class public, or keep it out of the patch.",
-			len(blocked), joinLines(blocked))
+			"Make the member public, or keep it out of the patch. (A private enclosing CLASS with a public "+
+			"member is a different case and is allowed on a base whose engine declares %s.)",
+			len(privateMemberIDs), joinLines(privateMemberIDs), freehandPrivateEnclosingClassCapability)
+	}
+
+	// A private ENCLOSING CLASS with a public member is the idiomatic Flutter shape
+	// (`class _HomePageState extends State<HomePage> { Widget build(...) }`). It is matchable only by an
+	// engine that canonicalizes the class name before comparing it to the manifest, so the answer comes
+	// from the base's recorded capability rather than from a rule here. A base built by an older
+	// toolchain declares nothing and keeps refusing, which is the behaviour that was shipping.
+	if len(privateClassIDs) > 0 {
+		caps, capErr := baseRedirectCapabilities(base)
+		if capErr != nil {
+			return nil, fmt.Errorf("freehand patch refused — %d changed declaration(s) have a library-private "+
+				"enclosing class, and this base's engine capabilities could not be read, so whether its "+
+				"gen_snapshot canonicalizes private class names is unknown:\n  - %s\n  %w",
+				len(privateClassIDs), joinLines(privateClassIDs), capErr)
+		}
+		if !caps.hasIdentityCapability(freehandPrivateEnclosingClassCapability) {
+			return nil, fmt.Errorf("freehand patch refused — %d changed declaration(s) have a library-private "+
+				"enclosing class, and this base's engine does not declare %s, so gen_snapshot compared a "+
+				"mangled name (`_HomePageState@<library-key>::build`) against an unmangled manifest, never "+
+				"marked them patchable, and the whole batch would commit zero redirects:\n  - %s\n"+
+				"  base engine %s declares identity capabilities: [%s] (source: %s)\n"+
+				"Make the enclosing class public, keep it out of the patch, or release a new base built on a "+
+				"toolchain that declares %s.",
+				len(privateClassIDs), freehandPrivateEnclosingClassCapability, joinLines(privateClassIDs),
+				caps.EngineRevision, strings.Join(caps.IdentityCapabilities, ", "), caps.Source,
+				freehandPrivateEnclosingClassCapability)
+		}
 	}
 
 	// CAPABILITY GATE — the diff has produced changed-patchable declarations, and nothing has been
@@ -420,6 +458,7 @@ func computeFreehandPatchPlan(projectDir, flutterRoot string) (*FreehandPatchPla
 		diffJSONPath:               filepath.Join(diffOut, "freehand_diff.json"),
 		recipe:                     recipe,
 		relDir:                     relDir,
+		obfuscation:                base.Obfuscation,
 		inputDigest:                inputDigest,
 		capabilityMapPath:          capMapPath,
 	}, nil
@@ -432,8 +471,14 @@ var errFreehandNoOp = fmt.Errorf("no patchable change detected between the base 
 // digest matches the baseline recipe — i.e. the candidate would be compiled with the same frontend,
 // platform, package_config, defines, and experiments. A mismatch (changed compile option / package
 // config / defines / frontend) is refused BEFORE compiling the candidate.
-func assertRecipeReproducible(projectDir, flutterRoot string, want FreehandSourceKernelRecipe) error {
-	got, err := buildFreehandSourceKernelRecipe(projectDir, flutterRoot)
+func assertRecipeReproducible(projectDir, flutterRoot string, want FreehandSourceKernelRecipe, flavor string) error {
+	// Said plainly before the digest comparison, which would refuse it anyway: a patch is compiled for
+	// its base's flavor (FLUTTER_APP_FLAVOR is part of the compiled Dart).
+	if want.Flavor != flavor {
+		return fmt.Errorf("this base was built as %s, the patch as %s: build the patch with the base's flavor (FLUTTER_APP_FLAVOR is compiled into the Dart)",
+			describeFlavor(want.Flavor), describeFlavor(flavor))
+	}
+	got, err := buildFreehandSourceKernelRecipe(projectDir, flutterRoot, flavor)
 	if err != nil {
 		return err
 	}
@@ -562,6 +607,17 @@ type FreehandPatchArtifactMeta struct {
 	DependencyDescriptorDigest string `json:"dependency_descriptor_digest"`
 	DependencyDescriptorSHA256 string `json:"dependency_descriptor_sha256"`
 	BaseDependencyGraphDigest  string `json:"base_dependency_graph_digest"`
+	// Obfuscation / TranslationReceiptSHA256 / ObfuscationBindingDigest are the R6 obfuscated-base
+	// binding. All three are absent (nil / "") for a base that was not obfuscated, which keeps every
+	// pre-R6 artifact byte-identical. ObfuscationBindingDigest is what the artifact id binds and what
+	// the signed device manifest carries, so a patch cannot be paired with a base map or a receipt
+	// other than the ones it was compiled against.
+	Obfuscation              *FreehandObfuscationBinding `json:"obfuscation,omitempty"`
+	TranslationReceiptSHA256 string                      `json:"translation_receipt_sha256,omitempty"`
+	ObfuscationBindingDigest string                      `json:"obfuscation_binding_digest,omitempty"`
+	// TranslatedABI is the runtime projection the device manifest carries. Absent for a base that was
+	// not obfuscated, in which case the device keeps reading the source-level fields exactly as before.
+	TranslatedABI []FreehandTranslatedABIEntry `json:"translated_abi,omitempty"`
 }
 
 // freehandDependencyDescriptorFile is the verbatim descriptor persisted inside every patch artifact.
@@ -605,8 +661,34 @@ func bindDependencyDigestIntoManifest(manifestBytes []byte, digest string) ([]by
 // computeFreehandArtifactID derives the immutable artifact identity from every component that changes
 // what the artifact IS: the plan, the exact toolchain, the durable replacement ABI, and the dependency
 // delta. It is recomputed from re-derived inputs on every verification — nothing stored is trusted.
-func computeFreehandArtifactID(planSHA, bindingDigest, manifestSHA, dependencyDigest string) string {
-	return freehandSHA256Bytes([]byte(planSHA + "|" + bindingDigest + "|" + manifestSHA + "|" + dependencyDigest))
+// computeFreehandArtifactID binds everything that makes one artifact different from another.
+//
+// obfuscationDigest is EMPTY for a base that was not obfuscated, and the concatenation then ends in
+// the same trailing "|" it always did -- so every artifact id produced before R6 is byte-for-byte what
+// it was, and the non-obfuscated lane is unaffected. A different base map, or a different receipt,
+// yields a distinct immutable artifact.
+func computeFreehandArtifactID(planSHA, bindingDigest, manifestSHA, dependencyDigest, obfuscationDigest string) string {
+	joined := planSHA + "|" + bindingDigest + "|" + manifestSHA + "|" + dependencyDigest
+	if obfuscationDigest != "" {
+		joined += "|" + obfuscationDigest
+	}
+	return freehandSHA256Bytes([]byte(joined))
+}
+
+// freehandObfuscationArtifactDigest is the single value the artifact id binds for an obfuscated base:
+// the recorded binding and the exact receipt bytes together. Empty when the base is not obfuscated.
+func freehandObfuscationArtifactDigest(b *FreehandObfuscationBinding, receiptSHA string) (string, error) {
+	if !b.isEnabled() {
+		return "", nil
+	}
+	bindingDigest, err := b.digest()
+	if err != nil {
+		return "", err
+	}
+	if receiptSHA == "" {
+		return "", errors.New("an obfuscated base requires a translation receipt digest to bind")
+	}
+	return freehandSHA256Bytes([]byte(bindingDigest + "|" + receiptSHA)), nil
 }
 
 // revalidateDependencyDescriptor re-resolves the candidate runtime dependency graph from disk and
@@ -1119,6 +1201,31 @@ var artifactFiles = []string{
 	freehandDependencyDescriptorFile,
 }
 
+// obfuscatedArtifactFiles is artifactFiles plus the translation receipt. An obfuscated artifact that
+// records a receipt digest but does not CARRY the receipt cannot be verified: the digest would be a
+// claim about a file nobody has, and TranslatedABI could never be re-derived.
+func obfuscatedArtifactFiles() []string {
+	out := make([]string, 0, len(artifactFiles)+1)
+	out = append(out, artifactFiles...)
+	return append(out, freehandTranslationReceiptFile)
+}
+
+// decodeStrictJSONWithEOF decodes one JSON document with unknown fields refused AND an actual
+// end-of-input check. json.Decoder.More() is not that check: it reports whether another VALUE
+// follows, so `{...}` with trailing whitespace-and-garbage can slip past it depending on shape.
+// Reading one more token and requiring io.EOF is.
+func decodeStrictJSONWithEOF(raw []byte, into any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(into); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("trailing data after the JSON document")
+	}
+	return nil
+}
+
 // verifyExistingPatchArtifact strictly re-verifies an on-disk artifact from ITS OWN FILES before reuse.
 // It trusts no single stored field: it re-derives patch_plan_sha256, the toolchain-binding digest, the
 // module-manifest SHA, and the artifact id from the actual bytes on disk and requires all of them to agree
@@ -1126,7 +1233,18 @@ var artifactFiles = []string{
 // replacement ABI is validated as a bijection with the recorded changed identities. Any deviation — a
 // tampered file, an edited metadata field, a symlink, unknown/trailing JSON — is an error (never silent reuse).
 func verifyExistingPatchArtifact(dir, expectArtifactID string) error {
-	for _, f := range artifactFiles {
+	// The member list depends on whether the artifact declares obfuscation, so the declaration is read
+	// FIRST -- from the file, strictly -- and then the required set is chosen from it. Reading it twice
+	// is deliberate: the first read decides what must exist, the second is the authoritative decode.
+	declaresObfuscation, err := artifactDeclaresObfuscation(dir)
+	if err != nil {
+		return err
+	}
+	required := artifactFiles
+	if declaresObfuscation {
+		required = obfuscatedArtifactFiles()
+	}
+	for _, f := range required {
 		fi, err := os.Lstat(filepath.Join(dir, f))
 		if err != nil {
 			return fmt.Errorf("artifact missing %s: %w", f, err)
@@ -1143,13 +1261,8 @@ func verifyExistingPatchArtifact(dir, expectArtifactID string) error {
 		return err
 	}
 	var m FreehandPatchArtifactMeta
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&m); err != nil {
+	if err := decodeStrictJSONWithEOF(raw, &m); err != nil {
 		return fmt.Errorf("corrupt/unknown-field patch_artifact.json: %w", err)
-	}
-	if dec.More() {
-		return errors.New("trailing data after patch_artifact.json")
 	}
 	if m.Schema != freehandPatchArtifactSchema {
 		return fmt.Errorf("unexpected patch_artifact schema %q (want %q)", m.Schema, freehandPatchArtifactSchema)
@@ -1316,12 +1429,152 @@ func verifyExistingPatchArtifact(dir, expectArtifactID string) error {
 	}
 	// Recompute the artifact identity from the re-derived components — trust nothing stored — and require it
 	// to equal BOTH the recorded id and the caller's expected id.
-	artifactID := computeFreehandArtifactID(planSHA, bindingDigest, manifestSHA, desc.DescriptorDigest)
+	recomputedObfDigest, err := freehandObfuscationArtifactDigest(m.Obfuscation, m.TranslationReceiptSHA256)
+	if err != nil {
+		return err
+	}
+	if recomputedObfDigest != m.ObfuscationBindingDigest {
+		return fmt.Errorf("recomputed obfuscation binding digest %s != recorded %s",
+			short(recomputedObfDigest), short(m.ObfuscationBindingDigest))
+	}
+	artifactID := computeFreehandArtifactID(planSHA, bindingDigest, manifestSHA, desc.DescriptorDigest, recomputedObfDigest)
 	if artifactID != m.ArtifactID {
 		return fmt.Errorf("recomputed artifact_id %s != recorded %s", artifactID, m.ArtifactID)
 	}
 	if artifactID != expectArtifactID {
 		return fmt.Errorf("artifact_id mismatch: recomputed %s != expected %s", artifactID, expectArtifactID)
+	}
+	// THE OBFUSCATION HALF, RE-DERIVED RATHER THAN TRUSTED.
+	if err := verifyArtifactObfuscation(dir, &m); err != nil {
+		return err
+	}
+	return nil
+}
+
+// artifactDeclaresObfuscation reads ONLY the declaration, so the required member set can be chosen
+// before anything is rehashed. A malformed artifact fails here with the same message it would fail
+// with later.
+func artifactDeclaresObfuscation(dir string) (bool, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "patch_artifact.json"))
+	if err != nil {
+		return false, fmt.Errorf("artifact missing patch_artifact.json: %w", err)
+	}
+	var probe struct {
+		Obfuscation *struct {
+			Enabled bool `json:"enabled"`
+		} `json:"obfuscation"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false, fmt.Errorf("corrupt patch_artifact.json: %w", err)
+	}
+	return probe.Obfuscation != nil && probe.Obfuscation.Enabled, nil
+}
+
+// verifyArtifactObfuscation re-derives everything the obfuscated half of an artifact claims.
+//
+// Before this, the artifact carried only translation_receipt_sha256 -- a digest of a file it did not
+// contain -- so verification could do nothing but restate the number it had been handed, and
+// TranslatedABI was accepted verbatim. An edited projection was therefore invisible: the entry that
+// actually reaches the engine could say anything.
+func verifyArtifactObfuscation(dir string, m *FreehandPatchArtifactMeta) error {
+	receiptPath := filepath.Join(dir, freehandTranslationReceiptFile)
+	if !m.Obfuscation.isEnabled() {
+		// A non-obfuscated artifact must carry NO obfuscation parts. Each of these would otherwise be a
+		// forged pairing the publisher could act on.
+		if _, err := os.Lstat(receiptPath); err == nil {
+			return errors.New("artifact carries a translation receipt but declares no obfuscated base")
+		}
+		if m.TranslationReceiptSHA256 != "" || m.ObfuscationBindingDigest != "" {
+			return errors.New("artifact records an obfuscation digest but declares no obfuscated base")
+		}
+		if len(m.TranslatedABI) > 0 {
+			return errors.New("artifact carries a translated ABI but declares no obfuscated base")
+		}
+		return nil
+	}
+	if err := m.Obfuscation.validate(); err != nil {
+		return fmt.Errorf("artifact obfuscation binding is invalid: %w", err)
+	}
+	fi, err := os.Lstat(receiptPath)
+	if err != nil {
+		return fmt.Errorf("obfuscated artifact is missing its translation receipt: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return errors.New("artifact translation receipt is a symlink")
+	}
+	if !fi.Mode().IsRegular() {
+		return errors.New("artifact translation receipt is not a regular file")
+	}
+	// MODE 0600, EXACTLY. The receipt names every original identity the module touched -- the source
+	// names obfuscation exists to remove -- so a group- or world-readable one is a disclosure, not an
+	// untidiness. It is written 0600; anything else means something changed it after the fact.
+	if perm := fi.Mode().Perm(); perm != freehandTranslationReceiptMode {
+		return fmt.Errorf("artifact translation receipt %s is mode %s, expected %s; it names every original identity in the module",
+			receiptPath, perm.String(), freehandTranslationReceiptMode.String())
+	}
+	receiptRaw, err := os.ReadFile(receiptPath)
+	if err != nil {
+		return err
+	}
+	if got := freehandSHA256Bytes(receiptRaw); got != m.TranslationReceiptSHA256 {
+		return fmt.Errorf("artifact translation receipt hashes to %s, recorded %s", got, m.TranslationReceiptSHA256)
+	}
+	var receipt FreehandTranslationReceipt
+	if err := decodeStrictJSONWithEOF(receiptRaw, &receipt); err != nil {
+		return fmt.Errorf("corrupt/unknown-field translation receipt: %w", err)
+	}
+	if receipt.Format != soroqTranslationReceiptFormat || receipt.FormatVersion != soroqTranslationReceiptFormatVersion {
+		return fmt.Errorf("artifact translation receipt declares a foreign format %q v%d", receipt.Format, receipt.FormatVersion)
+	}
+	if !receipt.ObfuscationEnabled {
+		return errors.New("artifact translation receipt says obfuscation was not enabled")
+	}
+	// The receipt must describe THIS base's map, by digest and by entry count.
+	if receipt.BaseMapSHA256 != m.Obfuscation.MapSHA256 {
+		return fmt.Errorf("artifact translation receipt was produced against base map %s, the artifact binds %s",
+			receipt.BaseMapSHA256, m.Obfuscation.MapSHA256)
+	}
+	if receipt.BaseMapEntries != m.Obfuscation.MapEntries {
+		return fmt.Errorf("artifact translation receipt records %d base map entries, the binding records %d",
+			receipt.BaseMapEntries, m.Obfuscation.MapEntries)
+	}
+	if receipt.IdentityCount != len(receipt.Identities) {
+		return fmt.Errorf("artifact translation receipt declares %d identities but carries %d",
+			receipt.IdentityCount, len(receipt.Identities))
+	}
+	// And the binding digest the manifest will carry must recompute from those two facts.
+	recomputedBinding, err := freehandObfuscationArtifactDigest(m.Obfuscation, m.TranslationReceiptSHA256)
+	if err != nil {
+		return err
+	}
+	if recomputedBinding != m.ObfuscationBindingDigest {
+		return fmt.Errorf("recomputed obfuscation binding digest %s != recorded %s",
+			short(recomputedBinding), short(m.ObfuscationBindingDigest))
+	}
+	// RE-DERIVE the projection from the durable ABI and the receipt, and require byte-for-byte equality
+	// with what is persisted. This is the check the artifact previously could not make.
+	manifestRaw, err := os.ReadFile(filepath.Join(dir, "soroq_freehand_module_manifest.json"))
+	if err != nil {
+		return err
+	}
+	var durable freehandModuleManifest
+	if err := json.Unmarshal(manifestRaw, &durable); err != nil {
+		return fmt.Errorf("decode durable module manifest: %w", err)
+	}
+	rederived, err := translateReplacementABI(durable.ReplacementABI, &receipt, m.ModuleLibrary)
+	if err != nil {
+		return fmt.Errorf("re-deriving the translated ABI from the artifact's own receipt failed: %w", err)
+	}
+	wantBytes, err := json.Marshal(rederived)
+	if err != nil {
+		return err
+	}
+	gotBytes, err := json.Marshal(m.TranslatedABI)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(wantBytes, gotBytes) {
+		return errors.New("the persisted translated ABI is not what this artifact's own receipt and durable ABI produce")
 	}
 	return nil
 }
@@ -1347,7 +1600,7 @@ func runPatchIOSEngineFreehand(head, passthrough []string, projectDir string) er
 	if _, _, err := installFreehandAnalyzer(flutterRoot); err != nil {
 		return fmt.Errorf("install freehand analyzer: %w", err)
 	}
-	plan, err := computeFreehandPatchPlan(projectDir, flutterRoot)
+	plan, err := computeFreehandPatchPlan(projectDir, flutterRoot, freehandBuildFlavor(passthrough))
 	if err != nil {
 		if err == errFreehandNoOp {
 			fmt.Fprintln(os.Stdout, "freehand: no patchable change detected — nothing to patch (clean no-op).")
@@ -1589,6 +1842,12 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 	if err != nil {
 		return "", fmt.Errorf("durable replacement ABI invalid: %w", err)
 	}
+	// Decoded from the SAME bytes the artifact id binds, so the runtime projection below cannot be
+	// built from a different ABI than the one that was validated.
+	var durableManifest freehandModuleManifest
+	if err := json.Unmarshal(synthManifestBytes, &durableManifest); err != nil {
+		return "", fmt.Errorf("decode the validated durable ABI: %w", err)
+	}
 	// The descriptor persisted verbatim in the artifact must itself survive the production strict decoder.
 	descriptorBytes, err := json.MarshalIndent(plan.DependencyDescriptor, "", "  ")
 	if err != nil {
@@ -1638,12 +1897,46 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 		return "", err
 	}
 	bytecodePath := filepath.Join(synthOut, "soroq_freehand_module.bytecode")
-	if err := compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, plan.relDir, moduleSrc, graphDigest, moduleSrcSHA, bytecodePath, synthManifest.NeedsFlutterTarget); err != nil {
+	// OBFUSCATION STATE COMES FROM THE VERIFIED BASELINE, never from this command's arguments.
+	obfBinding := plan.obfuscation
+	if err := obfBinding.validate(); err != nil {
+		return "", fmt.Errorf("the base's recorded obfuscation binding is unusable: %w", err)
+	}
+	// The receipt is RELEASE-SIDE. It is written beside the immutable baseline, never into the module
+	// output directory, and dart2bytecode refuses the compile if that is ever violated.
+	// THE BASELINE IS NEVER MUTATED BY PATCH GENERATION. The receipt used to be written into the
+	// immutable baseline directory, with each patch deleting the previous one first, so two patches
+	// against one base raced over a file inside a directory nothing is allowed to touch.
+	receiptPath := ""
+	if obfBinding.isEnabled() {
+		var releaseReceiptScratch func() error
+		receiptPath, releaseReceiptScratch, err = freehandPatchReceiptScratch(projectDir)
+		if err != nil {
+			return "", err
+		}
+		defer func() {
+			if cerr := releaseReceiptScratch(); cerr != nil {
+				fmt.Fprintf(os.Stderr, "soroq: %v\n", cerr)
+			}
+		}()
+	}
+	if err := compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, plan.relDir, moduleSrc, graphDigest, moduleSrcSHA, bytecodePath, synthManifest.NeedsFlutterTarget, obfBinding, receiptPath); err != nil {
 		return "", fmt.Errorf("compile freehand module: %w", err)
 	}
 	bytecodeSHA, err := sha256OfPath(bytecodePath)
 	if err != nil {
 		return "", err
+	}
+	// The receipt is loaded and fully validated HERE, next to the compile that produced it: a receipt
+	// bound to a different base map is the wrong-baseline case, and it must be caught on this machine
+	// rather than on a phone.
+	var translationReceipt *FreehandTranslationReceipt
+	translationReceiptSHA := ""
+	if obfBinding.isEnabled() {
+		translationReceipt, translationReceiptSHA, err = loadTranslationReceipt(receiptPath, obfBinding.MapSHA256)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	// 2b. Post-synthesis/compile input recheck: the source must not have drifted while we synthesized +
@@ -1674,7 +1967,21 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 	}
 	// The artifact id binds the plan, the exact tools, AND the durable replacement ABI (module manifest):
 	// any change to source/plan, toolchain, or the ABI yields a DISTINCT immutable artifact.
-	artifactID := computeFreehandArtifactID(planSHA, bindingDigest, manifestSHA, plan.DependencyDescriptorDigest)
+	obfArtifactDigest, err := freehandObfuscationArtifactDigest(obfBinding, translationReceiptSHA)
+	if err != nil {
+		return "", err
+	}
+	// The runtime projection of the replacement ABI. The durable ABI keeps its source-level identities
+	// untouched -- they are what semantic diffing and every existing verification path read -- and this
+	// is an additional array keyed by the frozen stable identity.
+	var translatedABI []FreehandTranslatedABIEntry
+	if obfBinding.isEnabled() {
+		translatedABI, err = translateReplacementABI(durableManifest.ReplacementABI, translationReceipt, moduleLibrary)
+		if err != nil {
+			return "", err
+		}
+	}
+	artifactID := computeFreehandArtifactID(planSHA, bindingDigest, manifestSHA, plan.DependencyDescriptorDigest, obfArtifactDigest)
 	meta := FreehandPatchArtifactMeta{
 		Schema:                 freehandPatchArtifactSchema,
 		RuntimeID:              plan.RuntimeID,
@@ -1707,6 +2014,10 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 		DependencyDescriptorDigest: plan.DependencyDescriptorDigest,
 		DependencyDescriptorSHA256: descriptorSHA,
 		BaseDependencyGraphDigest:  plan.DependencyDescriptor.BaseGraphDigest,
+		Obfuscation:                obfBinding,
+		TranslationReceiptSHA256:   translationReceiptSHA,
+		ObfuscationBindingDigest:   obfArtifactDigest,
+		TranslatedABI:              translatedABI,
 	}
 	metaBytes, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -1757,7 +2068,44 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 	if err := writeFileSync(filepath.Join(tmpDir, "patch_artifact.json"), metaBytes, 0o600); err != nil {
 		return "", err
 	}
+	// The receipt travels INSIDE the artifact, at 0600, copied from per-patch scratch. It is never
+	// written into the baseline (which is immutable) and never reaches the device payload: the
+	// publisher projects only the runtime identities the manifest needs.
+	if obfBinding.isEnabled() {
+		receiptBytes, rerr := os.ReadFile(receiptPath)
+		if rerr != nil {
+			return "", fmt.Errorf("read the translation receipt for persistence: %w", rerr)
+		}
+		if freehandSHA256Bytes(receiptBytes) != translationReceiptSHA {
+			return "", errors.New("the translation receipt changed between validation and persistence")
+		}
+		if err := writeFileSync(filepath.Join(tmpDir, freehandTranslationReceiptFile), receiptBytes, freehandTranslationReceiptMode); err != nil {
+			return "", err
+		}
+		// Explicit chmod: the create mode is subject to umask, and 0600 is a security property here,
+		// re-checked by verifyArtifactObfuscation on every read of this artifact.
+		if err := os.Chmod(filepath.Join(tmpDir, freehandTranslationReceiptFile), freehandTranslationReceiptMode); err != nil {
+			return "", err
+		}
+	}
 	syncDir(tmpDir)
+	// VERIFY BEFORE PUBLICATION.
+	//
+	// Every check verifyExistingPatchArtifact makes was only ever applied AFTER the rename, and only on
+	// the path where a concurrent writer won it. So the artifact this process publishes -- the common
+	// case -- became immutable without anyone re-deriving anything from its own bytes: a mis-assembled
+	// or partially written artifact was renamed into place and only failed later, at the next reuse,
+	// far from the command that produced it.
+	//
+	// Running it on tmpDir costs one pass over files that are already in the page cache, and a failure
+	// here leaves nothing published: the deferred cleanup removes the temporary directory and finalDir
+	// was never created.
+	if err := verifyExistingPatchArtifact(tmpDir, artifactID); err != nil {
+		return "", fmt.Errorf("refusing to publish an artifact that does not verify: %w", err)
+	}
+	if err := freehandFault("before-artifact-rename"); err != nil {
+		return "", err
+	}
 	if err := os.Rename(tmpDir, finalDir); err != nil {
 		if _, statErr := os.Stat(filepath.Join(finalDir, "patch_artifact.json")); statErr == nil {
 			// A concurrent writer won: STRICTLY verify its artifact before accepting it.
@@ -1791,7 +2139,7 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 // the VM -- the main source sha alone was NOT sufficient, because an upgrade can change only a carried
 // library while soroq_freehand_module.dart stays byte-identical
 // loader's "library already loaded" check (bytecode_reader.cc), while keeping the URI + bytecode reproducible.
-func compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, baseRelDir, moduleSrc, moduleGraphDigest, mainSourceSHA, out string, needsFlutter bool) error {
+func compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, baseRelDir, moduleSrc, moduleGraphDigest, mainSourceSHA, out string, needsFlutter bool, obf *FreehandObfuscationBinding, receiptOut string) error {
 	dartaot := filepath.Join(bundleDir, "dartaotruntime")
 	dart2bc := filepath.Join(bundleDir, "dart2bytecode")
 	// Import-dill = the NON-tree-shaken base SOURCE kernel: it carries the COMPLETE API of every base
@@ -1874,8 +2222,26 @@ func compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, baseRelDi
 		"--filesystem-scheme", "soroq-freehand",
 		"--filesystem-root", fsRoot,
 		"--prefix-library-uris", "import/prefix",
-		"-o", out, moduleURI,
 	)
+	// BASE-IDENTITY TRANSLATION. Derived entirely from the VERIFIED BASELINE: whether it happens at
+	// all, which map is the authority, and what digest that map must have. Nothing here comes from a
+	// public CLI argument, because a caller who could name a map could name any map.
+	if obf.isEnabled() {
+		mapPath, err := resolveBaseObfuscationMap(baseRelDir, obf)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(receiptOut) == "" {
+			return errors.New("internal: a translating module compile was started with no receipt path")
+		}
+		args = append(args,
+			"--soroq-base-obfuscated",
+			"--soroq-base-obfuscation-map", mapPath,
+			"--soroq-base-obfuscation-map-sha256", obf.MapSHA256,
+			"--soroq-translation-receipt", receiptOut,
+		)
+	}
+	args = append(args, "-o", out, moduleURI)
 	cmd := exec.Command(dartaot, args...)
 	cmd.Dir = projectDir
 	if o, err := cmd.CombinedOutput(); err != nil {
@@ -1898,7 +2264,30 @@ func compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, baseRelDi
 // Dart's library-private marker, and it is exactly what the VM mangles with an `@<id>` suffix. A private
 // class name is the common case (`_MyHomeState`), which is why this is a refusal rather than a warning.
 func freehandPrivateIdentities(ids []string) []string {
-	var blocked []string
+	byClass, byMember := freehandPrivateIdentitySplit(ids)
+	blocked := make([]string, 0, len(byClass)+len(byMember))
+	blocked = append(blocked, byClass...)
+	blocked = append(blocked, byMember...)
+	if len(blocked) == 0 {
+		return nil
+	}
+	return blocked
+}
+
+// freehandPrivateIdentitySplit separates the two reasons an identity is library-private, because they
+// are no longer the same question.
+//
+// A private MEMBER (`_helper`, `get:_value`) is mangled by the VM and stays unmatchable: nothing in this
+// tranche changes it, and it is refused unconditionally.
+//
+// A private ENCLOSING CLASS with a PUBLIC member (`_HomePageState::build`) is matchable by an engine
+// that canonicalizes the class name before comparing it to the manifest. Whether THIS base's engine does
+// that is recorded per-base as the %[1]s capability, so the answer comes from the base rather than from
+// a list here. An identity that is private on BOTH counts is reported as a private member, which is the
+// reason that no capability lifts.
+//
+// Order within each slice follows the input, so a message lists identities the way the diff produced them.
+func freehandPrivateIdentitySplit(ids []string) (privateClass, privateMember []string) {
 	for _, id := range ids {
 		parts := strings.Split(id, "::")
 		if len(parts) < 3 {
@@ -1907,11 +2296,20 @@ func freehandPrivateIdentities(ids []string) []string {
 		cls, member := parts[len(parts)-2], parts[len(parts)-1]
 		// A constructor identity is "Class." / "Class.named"; judge it on the class, which the loop
 		// already does, and on the member name after the dot.
-		if strings.HasPrefix(cls, "_") || strings.HasPrefix(member, "_") {
-			blocked = append(blocked, id)
+		memberPrivate := strings.HasPrefix(member, "_")
+		// `get:_value` / `set:_value` are private members wearing an accessor prefix. Without this the
+		// accessor form would be read as public and a capability would appear to lift it.
+		if i := strings.IndexByte(member, ':'); i >= 0 && i+1 < len(member) {
+			memberPrivate = memberPrivate || strings.HasPrefix(member[i+1:], "_")
+		}
+		switch {
+		case memberPrivate:
+			privateMember = append(privateMember, id)
+		case strings.HasPrefix(cls, "_"):
+			privateClass = append(privateClass, id)
 		}
 	}
-	return blocked
+	return privateClass, privateMember
 }
 
 // flutterProfilePlatformDillFromToolchain finds the flutter platform_strong.dill within the iOS toolchain

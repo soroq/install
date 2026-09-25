@@ -214,7 +214,7 @@ func TestEngineLaneRefusesFlavorBeforeAnyProjectMutation(t *testing.T) {
 			p := newEngineLaneProjectWithConfig(t, engineOrdinaryPubspec, cfg)
 			before := p.snapshot(t)
 			err := runEngineLaneBuild(p, "--", "--flavor", "prod")
-			if err == nil || !strings.Contains(err.Error(), "no flavor support") {
+			if err == nil || !strings.Contains(err.Error(), wantIOSEngineFlavorRefusal(route)) {
 				t.Fatalf("the hard-OTA route must refuse a flavored build, got: %v", err)
 			}
 			p.assertUntouched(t, before)
@@ -228,7 +228,7 @@ func TestEngineLaneRefusesObfuscationBeforeAnyProjectMutation(t *testing.T) {
 			p := newEngineLaneProjectWithConfig(t, engineOrdinaryPubspec, cfg)
 			before := p.snapshot(t)
 			err := runEngineLaneBuild(p, "--", "--obfuscate", "--split-debug-info=build/sym")
-			if err == nil || !strings.Contains(err.Error(), "not verified") {
+			if err == nil || !strings.Contains(err.Error(), "cannot bind an obfuscated base") {
 				t.Fatalf("the hard-OTA route must refuse an obfuscated build, got: %v", err)
 			}
 			p.assertUntouched(t, before)

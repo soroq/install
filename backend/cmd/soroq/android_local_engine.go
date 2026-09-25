@@ -23,6 +23,9 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -219,10 +222,9 @@ func materializeStockAndroidEmbedding(cacheDir, targetOut string) error {
 
 	embeddingPom := filepath.Join(targetOut, "flutter_embedding_release.pom")
 	embeddingJar := filepath.Join(targetOut, "flutter_embedding_release.jar")
-	if !fileExists(embeddingPom) {
-		if err := downloadToFile(fmt.Sprintf("%s/flutter_embedding_release/%s/flutter_embedding_release-%s.pom", base, version, version), embeddingPom); err != nil {
-			return fmt.Errorf("download flutter_embedding_release.pom (dependency metadata only): %w", err)
-		}
+	if err := placeEmbeddingPom(cacheDir, embeddingPom, version,
+		fmt.Sprintf("%s/flutter_embedding_release/%s/flutter_embedding_release-%s.pom", base, version, version)); err != nil {
+		return err
 	}
 	// The jar MUST be the SOROQ embedding placed (and setSoroq*-asserted) by
 	// materializeAndroidLocalEngineLayout, which runs first. Re-assert here as a fail-safe so a stale
@@ -243,6 +245,84 @@ func materializeStockAndroidEmbedding(cacheDir, targetOut string) error {
 		}
 	}
 	return nil
+}
+
+// androidEmbeddingPomPins pins the stock flutter_embedding_release POM per embedding version. It is
+// dependency METADATA only (the androidx list Gradle resolves; the jar bytes are Soroq's and are
+// asserted separately), but it decides what Gradle links, so its provenance is explicit: every pinned
+// version is verified whatever its source, and a mismatch fails the build.
+//
+// 1.0.0-5a2a6a42…: fetched from storage.googleapis.com/download.flutter.io, server MD5 matched,
+// byte-identical to two earlier independent fetches (handoff 27).
+var androidEmbeddingPomPins = map[string]string{
+	"1.0.0-5a2a6a42cce67f965cf540fcecf616faca624aa1": "6c24ccd1be9736d19c125fcee17e9bd94a27f716f091bc6688f55fa2e47c5538",
+}
+
+// androidVendoredEmbeddingPomRel is where a Soroq frontend vendors the POM under its bin/cache, in Maven
+// layout, so a build needs no upstream fetch.
+func androidVendoredEmbeddingPomRel(version string) string {
+	return filepath.Join("soroq", "maven", "io", "flutter", "flutter_embedding_release", version,
+		"flutter_embedding_release-"+version+".pom")
+}
+
+// embeddingPomProvenance is written beside the placed POM.
+type embeddingPomProvenance struct {
+	Schema  string `json:"schema"`
+	Version string `json:"version"`
+	Source  string `json:"source"` // "frontend-vendored" | "downloaded"
+	From    string `json:"from"`
+	SHA256  string `json:"sha256"`
+	Pinned  bool   `json:"pinned"`
+}
+
+// placeEmbeddingPom places the POM from the frontend's vendored copy when present, otherwise downloads
+// it; either way it is hashed, checked against androidEmbeddingPomPins (fail closed on mismatch), and
+// its provenance recorded. An already-placed POM is re-verified rather than trusted.
+func placeEmbeddingPom(cacheDir, dst, version, url string) error {
+	vendored := filepath.Join(cacheDir, androidVendoredEmbeddingPomRel(version))
+	prov := embeddingPomProvenance{Schema: "soroq.android_embedding_pom_provenance.v1", Version: version}
+	var data []byte
+	switch {
+	case fileExists(vendored):
+		b, err := os.ReadFile(vendored)
+		if err != nil {
+			return err
+		}
+		data, prov.Source, prov.From = b, "frontend-vendored", vendored
+	case fileExists(dst):
+		b, err := os.ReadFile(dst)
+		if err != nil {
+			return err
+		}
+		data, prov.Source, prov.From = b, "previously-placed", dst
+	default:
+		tmp := dst + ".download"
+		if err := downloadToFile(url, tmp); err != nil {
+			return fmt.Errorf("download flutter_embedding_release.pom (dependency metadata only): %w", err)
+		}
+		b, err := os.ReadFile(tmp)
+		_ = os.Remove(tmp)
+		if err != nil {
+			return err
+		}
+		data, prov.Source, prov.From = b, "downloaded", url
+	}
+	sum := sha256.Sum256(data)
+	prov.SHA256 = hex.EncodeToString(sum[:])
+	if pin, ok := androidEmbeddingPomPins[version]; ok {
+		if prov.SHA256 != pin {
+			return fmt.Errorf("flutter_embedding_release %s POM from %s has sha256 %s, pinned %s; refusing to link against unpinned dependency metadata", version, prov.From, prov.SHA256, pin)
+		}
+		prov.Pinned = true
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		return err
+	}
+	provBytes, _ := json.MarshalIndent(prov, "", "  ")
+	return os.WriteFile(dst+".provenance.json", append(provBytes, '\n'), 0o644)
 }
 
 func androidEmbeddingPOM(artifactID, version string) string {

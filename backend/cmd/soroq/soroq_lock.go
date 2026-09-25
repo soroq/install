@@ -36,7 +36,11 @@ type soroqLockPin struct {
 	Version          string
 	ToolchainVersion string
 	FrontendVersion  string // optional
-	RecordedAt       time.Time
+	// Flavor is the Flutter build flavor the pinned release was built with. Written only when
+	// non-empty, so an unflavored project's soroq.lock is byte-identical to before flavor support; an
+	// absent line therefore means "not recorded", never "known unflavored".
+	Flavor     string // optional
+	RecordedAt time.Time
 }
 
 // soroqLockPath returns <projectDir>/soroq.lock (project ROOT, beside soroq.yaml).
@@ -105,6 +109,8 @@ func parseSoroqLock(data []byte) soroqLock {
 				pin.ToolchainVersion = value
 			case "frontend_version":
 				pin.FrontendVersion = value
+			case "flavor":
+				pin.Flavor = value
 			case "recorded_at":
 				if t, err := time.Parse(time.RFC3339, value); err == nil {
 					pin.RecordedAt = t
@@ -136,6 +142,9 @@ func renderSoroqLock(lock soroqLock) string {
 		fmt.Fprintf(&b, "    toolchain_version: %s\n", strings.TrimSpace(pin.ToolchainVersion))
 		if strings.TrimSpace(pin.FrontendVersion) != "" {
 			fmt.Fprintf(&b, "    frontend_version: %s\n", strings.TrimSpace(pin.FrontendVersion))
+		}
+		if strings.TrimSpace(pin.Flavor) != "" {
+			fmt.Fprintf(&b, "    flavor: %s\n", strings.TrimSpace(pin.Flavor))
 		}
 		recordedAt := pin.RecordedAt
 		if recordedAt.IsZero() {
@@ -197,6 +206,45 @@ func loadSoroqLockPin(projectDir string, platform string, releaseID string) (sor
 		return soroqLockPin{}, false
 	}
 	if releaseID = strings.TrimSpace(releaseID); releaseID != "" && strings.TrimSpace(pin.ReleaseID) != releaseID {
+		// The platform pin is the LATEST release. With several flavors the base may be another
+		// flavor's older release, still pinned under its flavor key.
+		for key, fp := range lock.Platforms {
+			if isSoroqLockFlavorKeyOf(key, platform) && strings.TrimSpace(fp.ReleaseID) == releaseID &&
+				strings.TrimSpace(fp.ToolchainVersion) != "" {
+				return fp, true
+			}
+		}
+		return soroqLockPin{}, false
+	}
+	return pin, true
+}
+
+// soroq.lock keeps, besides each platform's latest pin, one pin per Flutter build flavor under
+// "<platform>@<lowercased flavor>", so every flavor's newest release keeps the toolchain that built it.
+// Older CLIs read only the plain platform keys and ignore these.
+const soroqLockFlavorSep = "@"
+
+func soroqLockFlavorKey(platform, flavor string) string {
+	return strings.ToLower(strings.TrimSpace(platform)) + soroqLockFlavorSep + strings.ToLower(strings.TrimSpace(flavor))
+}
+
+func isSoroqLockFlavorKey(key string) bool { return strings.Contains(key, soroqLockFlavorSep) }
+
+func isSoroqLockFlavorKeyOf(key, platform string) bool {
+	return strings.HasPrefix(key, strings.ToLower(strings.TrimSpace(platform))+soroqLockFlavorSep)
+}
+
+// loadSoroqLockFlavorPin returns the pin of flavor's newest release on platform.
+func loadSoroqLockFlavorPin(projectDir, platform, flavor string) (soroqLockPin, bool) {
+	if strings.TrimSpace(flavor) == "" {
+		return soroqLockPin{}, false
+	}
+	lock, err := loadSoroqLock(projectDir)
+	if err != nil {
+		return soroqLockPin{}, false
+	}
+	pin, ok := lock.Platforms[soroqLockFlavorKey(platform, flavor)]
+	if !ok || strings.TrimSpace(pin.ToolchainVersion) == "" || strings.TrimSpace(pin.ReleaseID) == "" {
 		return soroqLockPin{}, false
 	}
 	return pin, true

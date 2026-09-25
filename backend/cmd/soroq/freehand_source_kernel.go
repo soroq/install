@@ -144,8 +144,9 @@ func flutterProfilePlatformDillRel(flutterRoot string) (string, error) {
 
 // buildFreehandSourceKernelRecipe assembles the reproducible recipe from flutterRoot + the project's
 // package_config. Entrypoint/target/build-mode mirror the freehand release build (flutter build ios
-// --profile, entrypoint lib/main.dart, no dart-defines/experiments/flavor).
-func buildFreehandSourceKernelRecipe(projectDir, flutterRoot string) (FreehandSourceKernelRecipe, error) {
+// --profile, entrypoint lib/main.dart, no experiments). A flavored build records the flavor and the
+// FLUTTER_APP_FLAVOR define Flutter adds to the compiled Dart (ios_engine_flavor.go).
+func buildFreehandSourceKernelRecipe(projectDir, flutterRoot, flavor string) (FreehandSourceKernelRecipe, error) {
 	platRel, err := flutterProfilePlatformDillRel(flutterRoot)
 	if err != nil {
 		return FreehandSourceKernelRecipe{}, err
@@ -171,11 +172,11 @@ func buildFreehandSourceKernelRecipe(projectDir, flutterRoot string) (FreehandSo
 		Entrypoint:       "lib/main.dart",
 		Target:           "flutter",
 		BuildMode:        "profile",
-		Flavor:           "",
+		Flavor:           flavor,
 		PlatformDillRel:  platRel,
 		PlatformDillSHA:  platSHA,
 		GenKernelSHA:     genSHA,
-		DartDefines:      []string{},
+		DartDefines:      flavorDartDefines(flavor),
 		Experiments:      []string{},
 		PackageConfigSHA: pkgCfgSHA,
 	}, nil

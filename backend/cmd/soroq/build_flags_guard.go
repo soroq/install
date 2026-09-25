@@ -25,66 +25,14 @@ import (
 // nobody has verified. When someone proves the mapping is stable across the two builds and adds the
 // acceptance evidence, this guard should be replaced by that proof rather than merely deleted.
 //
-// SOROQ_ALLOW_UNVERIFIED_BUILD_FLAGS=1 is the explicit opt-in for someone who wants to experiment and
-// accepts that the result is unverified.
+// SOROQ_ALLOW_UNVERIFIED_BUILD_FLAGS=1 no longer applies to --flavor either: flavors are supported on
+// the Android release/patch routes and the iOS app-build leg (flavor.go), and refused outright on the
+// routes that would persist a flavor-unaware baseline. It is NOT honoured for obfuscation: an obfuscated build that proceeds without
+// capability authorization produces a baseline with no map and no binding, and every patch against it
+// then installs and resolves nothing. An experiment must never leave a reusable baseline, artifact or
+// publication behind, so obfuscation is refused outright rather than warned about.
 
 const unverifiedBuildFlagsOptInEnv = "SOROQ_ALLOW_UNVERIFIED_BUILD_FLAGS"
-
-// detectFlavorFlags returns the flavor/custom-target flags present in a passthrough arg list.
-func detectFlavorFlags(args []string) []string {
-	var found []string
-	for _, raw := range args {
-		arg := strings.TrimSpace(raw)
-		name := arg
-		if idx := strings.Index(arg, "="); idx >= 0 {
-			name = arg[:idx]
-		}
-		// Both `--flavor prod` and `--flavor=prod` count; the value is irrelevant to the decision.
-		if name == "--flavor" {
-			found = append(found, "--flavor")
-		}
-	}
-	return found
-}
-
-// guardFlavoredBuild refuses to BUILD a flavored app, because Soroq would then look for the artifact
-// in the wrong place.
-//
-// Flutter writes a flavored build to build/app/outputs/apk/<flavor>/release/ (and the analogous
-// bundle path). Soroq's artifact discovery scans only the unflavored locations, so after a flavored
-// build it finds nothing from that build -- and, if an older unflavored artifact is still on disk,
-// silently returns THAT instead. The stale-artifact guard now catches the dangerous half of this, but
-// the honest answer is that Soroq has no flavor-aware release identity at all: it cannot tell two
-// flavors apart, so two flavors of one version would collide on the same release id.
-//
-// There IS a supported path, and it is exercised by tests: build the flavor yourself and hand Soroq
-// the exact artifact. That keeps flavor selection where it already works -- in your build -- and keeps
-// Soroq bound to a file the developer named on purpose.
-func guardFlavoredBuild(args []string) error {
-	if len(detectFlavorFlags(args)) == 0 {
-		return nil
-	}
-	if os.Getenv(unverifiedBuildFlagsOptInEnv) == "1" {
-		fmt.Fprintf(os.Stderr,
-			"warning: building with --flavor. Soroq does not scan flavored output paths and has no\n"+
-				"  flavor-aware release identity; you have opted in via %s.\n"+
-				"  Verify the registered artifact is the one your flavored build produced.\n",
-			unverifiedBuildFlagsOptInEnv)
-		return nil
-	}
-	return fmt.Errorf(`refusing to build with --flavor: Soroq has no flavor support
-
-Flutter writes a flavored build to build/app/outputs/apk/<flavor>/release/, which Soroq's artifact
-discovery does not scan. Soroq also has no flavor-aware release identity, so two flavors of the same
-version would collide on one release id.
-
-Build the flavor yourself and hand Soroq the exact artifact -- this path is supported and tested:
-
-    flutter build apk --release --flavor <name>
-    soroq release android --build=false --artifact build/app/outputs/apk/<name>/release/app-<name>-release.apk
-
-Then patch the same way, with --build=false --candidate-artifact <path>.`)
-}
 
 // detectObfuscationFlags returns the obfuscation-related flags present in a passthrough arg list.
 //
@@ -108,34 +56,60 @@ func detectObfuscationFlags(args []string) []string {
 
 // guardUnverifiedBuildFlags refuses a build whose flags put the patch binding outside what Soroq has
 // evidence for. It is called before any build starts, so a refusal costs no compile time.
-func guardUnverifiedBuildFlags(args []string) error {
+//
+// [auth] is the TOOLCHAIN's answer to "can I translate identities into an obfuscated base's
+// namespace?", resolved from the engine bundle's own capability declaration. A nil auth -- which is
+// what every route that has not been wired passes -- means no toolchain was consulted, and the build
+// stays refused. That direction is the safe one: a route that forgot to resolve authorization refuses
+// rather than permits.
+//
+// NOTE what this does NOT do. Authorization permits the obfuscated BUILD; it does not by itself make
+// the patch bind. The binding is completed by the captured map, the translating compilation and the
+// translated ABI, each of which fails closed on its own. An R6-capable toolchain with any of those
+// missing still produces a refusal, which is what the "obfuscated command still refused despite an
+// R6-capable toolchain" control asserts.
+func guardUnverifiedBuildFlags(args []string, auth *freehandObfuscationAuthorization) error {
 	flags := detectObfuscationFlags(args)
 	if len(flags) == 0 {
 		return nil
 	}
-	if os.Getenv(unverifiedBuildFlagsOptInEnv) == "1" {
+	if auth != nil && auth.Allowed {
 		fmt.Fprintf(os.Stderr,
-			"warning: building with %s. Soroq has no acceptance evidence that an obfuscated patch binds\n"+
-				"  correctly to an obfuscated base; you have opted in via %s.\n"+
-				"  Verify on a real device before shipping this to users.\n",
-			strings.Join(dedupeStrings(flags), " "), unverifiedBuildFlagsOptInEnv)
+			"soroq: building with %s. The toolchain declares %s (%s), so this base's identities will be\n"+
+				"  captured into a release-side obfuscation map and every patch against it will be translated\n"+
+				"  through that map.\n",
+			strings.Join(dedupeStrings(flags), " "),
+			freehandObfuscatedIdentityTranslationCapability, auth.Reason)
 		return nil
 	}
-	return fmt.Errorf(`refusing to build with %s: Soroq has not verified obfuscated OTA
+	reason := "no toolchain capability was resolved for this command"
+	if auth != nil && auth.Reason != "" {
+		reason = auth.Reason
+	}
+	return fmt.Errorf(`refusing to build with %s: this toolchain cannot bind an obfuscated base
 
-Dart obfuscation renames declarations. Soroq binds an iOS patch by declaration identity, and an
-Android patch carries its own AOT symbol mapping, so a patch built from an obfuscated candidate is
-only correct if both compilations produced the same mapping. Nothing in Soroq pins or checks that
-today, and a wrong binding does not announce itself — it runs the wrong code, or silently does
-nothing, on a user's device.
+Dart obfuscation renames declarations, and Soroq binds an iOS patch BY DECLARATION IDENTITY. A patch
+carrying source-level names misses an obfuscated base entirely, and misses silently — it runs nothing
+and reports success.
 
-This is a missing proof, not a known failure. Choose one:
+Translating a module's identities into the base's namespace needs a toolchain whose dart2bytecode
+declares %s. This one does not:
+
+  %s
+
+Choose one:
 
   1. Build without %s (supported and covered by acceptance tests).
-  2. Experiment anyway, accepting that the result is unverified:
-       %s=1 soroq <your command>
-     and confirm the patch actually takes effect on a real device before shipping it.`,
+  2. Install a toolchain that declares the capability, and rebuild the BASE with it — an existing base
+     has no captured obfuscation map, so no patch can be translated against it.
+%s does NOT apply here. It used to let this command continue, and the result was worse than a
+refusal: the release recorded no obfuscation binding and no captured map, then persisted an actually
+obfuscated base as if it were an ordinary one. Every later patch against that baseline compiled,
+signed and installed cleanly and resolved nothing. An experiment must not be able to leave a reusable
+baseline, patch artifact or publication behind, so the override is refused on this route.`,
 		strings.Join(dedupeStrings(flags), " "),
+		freehandObfuscatedIdentityTranslationCapability,
+		reason,
 		strings.Join(dedupeStrings(flags), "/"),
 		unverifiedBuildFlagsOptInEnv)
 }

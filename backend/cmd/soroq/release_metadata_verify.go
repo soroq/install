@@ -30,7 +30,9 @@ type artifactMetadataMismatch struct {
 
 // verifyArtifactMetadataMatchesProject recomputes the bundled metadata from the CURRENT soroq.yaml and
 // pubspec.yaml and compares the identity-bearing fields against what the artifact actually carries.
-func verifyArtifactMetadataMatchesProject(projectDir string, snapshot *androidrelease.Snapshot) error {
+// flavorChannel, when non-empty, is the channel a declared flavor built with (flavor_channel.go): the
+// expected metadata is derived from the soroq.yaml that build saw, not the one on disk.
+func verifyArtifactMetadataMatchesProject(projectDir string, snapshot *androidrelease.Snapshot, flavorChannel string) error {
 	if snapshot == nil {
 		return nil
 	}
@@ -38,6 +40,11 @@ func verifyArtifactMetadataMatchesProject(projectDir string, snapshot *androidre
 	if err != nil {
 		// No soroq.yaml is a different, already-reported failure; nothing to compare against here.
 		return nil
+	}
+	if flavorChannel != "" {
+		if configBytes, err = effectiveSoroqYAML(configBytes, flavorChannel); err != nil {
+			return err
+		}
 	}
 	pubspecBytes, err := os.ReadFile(filepath.Join(projectDir, "pubspec.yaml"))
 	if err != nil {

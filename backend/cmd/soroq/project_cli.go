@@ -1471,6 +1471,11 @@ func inspectProject(projectDir string) (projectStatus, error) {
 		return projectStatus{}, pubspecErr
 	}
 
+	// Every command inspects the project first, so an interrupted flavored build is repaired before
+	// anything reads a soroq.yaml it left on a flavor channel.
+	if err := recoverInterruptedFlavorChannelSwap(absDir); err != nil {
+		return projectStatus{}, err
+	}
 	configBytes, configErr := os.ReadFile(status.SoroqConfigPath)
 	if configErr == nil {
 		status.HasSoroqConfig = true

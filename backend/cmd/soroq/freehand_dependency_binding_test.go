@@ -75,8 +75,8 @@ func TestArtifact_DependencyDescriptorIsBoundIntoIdentity(t *testing.T) {
 	if other.DescriptorDigest == meta.DependencyDescriptorDigest {
 		t.Fatal("test setup: the two descriptors should differ")
 	}
-	same := computeFreehandArtifactID(meta.PatchPlanSHA256, meta.ToolchainBindingDigest, meta.ModuleManifestSHA256, meta.DependencyDescriptorDigest)
-	diff := computeFreehandArtifactID(meta.PatchPlanSHA256, meta.ToolchainBindingDigest, meta.ModuleManifestSHA256, other.DescriptorDigest)
+	same := computeFreehandArtifactID(meta.PatchPlanSHA256, meta.ToolchainBindingDigest, meta.ModuleManifestSHA256, meta.DependencyDescriptorDigest, "")
+	diff := computeFreehandArtifactID(meta.PatchPlanSHA256, meta.ToolchainBindingDigest, meta.ModuleManifestSHA256, other.DescriptorDigest, "")
 	if same != id {
 		t.Fatalf("artifact id must be reproducible: %s != %s", same, id)
 	}
@@ -119,7 +119,7 @@ func editArtifactDescriptor(t *testing.T, dir string, mutate func(*depgraph.Desc
 		meta.DependencyDescriptorSHA256 = freehandSHA256Bytes(out)
 		meta.DependencyDescriptorDigest = d.DescriptorDigest
 		meta.BaseDependencyGraphDigest = d.BaseGraphDigest
-		meta.ArtifactID = computeFreehandArtifactID(meta.PatchPlanSHA256, meta.ToolchainBindingDigest, meta.ModuleManifestSHA256, d.DescriptorDigest)
+		meta.ArtifactID = computeFreehandArtifactID(meta.PatchPlanSHA256, meta.ToolchainBindingDigest, meta.ModuleManifestSHA256, d.DescriptorDigest, "")
 	}
 	newMeta, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -253,7 +253,7 @@ func TestArtifact_ModuleManifestPairedWithDifferentDescriptor_Refused(t *testing
 		t.Fatal(err)
 	}
 	meta.ModuleManifestSHA256 = freehandSHA256Bytes(out)
-	meta.ArtifactID = computeFreehandArtifactID(meta.PatchPlanSHA256, meta.ToolchainBindingDigest, meta.ModuleManifestSHA256, meta.DependencyDescriptorDigest)
+	meta.ArtifactID = computeFreehandArtifactID(meta.PatchPlanSHA256, meta.ToolchainBindingDigest, meta.ModuleManifestSHA256, meta.DependencyDescriptorDigest, "")
 	newMeta, _ := json.MarshalIndent(meta, "", "  ")
 	if err := os.WriteFile(metaPath, newMeta, 0o600); err != nil {
 		t.Fatal(err)
