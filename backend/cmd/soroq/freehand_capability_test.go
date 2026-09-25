@@ -344,7 +344,7 @@ func TestRedirectCapability_FutureEngineUnlocksConstructorsWithNoProducerChange(
 		t.Setenv("HOME", home)
 		writeEngineBundle(t, filepath.Join(home, ".soroq", "toolchains"), "tc-under-test", fullMeta().EngineRev, declaration)
 		proj, dill, srcDill, man, graph := seedFixture(t)
-		relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+		relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -391,7 +391,7 @@ func TestRedirectCapability_DoesNotMutateOrBreakExistingBaselines(t *testing.T) 
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	d1, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	d1, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +399,7 @@ func TestRedirectCapability_DoesNotMutateOrBreakExistingBaselines(t *testing.T) 
 	// overwrite an immutable baseline: the capability is derived, and re-deriving it is not a change to
 	// an immutable input.
 	writeEngineBundle(t, filepath.Join(home, ".soroq", "toolchains"), "tc-new", fullMeta().EngineRev, `{"honoured_kinds":["method","constructor"]}`)
-	d2, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	d2, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatalf("re-registering an unchanged base after the engine gained a declaration was refused: %v", err)
 	}

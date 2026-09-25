@@ -527,7 +527,7 @@ func TestPlatformsDispatcherReachesTheSameGuards(t *testing.T) {
 			before := p.snapshot(t)
 			err := patchPlatform("ios", []string{
 				"--project-dir", p.dir, "--toolchain", "tc-1", "--api", p.apiURL, "--", "--flavor", "prod"})
-			if err == nil || !strings.Contains(err.Error(), "no flavor support") {
+			if err == nil || !strings.Contains(err.Error(), wantIOSEngineFlavorRefusal(cfgName)) {
 				t.Fatalf("`patch --platforms=ios` must refuse a flavored build too, got: %v", err)
 			}
 			p.assertUntouched(t, before)
@@ -555,7 +555,7 @@ func TestEngineLanePatchRefusesUnverifiedBuildFlags(t *testing.T) {
 			p := newMultiEngineProject(t, cfg, ordinaryIOSHost())
 			before := p.snapshot(t)
 			err := runEngineLanePatch(p, "--", "--flavor", "prod")
-			if err == nil || !strings.Contains(err.Error(), "no flavor support") {
+			if err == nil || !strings.Contains(err.Error(), wantIOSEngineFlavorRefusal(cfgName)) {
 				t.Fatalf("the patch route must refuse a flavored build, got: %v", err)
 			}
 			p.assertUntouched(t, before)
@@ -564,7 +564,7 @@ func TestEngineLanePatchRefusesUnverifiedBuildFlags(t *testing.T) {
 			p := newMultiEngineProject(t, cfg, ordinaryIOSHost())
 			before := p.snapshot(t)
 			err := runEngineLanePatch(p, "--", "--obfuscate", "--split-debug-info=build/sym")
-			if err == nil || !strings.Contains(err.Error(), "not verified") {
+			if err == nil || !strings.Contains(err.Error(), "cannot bind an obfuscated base") {
 				t.Fatalf("the patch route must refuse an obfuscated build, got: %v", err)
 			}
 			p.assertUntouched(t, before)

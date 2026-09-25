@@ -1,9 +1,7 @@
 package main
 
 import (
-	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -466,6 +464,11 @@ func reverifyCachedToolchain(version, versionDir string, skipBundleVerify bool) 
 			return cliManifest{}, false, fmt.Errorf("%w\n%s", err, out)
 		}
 	}
+	// The cached bundle must still agree with its cached signed manifest. A cache entry edited after
+	// installation is exactly the case an offline re-verification exists to catch.
+	if err := verifyManifestMatchesEngine(manifest, bundleDir); err != nil {
+		return cliManifest{}, false, err
+	}
 	return manifest, true, nil
 }
 
@@ -619,52 +622,13 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// untarGz extracts a gzip'd tar stream (r) into dst. Rejects unsafe (absolute / .. traversal) entries.
-// Reads from an io.Reader (a streamed temp file) so a large toolchain archive is never held whole in
-// memory. Keeps the toolchain's permissive typeflag handling (any non-dir entry is written as a regular
-// file) rather than switching to the frontend's untarGzReader, which REJECTS non-regular/non-dir entries.
+// untarGz extracts a gzip'd tar stream (r) into dst.
+//
+// It used to write ANY non-directory entry as a regular file, so a symlink became a file whose contents
+// were its own target path -- silently wrong rather than refused. It now shares the frontend's extractor,
+// which knows the entry types apart and requires every link to resolve inside dst.
 func untarGz(r io.Reader, dst string) error {
-	gz, err := gzip.NewReader(r)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		clean := filepath.Clean(hdr.Name)
-		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("refusing unsafe archive entry %q", hdr.Name)
-		}
-		target := filepath.Join(dst, clean)
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
-			}
-		default:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(out, tr); err != nil {
-				out.Close()
-				return err
-			}
-			if err := out.Close(); err != nil {
-				return err
-			}
-		}
-	}
+	return untarGzReader(r, dst)
 }
 
 // copyTo wraps io.Copy so toolchain_cmd.go can hash files without importing io directly.

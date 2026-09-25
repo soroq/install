@@ -37,6 +37,8 @@ func buildFixtureFrontendArchive(t *testing.T) []byte {
 	}{
 		{"flutter-sdk-src/bin/flutter", 0o755, "#!/bin/sh\necho fixture flutter\n"},
 		{"flutter-sdk-src/packages/flutter_tools/lib/src/soroq_metadata.dart", 0o644, "// soroq asset bundler fixture\n"},
+		// The three revision markers the install cross-checks against the signed manifest. The framework
+		// revision is the tree's own git HEAD, so the archive carries enough git metadata to resolve it.
 		{"flutter-sdk-src/.git/HEAD", 0o644, "ref: refs/heads/main\n"},
 		// The three revision markers the install cross-checks against the signed manifest. The framework
 		// revision is the tree's own git HEAD, so the archive carries enough git metadata to resolve it.

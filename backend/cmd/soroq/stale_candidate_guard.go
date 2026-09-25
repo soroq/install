@@ -11,8 +11,10 @@ import (
 //
 // Artifact discovery globs a fixed set of output paths and returns the newest match. That is correct
 // for the ordinary single-flavor project, and silently wrong the moment the build writes somewhere the
-// globs do not cover -- most obviously `flutter build apk --flavor prod`, which emits
-// build/app/outputs/apk/prod/release/ rather than the apk/release/ path Soroq looks in. Discovery then
+// globs do not cover -- e.g. `flutter build apk --flavor prod` run WITHOUT telling Soroq the flavor,
+// which emits build/app/outputs/apk/prod/release/ rather than the apk/release/ path Soroq looks in. With
+// --flavor, discovery scans exactly that flavor's locations (flavor.go) and this guard still applies to
+// the flavored path. Discovery otherwise
 // finds nothing from this build and happily returns a LEFTOVER artifact from an earlier, unrelated
 // build. The release registers, the digests are internally consistent, and the shipped code is not the
 // code the developer just built.
@@ -45,13 +47,14 @@ Soroq built, then discovered an artifact that predates that build — so this fi
 earlier build and is NOT the code you just compiled. Registering it would ship the wrong code under a
 release that looks internally consistent.
 
-The usual cause is a build whose output lands outside the paths Soroq scans, most commonly a flavored
-build (--flavor <name> writes build/app/outputs/apk/<flavor>/release/). Soroq has no flavor support
-and does not guess.
+The usual cause is a build whose output lands outside the paths Soroq scans: a custom output
+directory, a build script that writes elsewhere, or a flavored build run without telling Soroq the
+flavor (pass --flavor <name> so Soroq builds it and looks only in that flavor's output locations).
+Soroq does not guess.
 
 Point Soroq at the file your build actually produced:
 
-    soroq release android --build=false --artifact <path-to-your-artifact>`,
+    soroq release android --build=false --artifact <path-to-your-artifact> [--flavor <name>]`,
 		artifactPath,
 		info.ModTime().UTC().Format(time.RFC3339),
 		buildStartedAt.UTC().Format(time.RFC3339))

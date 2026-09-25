@@ -556,7 +556,7 @@ func verifyFreehandStagingStrict(projectDir, appDill, analyzerSha string) (analy
 // receipt/index field, all hashes, the config digest, and the content address are recomputed from live
 // inputs and must match — then persists exactly the verified manifest/graph and the EXACT kernel that
 // gen_snapshot consumed.
-func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterRoot, toolchainVersion, preBuildSourceDigest string) (string, error) {
+func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterRoot, toolchainVersion, preBuildSourceDigest, producedMapPath string, obfAuth *freehandObfuscationAuthorization, flavor string) (string, error) {
 	analysisDir, manifestPath, graphPath, err := verifyFreehandStagingStrict(projectDir, appDill, analyzerSha)
 	if err != nil {
 		return "", fmt.Errorf("freehand staging revalidation failed: %w", err)
@@ -572,7 +572,7 @@ func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterR
 			return "", fmt.Errorf("source/config changed during the build (TOCTOU): pre=%s post=%s; refusing to persist a baseline whose source kernel may not match the AOT app.dill", preBuildSourceDigest[:12], postDigest[:12])
 		}
 	}
-	soroqConfig, err := os.ReadFile(filepath.Join(projectDir, "soroq.yaml"))
+	soroqConfig, err := readProjectSoroqYAML(projectDir)
 	if err != nil {
 		return "", err
 	}
@@ -589,7 +589,7 @@ func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterR
 		return "", fmt.Errorf("hash package_config.json: %w", err)
 	}
 	// Dual-kernel v2: build the source-kernel recipe + generate the non-AOT source-fidelity companion.
-	recipe, err := buildFreehandSourceKernelRecipe(projectDir, flutterRoot)
+	recipe, err := buildFreehandSourceKernelRecipe(projectDir, flutterRoot, flavor)
 	if err != nil {
 		return "", fmt.Errorf("build source-kernel recipe: %w", err)
 	}
@@ -650,9 +650,24 @@ func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterR
 			AnalysisID: filepath.Base(analysisDir),
 		},
 	}
-	relDir, err := persistFreehandBaseline(projectDir, bl, appDill, sourceKernelPath, manifestPath, graphPath, baseDepGraph)
+	// The binding is described here and the map is handed to persistFreehandBaseline as an INPUT to its
+	// transaction. There is no post-publication adoption: a published baseline either contains the map
+	// it declares or was never published.
+	var obfBinding *FreehandObfuscationBinding
+	if strings.TrimSpace(producedMapPath) != "" {
+		obfBinding, err = describeProducedObfuscationMap(producedMapPath, obfAuth)
+		if err != nil {
+			return "", err
+		}
+		bl.Obfuscation = obfBinding
+	}
+	relDir, err := persistFreehandBaseline(projectDir, bl, appDill, sourceKernelPath, manifestPath, graphPath, baseDepGraph, producedMapPath)
 	if err != nil {
 		return "", err
+	}
+	if obfBinding != nil {
+		fmt.Fprintf(os.Stderr, "base obfuscation map published with the baseline (%d entries, mode %s) -> %s\n",
+			obfBinding.MapEntries, obfBinding.MapMode, filepath.Join(relDir, obfBinding.MapFile))
 	}
 	// Move the build's gen_snapshot object graph into the immutable baseline. `soroq patch` reads it to
 	// refuse a redirect whose value the precompiler already propagated into its callers -- the only
@@ -714,14 +729,14 @@ func adoptFreehandObjectGraph(projectDir, relDir string) error {
 // freehandFinalizeBuild persists the immutable baseline and registers the release AFTER a fully
 // successful build. Fail-build atomicity for the product release command: any non-nil buildErr aborts
 // with NO baseline persisted and NO release delegate invoked — nothing partial is left behind.
-func freehandFinalizeBuild(head []string, projectDir, appDill string, buildErr error, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest string) error {
+func freehandFinalizeBuild(head []string, projectDir, appDill string, buildErr error, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath string, obfAuth *freehandObfuscationAuthorization, flavor string) error {
 	if buildErr != nil {
 		return fmt.Errorf("freehand build failed; no baseline persisted and no release registered: %w", buildErr)
 	}
 	if strings.TrimSpace(appDill) == "" {
 		return errors.New("freehand build reported success but produced no app.dill")
 	}
-	relDir, err := freehandPersistFn(projectDir, appDill, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest)
+	relDir, err := freehandPersistFn(projectDir, appDill, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath, obfAuth, flavor)
 	if err != nil {
 		return fmt.Errorf("persist freehand baseline: %w", err)
 	}
@@ -821,6 +836,39 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 		}
 	}
 
+	// THE MAP COMES FROM THIS BUILD'S OWN gen_snapshot, not from a later re-run.
+	//
+	// It is appended to the same --extra-gen-snapshot-options stream as the object graph above, so the
+	// map describes exactly the snapshot that ships. A map produced by any other invocation would
+	// describe a different assignment -- measured on the real R5 Android lane, one member is `khc` in
+	// one build and `lhc` in another -- and every patch translated through it would miss.
+	obfAuth, err := authorizeObfuscationForToolchain(toolchain)
+	if err != nil {
+		return err
+	}
+	obfuscating := len(detectObfuscationFlags(passthrough)) > 0 && obfAuth != nil && obfAuth.Allowed
+	producedMapPath := ""
+	if obfuscating {
+		// A UNIQUE scratch directory per invocation. A fixed path let two releases in one project
+		// delete and adopt each other's map; nothing about "clear the stale one first" fixes that,
+		// because both builds are writing the same name at the same time.
+		var releaseScratch func() error
+		producedMapPath, releaseScratch, err = freehandProducedObfuscationMapPath(projectDir)
+		if err != nil {
+			return err
+		}
+		// The scratch copy never outlives this command, whatever happens to it. A REFUSED cleanup --
+		// something unexpected appeared in the directory -- leaks one small directory and says so
+		// rather than deleting whatever it found.
+		defer func() {
+			if cerr := releaseScratch(); cerr != nil {
+				fmt.Fprintf(os.Stderr, "soroq: %v\n", cerr)
+			}
+		}()
+		passthrough = append(passthrough,
+			"--extra-gen-snapshot-options=--save-obfuscation-map="+producedMapPath)
+	}
+
 	// Zero-touch runtime wiring: generate the dual-interface activator + bootstrap entrypoint under
 	// .soroq/generated/ and redirect the build entrypoint to the bootstrap, so the compiled app.dill
 	// contains the activator and auto-starts the controller with NO lib/ edits. The baseline and every
@@ -866,7 +914,7 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 	// Fail-build atomicity: buildIOSAppDill's result is finalized as a PURE TAIL — freehandFinalizeBuild
 	// is the only post-build path, so a failed build persists no baseline and calls no release delegate.
 	appDill, buildErr := buildIOSAppDill(projectDir, toolchain, passthrough)
-	return freehandFinalizeBuild(head, projectDir, appDill, buildErr, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest)
+	return freehandFinalizeBuild(head, projectDir, appDill, buildErr, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath, obfAuth, freehandBuildFlavor(passthrough))
 }
 
 // freehandProjectAppID reads app_id from the project's soroq.yaml.

@@ -11,7 +11,7 @@ import (
 // A baseline written before the widened contract must be refused with the EXACT actionable message.
 func TestOldBaseWithoutContract_RefusedWithExactMessage(t *testing.T) {
 	proj, dill, srcDill, man, graph := seedFixture(t)
-	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph())
+	relDir, err := persistFreehandBaseline(proj, fullMeta(), dill, srcDill, man, graph, testDepGraph(), "")
 	if err != nil {
 		t.Fatal(err)
 	}

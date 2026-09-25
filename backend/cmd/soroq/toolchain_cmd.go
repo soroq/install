@@ -71,9 +71,25 @@ const toolchainPinnedKeyID = "soroq-toolchain-kid-v1"
 
 const toolchainManifestSchema = "soroq.toolchain.v1"
 
-// Expected build-time identity the CLI is wired for. These mirror the committed canonical
-// soroq.ios_engine.v2 engine.json (tools/soroq_toolchain_packer/canonical/). doctor + install use them
-// to refuse a flutter/dart revision mismatch up front (a clear refusal before any extraction).
+// THE CLI IS NO LONGER WIRED TO ONE FLUTTER REVISION.
+//
+// These constants used to be the ACCEPT LIST: install refused any manifest whose flutter/dart revision
+// did not equal them. That made a correctly signed, production-published toolchain uninstallable the
+// moment the matrix moved forward -- a clean-HOME install of the Flutter 3.44.9 toolchain was refused
+// with `flutter revision mismatch: ios manifest "6b182d2c7585", this CLI is wired for "f74781f62134"`
+// -- and it meant every new signed Flutter version required a CLI edit and release. That is the exact
+// opposite of a catalog-driven version matrix.
+//
+// WHAT REPLACES THE EQUALITY CHECK, and why it is not weaker. The manifest is signed by the pinned
+// production key and its signature is verified BEFORE any of it is read. A manifest that carries that
+// signature is the publisher's own statement of the identity, so the identity it declares is
+// authoritative -- the CLI's job is to check that the statement is WELL-FORMED and that the bytes on
+// disk AGREE with it, not to second-guess which revision the publisher was allowed to ship. The
+// agreement half is new and is what actually replaces the lost coupling: after extraction, the inner
+// engine.json must match the signed manifest on engine revision, flutter and dart revisions,
+// capabilities and every artifact hash (verifyManifestMatchesEngine).
+//
+// They remain as the REFERENCE identity doctor reports and as the historical anchor of the r2 lane.
 const (
 	// iOS toolchain identity — the R3 matched revision (dart_dynamic_modules=true), device-proven
 	// 2026-07-03 (T037). Superseded the stale c9a6c484/d684a576 patch-lane-only identity when the
@@ -180,6 +196,8 @@ func runToolchain(args []string) error {
 		return runToolchainKeygen(args[1:])
 	case "publish":
 		return runToolchainPublish(args[1:])
+	case "stage-archive":
+		return runToolchainStageArchive(args[1:])
 	case "install":
 		return runToolchainInstall(args[1:])
 	case "list":
@@ -200,7 +218,8 @@ func toolchainUsage() {
 
 subcommands:
   keygen   operator: mint a fresh toolchain signing keypair (prints pubkey+keyid; seed -> 0600 file)
-  publish  operator: sign + PUT a packer-produced toolchain manifest to the registry
+  publish  operator: stage the archive, then sign + PUT a packer-produced toolchain manifest
+  stage-archive  operator: upload an archive to its verified content-addressed registry URL (publishes nothing)
   install  download, verify (signature + archive hash + verifyEngineBundle), and cache a toolchain
   list     list installed (cached) toolchain versions under ~/.soroq/toolchains/
   doctor   report toolchain availability + package/CLI-version compatibility`)

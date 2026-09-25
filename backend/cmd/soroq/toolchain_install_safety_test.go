@@ -18,6 +18,11 @@ import (
 	"soroq/backend/internal/signing"
 )
 
+// fixtureToolchainEngineRevision is the identity BOTH the fixture archive's engine.json and every
+// manifest paired with it declare. They are cross-checked after extraction, so one constant keeps them
+// from drifting apart and failing for a reason that is about the fixture rather than the code.
+const fixtureToolchainEngineRevision = "soroq.ios_engine.fixture.shared"
+
 // buildFixtureToolchainArchive builds a minimal but STRUCTURALLY VALID toolchain archive (tar.gz) whose
 // bundle subdir is ios/, containing engine.json + the 5 iOS artifacts. Enough for the extract step's
 // engine.json presence check; the verifyEngineBundle gate is exercised via the runVerifyEngineBundle seam.

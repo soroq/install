@@ -51,15 +51,20 @@ func TestOrdinaryBuildFlagsAreNotMistakenForObfuscation(t *testing.T) {
 }
 
 func TestObfuscatedBuildIsRefusedWithAWayForward(t *testing.T) {
-	err := guardUnverifiedBuildFlags([]string{"--obfuscate", "--split-debug-info=build/symbols"})
+	err := guardUnverifiedBuildFlags([]string{"--obfuscate", "--split-debug-info=build/symbols"}, nil)
 	if err == nil {
 		t.Fatal("an obfuscated build must be refused rather than silently producing a patch of unknown correctness")
 	}
 	msg := err.Error()
+	// The refusal's REASON changed with R6 and the assertion follows it. Before, obfuscated OTA was
+	// unverified everywhere. Now it is implemented, and what a given command lacks is a toolchain whose
+	// dart2bytecode can translate identities -- so the refusal must name that capability and how to get
+	// past it, not merely say "unverified".
 	for _, want := range []string{
-		"--obfuscate",                        // names what was seen
-		"not verified",                       // states the real status
-		"SOROQ_ALLOW_UNVERIFIED_BUILD_FLAGS", // gives the opt-in
+		"--obfuscate",                                   // names what was seen
+		"cannot bind an obfuscated base",                // states the real status
+		freehandObfuscatedIdentityTranslationCapability, // names what is missing
+		"SOROQ_ALLOW_UNVERIFIED_BUILD_FLAGS",            // gives the opt-in
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("refusal should mention %q:\n%s", want, msg)
@@ -67,15 +72,27 @@ func TestObfuscatedBuildIsRefusedWithAWayForward(t *testing.T) {
 	}
 }
 
-func TestObfuscationOptInIsHonoured(t *testing.T) {
+// The opt-in NO LONGER applies to obfuscation, and that is the point.
+//
+// It used to let an unauthorized obfuscated release continue. The result was worse than a refusal:
+// the release then recorded no binding and no captured map, and persisted an actually obfuscated base
+// as an ordinary one. Every later patch against that baseline compiled, signed and installed cleanly
+// and resolved nothing. An experiment must not be able to leave a reusable baseline behind.
+func TestObfuscationOptInIsNoLongerHonoured(t *testing.T) {
 	t.Setenv("SOROQ_ALLOW_UNVERIFIED_BUILD_FLAGS", "1")
-	if err := guardUnverifiedBuildFlags([]string{"--obfuscate"}); err != nil {
-		t.Fatalf("the documented opt-in must allow the build to proceed: %v", err)
+	err := guardUnverifiedBuildFlags([]string{"--obfuscate"}, nil)
+	if err == nil {
+		t.Fatal("the override must not let an unauthorized obfuscated build proceed")
 	}
+	if !strings.Contains(err.Error(), "does NOT apply here") {
+		t.Fatalf("the refusal should say the override no longer applies: %v", err)
+	}
+	// --flavor no longer needs the opt-in on its supported routes (flavor.go), and the opt-in does not
+	// unlock the routes that still refuse it; see flavor_test.go.
 }
 
 func TestUnobfuscatedBuildIsUnaffected(t *testing.T) {
-	if err := guardUnverifiedBuildFlags([]string{"--dart-define=A=b"}); err != nil {
+	if err := guardUnverifiedBuildFlags([]string{"--dart-define=A=b"}, nil); err != nil {
 		t.Fatalf("an ordinary build must not be blocked: %v", err)
 	}
 }
@@ -96,60 +113,24 @@ func TestReleaseAndroidRefusesObfuscatedBuildWithoutBuilding(t *testing.T) {
 
 	err := runReleaseAndroid([]string{
 		"--project-dir", projectDir, "--api", "http://127.0.0.1:1",
-		"--", "--obfuscate", "--split-debug-info=build/symbols",
+		"--", "--obfuscate", "--split-debug-info=build/symbols", "--target-platform", "android-arm64",
 	})
 	if err == nil {
 		t.Fatal("an obfuscated release must be refused")
 	}
-	if !strings.Contains(err.Error(), "not verified") {
-		t.Fatalf("expected the unverified-binding refusal, got: %v", err)
+	// [soroq] Option A: Android obfuscation is permitted only with a toolchain that can seed patches
+	// from the base's map; with none resolved, the refusal names that capability.
+	if !strings.Contains(err.Error(), androidObfuscationSeedCapability) {
+		t.Fatalf("expected the missing-capability refusal, got: %v", err)
 	}
 	if buildCalls != 0 {
 		t.Fatalf("refused after %d build(s); the guard must run before any build", buildCalls)
 	}
 }
 
-func TestFlavorFlagsAreDetectedInBothForms(t *testing.T) {
-	for _, args := range [][]string{{"--flavor", "prod"}, {"--flavor=prod"}, {"--release", "--flavor", "dev"}} {
-		if len(detectFlavorFlags(args)) == 0 {
-			t.Errorf("detectFlavorFlags(%v) found nothing", args)
-		}
-	}
-	for _, args := range [][]string{nil, {"--release"}, {"--dart-define=FLAVOR=prod"}} {
-		if got := detectFlavorFlags(args); len(got) != 0 {
-			t.Errorf("detectFlavorFlags(%v) = %v; only the --flavor flag itself counts", args, got)
-		}
-	}
-}
-
-func TestFlavoredBuildIsRefusedAndNamesTheSupportedPath(t *testing.T) {
-	err := guardFlavoredBuild([]string{"--flavor", "prod"})
-	if err == nil {
-		t.Fatal("Soroq cannot find a flavored build's artifact, so building one must be refused")
-	}
-	for _, want := range []string{"no flavor support", "--build=false --artifact", "outputs/apk/"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("refusal should mention %q:\n%s", want, err)
-		}
-	}
-}
-
-// The escape hatch must be real: supplying a flavored artifact explicitly is the SUPPORTED path, so it
-// must not be blocked. A refusal with no working alternative would just be an outage.
-func TestExplicitlySuppliedArtifactIsNeverBlockedByTheFlavorGuard(t *testing.T) {
-	// The guard only ever inspects passthrough BUILD args; --build=false supplies none.
-	if err := guardFlavoredBuild(nil); err != nil {
-		t.Fatalf("the --build=false path passes no build args and must not be blocked: %v", err)
-	}
-}
-
-func TestFlavorOptInIsHonoured(t *testing.T) {
-	t.Setenv("SOROQ_ALLOW_UNVERIFIED_BUILD_FLAGS", "1")
-	if err := guardFlavoredBuild([]string{"--flavor=prod"}); err != nil {
-		t.Fatalf("the documented opt-in must allow the build to proceed: %v", err)
-	}
-}
-
+// The explicit-artifact path must keep working with no flavor declared: an undeclared flavored path
+// only warns and records the release as unflavored (so a later flavored patch is refused, not
+// silently accepted). The flag-driven path is covered in flavor_test.go.
 // END-TO-END: the documented flavor workaround must actually register a release.
 //
 // A refusal is only honest if the alternative it names works. This builds an artifact at the exact

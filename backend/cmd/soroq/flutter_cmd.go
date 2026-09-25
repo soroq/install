@@ -238,11 +238,15 @@ func runFlutterUse(args []string) error {
 		lock.Platforms = map[string]soroqLockPin{}
 	}
 	for _, e := range matched {
+		// Only the toolchain/frontend change; the pinned release's identity (id, version, flavor) is kept.
+		// Per-flavor pins (<platform>@<flavor>) record which toolchain built each flavor's release and
+		// are deliberately left as they are.
 		lock.Platforms[e.Platform] = soroqLockPin{
 			ReleaseID:        lock.Platforms[e.Platform].ReleaseID,
 			Version:          lock.Platforms[e.Platform].Version,
 			ToolchainVersion: e.ToolchainVersion,
 			FrontendVersion:  e.FrontendVersion,
+			Flavor:           lock.Platforms[e.Platform].Flavor,
 			RecordedAt:       time.Now().UTC(),
 		}
 	}

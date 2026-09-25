@@ -122,6 +122,11 @@ func (s *ToolchainManifestSigner) SignToolchainManifest(manifestBytes []byte) (s
 	return hex.EncodeToString(sig), nil
 }
 
+// ProductionToolchainPublicKeyHex is the production toolchain PUBLIC key (key id soroq-toolchain-kid-v1).
+// The control plane refuses to register a toolchain or frontend manifest whose signature does not verify
+// under it; the CLI pins the same key (cmd/soroq toolchainPinnedPublicKeyHex, held equal by a test).
+const ProductionToolchainPublicKeyHex = "0c13a40b064f549f817c58a8d4a22b28a38cd0bde7133e73db0040071d770ca1"
+
 // VerifyToolchainManifestSignature verifies a HEX detached signature over the EXACT manifest bytes
 // against a pinned public key (HEX). It returns a precise error on any failure (no partial trust).
 func VerifyToolchainManifestSignature(manifestBytes []byte, signatureHex string, pinnedPublicKeyHex string) error {

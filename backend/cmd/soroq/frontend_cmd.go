@@ -100,6 +100,10 @@ func runFrontend(args []string) error {
 		return runFrontendInstall(args[1:])
 	case "publish":
 		return runFrontendPublish(args[1:])
+	case "stage-archive":
+		return runFrontendStageArchive(args[1:])
+	case "adopt-archive":
+		return runFrontendAdoptArchive(args[1:])
 	case "list":
 		return runFrontendList(args[1:])
 	case "path":
@@ -120,7 +124,9 @@ func frontendUsage() {
 
 subcommands:
   install  download, verify (signature + archive sha256/size), and install a Soroq Flutter frontend
-  publish  operator: sign + PUT a frontend manifest + upload the archive to the registry
+  publish  operator: stage the archive (or name a staged one), verify it, then sign + PUT the manifest
+  stage-archive  operator: upload an archive to its verified content-addressed registry URL (publishes nothing)
+  adopt-archive  operator: have the registry copy, verified, a registered version's archive (publishes nothing)
   use-candidate  activate a LOCAL UNSIGNED candidate frontend (--restore to go back)
   list     list installed frontends under ~/.soroq/frontends/
   path     print the resolved installed frontend bin/flutter
@@ -234,8 +240,17 @@ func parseFrontendManifest(b []byte) (frontendManifest, error) {
 	return m, nil
 }
 
-// checkFrontendIdentity refuses a manifest whose flutter_revision does not match the revision this CLI is
-// wired for (the strong upstream anchor; the frontend must match the toolchain/engine pair).
+// checkFrontendIdentity refuses a manifest that IDENTIFIES NOTHING. It no longer compares against a
+// revision compiled into the CLI.
+//
+// It used to require flutter_revision == expectedFlutterRevision (3.44.2). That made the accept list one
+// release wide: a correctly signed Flutter 3.44.9 frontend could not install, and every future matrix
+// version needed a CLI rebuild -- the same defect that had to be fixed for toolchains.
+//
+// The signature over this manifest is verified against the pinned key BEFORE any field here is read, so
+// the publisher has asserted this identity. What the CLI still owes is (a) that the assertion is
+// well-formed, and (b) that the tree actually shipped matches it -- verifyFrontendTreeMatchesManifest,
+// run after extraction and before the cache swap. Dropping (a) would let the tree check compare blanks.
 func checkFrontendIdentity(m frontendManifest) error {
 	// It used to require flutter_revision == expectedFlutterRevision (3.44.2). That made the accept list
 	// one revision long, which is precisely what catalog v2 exists to end: the matrix pins 3.44.2 and
@@ -273,6 +288,46 @@ func checkFrontendIdentity(m frontendManifest) error {
 	return nil
 }
 
+// assertFrontendToolchainPair refuses a frontend/toolchain pair the publisher never declared compatible,
+// BEFORE Flutter is invoked.
+//
+// A mismatched pair does not fail cleanly: the f74781f6 frontend_server compiling against a 6b182d2c
+// engine dies inside kernelForProgram with a bare "Target kernel_snapshot_program failed: Exception" and
+// an EMPTY app.dill -- minutes of build for an error that names neither artifact. Refusing up front turns
+// that into one sentence naming both.
+func assertFrontendToolchainPair(fm frontendManifest, tm cliManifest) error {
+	want := strings.TrimSpace(tm.SoroqToolchainVersion)
+	if want == "" {
+		return errors.New("the selected toolchain manifest carries no version, so no pair can be checked")
+	}
+	found := false
+	for _, id := range fm.CompatibleToolchainIDs {
+		if strings.EqualFold(strings.TrimSpace(id), want) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("frontend %q does not declare toolchain %q compatible (it declares: %s); "+
+			"building this pair would fail inside the kernel compiler with an empty app.dill",
+			fm.SoroqFrontendVersion, want, strings.Join(fm.CompatibleToolchainIDs, ", "))
+	}
+	// Declared compatibility is necessary but not sufficient: the two must also AGREE about what they
+	// were built from, or a stale compatible_toolchain_ids entry would re-admit the very mismatch above.
+	if !strings.EqualFold(strings.TrimSpace(fm.FlutterRevision), strings.TrimSpace(tm.FlutterRevision)) {
+		return fmt.Errorf("frontend/toolchain flutter revision disagreement: frontend %q says %q, toolchain %q says %q",
+			fm.SoroqFrontendVersion, short(fm.FlutterRevision), want, short(tm.FlutterRevision))
+	}
+	// The enumerated legacy pair (dart_revision_compat.go) declares the same Dart in two forms; only that
+	// exact pair, with exactly those two values, is exempt -- the same rule validatePairIdentity applies.
+	if !strings.EqualFold(strings.TrimSpace(fm.DartRevision), strings.TrimSpace(tm.DartRevision)) &&
+		!allowsLegacyDartRevisionMismatch(fm.SoroqFrontendVersion, tm.SoroqToolchainVersion, fm.DartRevision, tm.DartRevision) {
+		return fmt.Errorf("frontend/toolchain dart revision disagreement: frontend %q says %q, toolchain %q says %q",
+			fm.SoroqFrontendVersion, short(fm.DartRevision), want, short(tm.DartRevision))
+	}
+	return nil
+}
+
 // verifyFrontendTreeMatchesManifest is what REPLACES the hardcoded revision pin.
 //
 // The CLI no longer decides which Flutter a frontend may carry, so it must instead prove the tree it
@@ -281,14 +336,24 @@ func checkFrontendIdentity(m frontendManifest) error {
 // each equal what the signed manifest declares. Runs before the cache swap, and again on every offline
 // re-verification of an installed SIGNED frontend.
 func verifyFrontendTreeMatchesManifest(m frontendManifest, sdkDir string) error {
-	flutterRev, dartRev, engineRev, err := frontendTreeRevisions(sdkDir)
+	engineMarker := filepath.Join("bin", "internal", "engine.version")
+	wantDart := m.DartRevision
+	dartWhat := "dart revision (bin/cache/dart-sdk/revision)"
+	// One enumerated legacy artifact keeps its markers elsewhere / in another form; every marker is still
+	// read and compared (legacy_frontend_tree_compat.go).
+	if l, ok := legacyTreeLayoutFor(m); ok {
+		engineMarker = filepath.FromSlash(l.engineMarker)
+		wantDart = l.treeDartRevision
+		dartWhat = "dart revision (bin/cache/dart-sdk/revision, legacy layout)"
+	}
+	flutterRev, dartRev, engineRev, err := frontendTreeRevisionsAt(sdkDir, engineMarker)
 	if err != nil {
 		return err
 	}
 	for _, c := range []struct{ what, manifest, tree string }{
 		{"flutter revision", m.FlutterRevision, flutterRev},
-		{"dart revision (bin/cache/dart-sdk/revision)", m.DartRevision, dartRev},
-		{"engine revision (bin/internal/engine.version)", m.EngineRevision, engineRev},
+		{dartWhat, wantDart, dartRev},
+		{"engine revision (" + filepath.ToSlash(engineMarker) + ")", m.EngineRevision, engineRev},
 	} {
 		if !strings.EqualFold(strings.TrimSpace(c.manifest), strings.TrimSpace(c.tree)) {
 			return fmt.Errorf("%s mismatch: signed manifest says %q, the extracted frontend tree says %q",
@@ -300,6 +365,11 @@ func verifyFrontendTreeMatchesManifest(m frontendManifest, sdkDir string) error 
 
 // frontendTreeRevisions reads the three revision markers the shipped Flutter SDK tree carries.
 func frontendTreeRevisions(sdkDir string) (flutterRev, dartRev, engineRev string, err error) {
+	return frontendTreeRevisionsAt(sdkDir, filepath.Join("bin", "internal", "engine.version"))
+}
+
+// frontendTreeRevisionsAt is frontendTreeRevisions with the engine marker's tree-relative path supplied.
+func frontendTreeRevisionsAt(sdkDir, engineMarker string) (flutterRev, dartRev, engineRev string, err error) {
 	readTrim := func(rel string) (string, error) {
 		b, rerr := os.ReadFile(filepath.Join(sdkDir, rel))
 		if rerr != nil {
@@ -310,7 +380,7 @@ func frontendTreeRevisions(sdkDir string) (flutterRev, dartRev, engineRev string
 	if dartRev, err = readTrim(filepath.Join("bin", "cache", "dart-sdk", "revision")); err != nil {
 		return "", "", "", err
 	}
-	if engineRev, err = readTrim(filepath.Join("bin", "internal", "engine.version")); err != nil {
+	if engineRev, err = readTrim(engineMarker); err != nil {
 		return "", "", "", err
 	}
 	// The framework revision is the tree's own git HEAD; the archive ships self-contained git metadata.
@@ -937,15 +1007,27 @@ func streamDownloadToFile(rawURL string, dst *os.File, progress io.Writer) (stri
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
-// untarGzReader extracts gzip'd tar bytes from r into dst. Rejects unsafe (absolute / .. traversal) entries.
-// Streaming variant of untarGz (bytes) so a ~1 GB archive is never held whole in memory. The frontend
-// archive contains only regular files + directories (no symlinks/hardlinks), so those are the handled types.
+// untarGzReader extracts gzip'd tar bytes from r into dst, refusing any entry that would write outside
+// dst. Streaming, so a ~1 GB archive is never held whole in memory. Shared by the frontend and toolchain
+// installs: two extractors disagreeing about what a tar entry means is how a symlink ends up written as a
+// regular file containing its own target path.
+//
+// Symlinks are REAL entries here, not an edge case. Flutter 3.44.9 ships engine/src, whose web_ui tests
+// are symlinked; refusing type 2 outright rejected a correctly signed frontend after its full download.
+// They are also the one entry type that can escape dst without a ".." in its own name -- a link to
+// ../../.. followed by an entry writing through it -- so every link is required to resolve inside dst.
 func untarGzReader(r io.Reader, dst string) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return err
 	}
 	defer gz.Close()
+
+	// escapes reports whether a cleaned, dst-relative path leaves dst.
+	escapes := func(p string) bool {
+		return filepath.IsAbs(p) || p == ".." || strings.HasPrefix(p, ".."+string(filepath.Separator))
+	}
+
 	tr := tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()
@@ -955,8 +1037,12 @@ func untarGzReader(r io.Reader, dst string) error {
 		if err != nil {
 			return err
 		}
+		// Archive-level PAX metadata describes the stream, not a file to create.
+		if hdr.Typeflag == tar.TypeXGlobalHeader || hdr.Typeflag == tar.TypeXHeader {
+			continue
+		}
 		clean := filepath.Clean(hdr.Name)
-		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		if escapes(clean) {
 			return fmt.Errorf("refusing unsafe archive entry %q", hdr.Name)
 		}
 		// Skip macOS AppleDouble sidecars (._name). A frontend archive tarred on macOS without
@@ -986,6 +1072,39 @@ func untarGzReader(r io.Reader, dst string) error {
 				return err
 			}
 			if err := out.Close(); err != nil {
+				return err
+			}
+		case tar.TypeSymlink:
+			// A symlink target is relative to the link's OWN directory, so that is where containment is
+			// judged from. An absolute target escapes by definition.
+			if filepath.IsAbs(hdr.Linkname) || escapes(filepath.Join(filepath.Dir(clean), hdr.Linkname)) {
+				return fmt.Errorf("refusing archive symlink %q -> %q: it resolves outside the extraction root",
+					hdr.Name, hdr.Linkname)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			// A re-extraction over a partial tree would otherwise fail on an existing link.
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return err
+			}
+		case tar.TypeLink:
+			// A hardlink target is relative to the archive ROOT, not to the link's directory.
+			linkClean := filepath.Clean(hdr.Linkname)
+			if escapes(linkClean) {
+				return fmt.Errorf("refusing archive hardlink %q -> %q: it resolves outside the extraction root",
+					hdr.Name, hdr.Linkname)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Link(filepath.Join(dst, linkClean), target); err != nil {
 				return err
 			}
 		default:

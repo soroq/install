@@ -667,6 +667,49 @@ type engineLaneBundleDescriptor struct {
 	HostURL             string `json:"host_url,omitempty"` // device kHostBase when published via --api
 }
 
+// refuseObfuscatedBaseOnLegacyRoute stops the INDEXED engine-lane route from being pointed at an
+// obfuscated base.
+//
+// This route compiles bytecode with a fixed dart2bytecode invocation and resolves patches by NUMERIC
+// INDEX against soroqPatchTable. It has no base obfuscation map, no identity translation and no
+// receipt, and it never will: identity translation belongs to the freehand lane, which is the lane
+// that binds by declaration identity in the first place.
+//
+// Without this, pointing it at an obfuscated base would compile, sign, publish and install -- and then
+// resolve nothing, silently, on a user's device. Refusing is the only honest outcome, and it names the
+// lane that does support it.
+func refuseObfuscatedBaseOnLegacyRoute(baselinePath string) error {
+	if strings.TrimSpace(baselinePath) == "" {
+		return nil
+	}
+	// The freehand baseline is a SIBLING of the engine-lane one, under the same release directory. A
+	// captured obfuscation map beside it is the fact this route must not ignore.
+	dir := filepath.Dir(baselinePath)
+	for _, candidate := range []string{
+		filepath.Join(dir, "base_obfuscation_map.json"),
+		filepath.Join(dir, "baseline.json"),
+	} {
+		raw, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		if strings.HasSuffix(candidate, "base_obfuscation_map.json") ||
+			bytes.Contains(raw, []byte(`"obfuscation"`)) {
+			return fmt.Errorf(`refusing to patch an OBFUSCATED base through the indexed engine-lane route
+
+%s indicates the base was built with --obfuscate. This route resolves patches by numeric index and
+compiles with no base obfuscation map, no identity translation and no translation receipt, so a patch
+built here would install, commit and resolve nothing on device.
+
+Use the freehand lane, which binds by declaration identity and translates through the base's captured
+map:
+
+    soroq patch ios --engine`, candidate)
+		}
+	}
+	return nil
+}
+
 func runPatchIOSEngine(args []string) error {
 	fs := flag.NewFlagSet("patch ios-engine", flag.ContinueOnError)
 	baselinePath := fs.String("baseline", "", "path to the immutable engine-lane baseline json written by release ios-engine")
@@ -690,6 +733,9 @@ func runPatchIOSEngine(args []string) error {
 	rollout := fs.Int("rollout", 100, "initial rollout percentage (1-100) for staged/canary delivery; 100 = all devices, partial buckets by device client id (to pause a published patch to 0%, use the rollout command)")
 	format := fs.String("format", "text", "output format: text or json")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := refuseObfuscatedBaseOnLegacyRoute(*baselinePath); err != nil {
 		return err
 	}
 	indexExplicit := false

@@ -105,7 +105,7 @@ func buildFreehandArtifactFrom(t *testing.T, dir string, decls []abiDecl) (strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	artifactID := computeFreehandArtifactID(planSHA, bindingDigest, manifestSHA, descriptor.DescriptorDigest)
+	artifactID := computeFreehandArtifactID(planSHA, bindingDigest, manifestSHA, descriptor.DescriptorDigest, "")
 
 	// Every artifact carries a COMPLETE rich base identity, derived the way the real patch path derives
 	// it: base_fingerprint is the artifact's own base app.dill sha, and the digest is recomputed rather

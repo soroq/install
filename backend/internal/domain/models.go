@@ -518,6 +518,27 @@ type ToolchainArchive struct {
 	UploadedAt            time.Time `json:"uploaded_at,omitempty"`
 }
 
+// StagedToolchainArchive is a toolchain archive the control plane has received IN FULL and verified
+// (size and SHA-256 both equal to what the operator declared) BEFORE any manifest names it. It lives at a
+// content-addressed key and is publicly readable at /v1/toolchain-archives/sha256/<sha256>. Staging never
+// makes a toolchain version visible; only a manifest publication naming this exact digest and size does.
+type StagedToolchainArchive struct {
+	SHA256      string `json:"sha256"`
+	SizeBytes   uint64 `json:"size_bytes"`
+	ObjectKey   string `json:"object_key,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
+// StagedArchive is a frontend archive the control plane holds at a content-addressed key after verifying
+// its whole body against the declared size and SHA-256. It is publicly readable at
+// /v1/frontend-archives/sha256/<sha256>; staging never makes a frontend version visible.
+type StagedArchive struct {
+	SHA256      string `json:"sha256"`
+	SizeBytes   uint64 `json:"size_bytes"`
+	ObjectKey   string `json:"object_key,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
 // CLIAuthCode is a one-time PKCE authorization code minted by the website->backend authorize endpoint
 // (Deliverable 2, browser-based CLI login). SECURITY: only the sha256 (hex) of the raw code is ever
 // persisted — the raw code is returned to the caller once and never stored. The record is single-use

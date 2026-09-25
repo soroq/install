@@ -106,6 +106,12 @@ type FreehandBaselineMeta struct {
 	// baseline that is otherwise byte-identical must still re-register idempotently. Absent is read as
 	// legacy-default, never as "allow every kind".
 	RedirectCapabilities *FreehandRedirectCapabilities `json:"redirect_capabilities,omitempty"`
+	// Obfuscation is the recorded answer to "was this base built with --obfuscate, and which captured
+	// map is its ABI authority?" -- see FreehandObfuscationBinding. It is DERIVED at persist time from
+	// the build that produced this base, never taken from the caller, and it is absent on every base
+	// that was not obfuscated. Absence is read as "not obfuscated", never as permission: a patch
+	// against a base with no binding is compiled and bound exactly as it was before this existed.
+	Obfuscation *FreehandObfuscationBinding `json:"obfuscation,omitempty"`
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -150,6 +156,60 @@ const (
 // redirect kinds under. No engine ships it today; that absence is exactly why legacy-default exists.
 const freehandEngineCapabilityKey = "soroq_freehand_redirect_capabilities"
 
+// freehandPrivateEnclosingClassCapability is the toolchain capability an engine bundle declares when its
+// gen_snapshot canonicalizes a library-private ENCLOSING CLASS name before matching the patchable
+// manifest.
+//
+// WHY IT IS A CAPABILITY AND NOT A PRODUCER FLAG. The VM mangles a private class name with an
+// `@<library-key>` suffix, so `_HomePageState.build` reports as `_HomePageState@57413802::build` while
+// the analyzer's manifest carries the source name. On an engine WITHOUT this fix the exact compare can
+// never hit, the base never marks the function patchable, and a published batch installs, commits and
+// changes nothing. Whether a base can honour it is a property of the ENGINE THAT BUILT THAT BASE, which
+// is exactly what a per-base capability records. An old toolchain declares nothing and keeps refusing.
+//
+// It is deliberately NARROW: a private enclosing class with a PUBLIC member. A private MEMBER stays
+// refused, because its own name is mangled too and enabling it would widen the patchable surface far
+// past the shape this was measured for.
+const freehandPrivateEnclosingClassCapability = "private_enclosing_class_identity_v1"
+
+// freehandPublicFieldAccessorRetentionCapability is what an engine declares when its AOT compiler keeps
+// the implicit getter/setter dispatch targets for the PUBLIC INSTANCE FIELDS of a patchable class.
+//
+// WHY IT IS A CAPABILITY AND NOT A DETAIL. A redirected method runs on the REAL base receiver, and module
+// bytecode reaches a field by SELECTOR: `builds++` is an InterfaceCall of get:builds then set:builds. In
+// a base built WITHOUT this retention, the field was only touched from inside the method that got
+// replaced, so the access was lowered to a direct slot load/store, the implicit accessors had no call
+// sites, and AOT dropped them. The transition then resolves, validates, commits, reports committed=1 --
+// and the first frame throws
+//
+//	NoSuchMethodError: Class '_HomePageState' has no instance getter 'builds'
+//
+// with a blank screen. That is the exact failure the first real device session produced on
+// soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r1. Whether a base can survive it is a property of the
+// ENGINE THAT BUILT THAT BASE, which is what a per-base capability records; an engine without the fix
+// declares nothing and a base built on it does not claim to support field access.
+//
+// It is deliberately NARROW, and matches the engine's own scope: PUBLIC instance fields only. A private
+// field keeps NoSuchMethod-ing, exactly as before -- widening to private state would put the whole
+// private surface of every patchable class on the wire.
+const freehandPublicFieldAccessorRetentionCapability = "public_instance_field_accessor_retention_v1"
+
+// freehandPublicFieldAccessorDynamicDispatchCapability is the corrected r3 contract. The r2 engine
+// retained accessor Code, but a real device proved that Code alone is insufficient: product AOT had
+// removed the accessor from the class dictionary and had not retained a required dyn:* dispatcher.
+// r3 preserves those selector-resolution structures as well. Keep the r2 name recognized because its
+// signed immutable manifest exists, but never treat it as proof of working dynamic field dispatch.
+const freehandPublicFieldAccessorDynamicDispatchCapability = "public_instance_field_accessor_dynamic_dispatch_v1"
+
+// freehandKnownIdentityCapabilities is the closed set an engine may declare. An unknown name fails
+// closed rather than being carried through as an opaque string a future guard might match by accident.
+var freehandKnownIdentityCapabilities = map[string]bool{
+	freehandPrivateEnclosingClassCapability:              true,
+	freehandPublicFieldAccessorRetentionCapability:       true,
+	freehandPublicFieldAccessorDynamicDispatchCapability: true,
+	freehandObfuscatedIdentityTranslationCapability:      true,
+}
+
 // legacyDefaultRedirectKinds are the kinds that were demonstrably shipping before this tranche: they are
 // the method-shaped identities whose redirects have been observed to take effect on device. They are the
 // VALUE recorded onto a base that predates any engine declaration -- not a rule applied at patch time.
@@ -172,9 +232,28 @@ type FreehandRedirectCapabilities struct {
 	EngineRevision string `json:"engine_revision"`
 	// HonouredKinds is the set itself: sorted, de-duplicated, non-empty.
 	HonouredKinds []string `json:"honoured_kinds"`
+	// IdentityCapabilities are engine-declared IDENTITY-SHAPE capabilities, separate from the semantic
+	// kinds above: a kind says "a setter redirect takes effect", a capability says "an identity of this
+	// SHAPE can be matched at all". Empty on every base built before an engine declared one, which is
+	// what makes an old toolchain refuse rather than silently attempt.
+	IdentityCapabilities []string `json:"identity_capabilities,omitempty"`
 	// Note says IN THE RECORDED VALUE why the set is what it is, so someone reading a baseline.json years
 	// from now learns whether an engine declared this or nobody had measured it yet.
 	Note string `json:"note"`
+}
+
+// hasIdentityCapability reports whether the base's engine declared a named identity capability. A nil
+// receiver answers false: no record is not evidence of a capability.
+func (c *FreehandRedirectCapabilities) hasIdentityCapability(name string) bool {
+	if c == nil {
+		return false
+	}
+	for _, got := range c.IdentityCapabilities {
+		if got == name {
+			return true
+		}
+	}
+	return false
 }
 
 // kindSet is the membership test the publish-time guard uses.
@@ -287,6 +366,7 @@ func resolveRedirectCapabilitiesFromToolchains(root, engineRev string) (*Freehan
 	type found struct {
 		dir   string
 		kinds []string
+		caps  []string
 	}
 	matches := []found{}
 	for _, e := range entries {
@@ -311,11 +391,11 @@ func resolveRedirectCapabilitiesFromToolchains(root, engineRev string) (*Freehan
 			matches = append(matches, found{dir: e.Name(), kinds: nil})
 			continue
 		}
-		kinds, derr := decodeEngineCapabilityDeclaration(decl)
+		kinds, caps, derr := decodeEngineCapabilityDeclaration(decl)
 		if derr != nil {
 			return nil, fmt.Errorf("engine bundle %s declares a malformed %s: %w", enginePath, freehandEngineCapabilityKey, derr)
 		}
-		matches = append(matches, found{dir: e.Name(), kinds: kinds})
+		matches = append(matches, found{dir: e.Name(), kinds: kinds, caps: caps})
 	}
 	if len(matches) == 0 {
 		return legacyDefaultRedirectCapabilities(engineRev, "no installed engine bundle declares revision "+engineRev), nil
@@ -328,16 +408,23 @@ func resolveRedirectCapabilitiesFromToolchains(root, engineRev string) (*Freehan
 			return nil, fmt.Errorf("installed engine bundles %s and %s both claim engine revision %s but declare DIFFERENT honoured redirect kinds ([%s] vs [%s]); refusing to guess which engine this base was built with",
 				first.dir, m.dir, engineRev, strings.Join(first.kinds, ", "), strings.Join(m.kinds, ", "))
 		}
+		// The same disagreement rule applies to identity capabilities. One bundle claiming private-class
+		// matching while another denies it, for the SAME revision, means nobody knows what built the base.
+		if strings.Join(m.caps, ",") != strings.Join(first.caps, ",") {
+			return nil, fmt.Errorf("installed engine bundles %s and %s both claim engine revision %s but declare DIFFERENT identity capabilities ([%s] vs [%s]); refusing to guess which engine this base was built with",
+				first.dir, m.dir, engineRev, strings.Join(first.caps, ", "), strings.Join(m.caps, ", "))
+		}
 	}
 	if first.kinds == nil {
 		return legacyDefaultRedirectCapabilities(engineRev, "engine bundle "+first.dir+" declares no "+freehandEngineCapabilityKey), nil
 	}
 	c := &FreehandRedirectCapabilities{
-		Schema:         freehandRedirectCapabilitiesSchema,
-		Source:         freehandCapabilitySourceEngine,
-		EngineRevision: engineRev,
-		HonouredKinds:  first.kinds,
-		Note:           "declared by the engine bundle itself (" + freehandEngineCapabilityKey + " in " + first.dir + "/ios/engine.json)",
+		Schema:               freehandRedirectCapabilitiesSchema,
+		Source:               freehandCapabilitySourceEngine,
+		EngineRevision:       engineRev,
+		HonouredKinds:        first.kinds,
+		IdentityCapabilities: first.caps,
+		Note:                 "declared by the engine bundle itself (" + freehandEngineCapabilityKey + " in " + first.dir + "/ios/engine.json)",
 	}
 	if err := validateFreehandRedirectCapabilities(c); err != nil {
 		return nil, err
@@ -351,32 +438,53 @@ func resolveRedirectCapabilitiesFromToolchains(root, engineRev string) (*Freehan
 //
 // and nothing else: a bare list or a stray string would be a different contract, and guessing which one
 // an engine meant is how a producer ends up "unlocking" a kind the engine never claimed.
-func decodeEngineCapabilityDeclaration(raw json.RawMessage) ([]string, error) {
+func decodeEngineCapabilityDeclaration(raw json.RawMessage) ([]string, []string, error) {
 	var decl struct {
 		HonouredKinds []string `json:"honoured_kinds"`
+		// Optional. An engine that predates identity capabilities declares only honoured_kinds, and the
+		// absent field is what makes an old toolchain refuse the shapes it cannot match.
+		IdentityCapabilities []string `json:"identity_capabilities"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&decl); err != nil {
-		return nil, fmt.Errorf("not a {\"honoured_kinds\": [...]} object: %w", err)
+		return nil, nil, fmt.Errorf("not a {\"honoured_kinds\": [...]} object: %w", err)
 	}
 	if len(decl.HonouredKinds) == 0 {
-		return nil, errors.New("honoured_kinds is empty; an engine that honours nothing cannot receive any patch")
+		return nil, nil, errors.New("honoured_kinds is empty; an engine that honours nothing cannot receive any patch")
 	}
 	seen := map[string]bool{}
 	kinds := make([]string, 0, len(decl.HonouredKinds))
 	for _, k := range decl.HonouredKinds {
 		if !freehandSemanticKinds[k] {
-			return nil, fmt.Errorf("honoured_kinds contains %q, which is not a frozen semantic identity kind (%s)", k, freehandSemanticKindList())
+			return nil, nil, fmt.Errorf("honoured_kinds contains %q, which is not a frozen semantic identity kind (%s)", k, freehandSemanticKindList())
 		}
 		if seen[k] {
-			return nil, fmt.Errorf("honoured_kinds lists %q twice", k)
+			return nil, nil, fmt.Errorf("honoured_kinds lists %q twice", k)
 		}
 		seen[k] = true
 		kinds = append(kinds, k)
 	}
 	sort.Strings(kinds)
-	return kinds, nil
+
+	// Identity capabilities come from a CLOSED set. An engine that declares a name this producer does
+	// not know is refused outright rather than carried through: an opaque string that no guard matches
+	// today is a string some future guard might match by accident, and the whole point of the record is
+	// that a base can only claim what an engine demonstrated.
+	seenCap := map[string]bool{}
+	caps := make([]string, 0, len(decl.IdentityCapabilities))
+	for _, c := range decl.IdentityCapabilities {
+		if !freehandKnownIdentityCapabilities[c] {
+			return nil, nil, fmt.Errorf("identity_capabilities contains %q, which this producer does not recognize", c)
+		}
+		if seenCap[c] {
+			return nil, nil, fmt.Errorf("identity_capabilities lists %q twice", c)
+		}
+		seenCap[c] = true
+		caps = append(caps, c)
+	}
+	sort.Strings(caps)
+	return kinds, caps, nil
 }
 
 // requireFreehandRetention fails closed unless the baseline carries verified, non-empty, consistent
@@ -710,7 +818,45 @@ func verifyExistingBaseline(relDir string) (*FreehandBaselineMeta, error) {
 	if _, err := baseRedirectCapabilities(&m); err != nil {
 		return nil, err
 	}
+	// THE OBFUSCATION MAP IS A BASELINE MEMBER, verified exactly like app.dill and the manifest: the
+	// binding must be well-formed, the file must exist, be regular, be mode 0600, and hash to the
+	// recorded digest with the recorded entry count. A map present WITHOUT a binding is a stray file
+	// inside an immutable directory and is refused rather than ignored -- ignoring it would let one be
+	// dropped beside a baseline and read by anything that looks for it by name.
+	if err := verifyBaselineObfuscationMap(relDir, &m); err != nil {
+		return nil, err
+	}
 	return &m, nil
+}
+
+// verifyBaselineObfuscationMap checks the captured map against the baseline's binding, in both
+// directions.
+func verifyBaselineObfuscationMap(relDir string, m *FreehandBaselineMeta) error {
+	if err := m.Obfuscation.validate(); err != nil {
+		return fmt.Errorf("baseline obfuscation binding: %w", err)
+	}
+	p := filepath.Join(relDir, freehandBaseObfuscationMapFile)
+	if !m.Obfuscation.isEnabled() {
+		if _, err := os.Lstat(p); err == nil {
+			return fmt.Errorf("baseline %s contains an obfuscation map but declares no obfuscation binding", relDir)
+		}
+		return nil
+	}
+	raw, err := readCapturedObfuscationMap(p)
+	if err != nil {
+		return err
+	}
+	if got := freehandSHA256Bytes(raw); got != m.Obfuscation.MapSHA256 {
+		return fmt.Errorf("baseline obfuscation map hash mismatch: %s != recorded %s", got, m.Obfuscation.MapSHA256)
+	}
+	entries, err := parseBaseObfuscationMap(raw)
+	if err != nil {
+		return fmt.Errorf("baseline obfuscation map: %w", err)
+	}
+	if entries != m.Obfuscation.MapEntries {
+		return fmt.Errorf("baseline obfuscation map has %d entries, recorded %d", entries, m.Obfuscation.MapEntries)
+	}
+	return nil
 }
 
 // countManifestEntries counts non-empty manifest lines (the true patchable-symbol count).
@@ -787,13 +933,41 @@ func immutableInputsEqual(a, b *FreehandBaselineMeta) bool {
 		a.DependencyPackageConfigSHA256 == b.DependencyPackageConfigSHA256 &&
 		a.ContractSchema == b.ContractSchema &&
 		a.ContractDigest == b.ContractDigest &&
-		retentionEqual(a.Retention, b.Retention)
+		retentionEqual(a.Retention, b.Retention) &&
+		obfuscationBindingEqual(a.Obfuscation, b.Obfuscation)
 }
 
-// persistFreehandBaseline atomically snapshots (appDill, manifest, graph) + baseline.json under
-// .soroq/releases/<runtime-id>/, returning the release dir. Immutable across all inputs, idempotent
-// for an identical re-run, hash-verified, path-safe, fault-atomic, and fsync-durable.
-func persistFreehandBaseline(projectDir string, meta FreehandBaselineMeta, appDillPath, sourceDillPath, manifestPath, graphPath string, depGraph depgraph.Graph) (string, error) {
+// obfuscationBindingEqual compares the COMPLETE binding. Comparing only the digest would let a base
+// recorded under a different capability or map format be reused idempotently for one recorded under
+// this toolchain's.
+func obfuscationBindingEqual(a, b *FreehandObfuscationBinding) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// persistFreehandBaseline atomically snapshots (appDill, manifest, graph, obfuscation map) +
+// baseline.json under .soroq/releases/<runtime-id>/, returning the release dir. Immutable across all
+// inputs, idempotent for an identical re-run, hash-verified, path-safe, fault-atomic, and
+// fsync-durable.
+//
+// obfMapSrc IS PART OF THE TRANSACTION. It used to be adopted after this function returned, which left
+// a window where the published baseline declared a map it did not have -- and nothing rejected that
+// afterwards, because the verifier did not look. The map is now copied and fully verified inside the
+// temporary directory BEFORE baseline.json is written, so the rename publishes both or neither.
+func persistFreehandBaseline(projectDir string, meta FreehandBaselineMeta, appDillPath, sourceDillPath, manifestPath, graphPath string, depGraph depgraph.Graph, obfMapSrc string) (string, error) {
+	// The two halves must agree before anything is read or written. A binding with no map cannot be
+	// completed, and a map with no binding has no authority.
+	if err := meta.Obfuscation.validate(); err != nil {
+		return "", fmt.Errorf("refusing to persist a baseline with an invalid obfuscation binding: %w", err)
+	}
+	if meta.Obfuscation.isEnabled() && strings.TrimSpace(obfMapSrc) == "" {
+		return "", errors.New("refusing to persist a baseline that declares obfuscation with no captured map to publish")
+	}
+	if !meta.Obfuscation.isEnabled() && strings.TrimSpace(obfMapSrc) != "" {
+		return "", errors.New("refusing to publish an obfuscation map into a baseline that declares none")
+	}
 	if err := validateRuntimeID(meta.RuntimeID); err != nil {
 		return "", err
 	}
@@ -854,8 +1028,20 @@ func persistFreehandBaseline(projectDir string, meta FreehandBaselineMeta, appDi
 	// caller supplies Verified+AnalysisID ONLY after the analysis staging validated against the live
 	// app.dill (verifyFreehandStagingStrict). Fail closed unless the evidence is complete — a plain/
 	// reused Flutter build never reaches here with Retention.Verified set.
+	//
+	// meta arrives BY VALUE but Retention and Obfuscation are pointers, so writing through them would
+	// mutate state the caller still owns -- and two callers sharing one meta would race on it. Both are
+	// deep-copied here, so this function derives its own values and observably changes nothing outside
+	// itself.
 	if meta.Retention == nil {
 		meta.Retention = &FreehandRetentionEvidence{}
+	} else {
+		retention := *meta.Retention
+		meta.Retention = &retention
+	}
+	if meta.Obfuscation != nil {
+		obfuscation := *meta.Obfuscation
+		meta.Obfuscation = &obfuscation
 	}
 	meta.Retention.RetainedIdentities = meta.PatchableCount
 	meta.Retention.ManifestSHA256 = meta.ManifestSHA256
@@ -949,6 +1135,15 @@ func persistFreehandBaseline(projectDir string, meta FreehandBaselineMeta, appDi
 	}
 	if err := freehandFault("after-dependency-graph"); err != nil {
 		return "", err
+	}
+	// THE MAP, INSIDE THE TRANSACTION, BEFORE baseline.json.
+	if meta.Obfuscation.isEnabled() {
+		if err := publishObfuscationMapInto(tmpDir, obfMapSrc, meta.Obfuscation); err != nil {
+			return "", err
+		}
+		if err := freehandFault("after-obfuscation-map"); err != nil {
+			return "", err
+		}
 	}
 	metaBytes, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {

@@ -475,6 +475,17 @@ func buildIOSAppDill(projectDir, toolchainVersion string, extraArgs []string) (s
 		return "", err
 	}
 
+	// STRICT PAIR BINDING, before Flutter is invoked at all.
+	//
+	// A frontend and a toolchain are a version-matched pair. Building the 3.44.9 toolchain against the
+	// 3.44.2 frontend does not fail cleanly: the frontend_server dies inside kernelForProgram with a bare
+	// "Target kernel_snapshot_program failed: Exception" and leaves a ZERO-BYTE app.dill, after minutes
+	// of build, naming neither artifact. The publisher already states which toolchains a frontend pairs
+	// with, so that statement is checked here and the refusal names both.
+	if err := assertActiveFrontendPairsWithToolchain(toolchainVersion, iosBundleDir); err != nil {
+		return "", err
+	}
+
 	// THE MODE THE ENGINE DECLARES, not a constant. See iosFlutterBuildModeFlag.
 	engineBuildMode, engineTier, err := iosToolchainEngineMode(iosBundleDir)
 	if err != nil {
@@ -639,4 +650,44 @@ func iosFrameworkInfoPlistFor(buildMode string) string {
 </dict>
 </plist>
 `
+}
+
+// assertActiveFrontendPairsWithToolchain refuses a frontend/toolchain pair the publisher never declared,
+// reading BOTH signed manifests from their caches. An unsigned candidate frontend carries no
+// compatible_toolchain_ids to check, so it is left to the candidate path's own provenance warning
+// rather than being failed here.
+func assertActiveFrontendPairsWithToolchain(toolchainVersion, iosBundleDir string) error {
+	tcDir, err := toolchainVersionDir(toolchainVersion)
+	if err != nil {
+		return err
+	}
+	tcRaw, err := os.ReadFile(filepath.Join(tcDir, "manifest.json"))
+	if err != nil {
+		// No cached toolchain manifest (a locally packed bundle, say). The engine.json identity checks
+		// above still applied; there is no signed pairing statement to enforce.
+		return nil
+	}
+	tm, err := parseCLIManifest(tcRaw)
+	if err != nil {
+		return fmt.Errorf("read the cached toolchain manifest for %q: %w", toolchainVersion, err)
+	}
+
+	bin, berr := resolveInstalledFrontendFlutterBin()
+	if berr != nil || strings.TrimSpace(bin) == "" {
+		return nil // no installed frontend record to pair against
+	}
+	// <version>/flutter-sdk-src/bin/flutter -> <version>/manifest.json
+	feDir := filepath.Dir(filepath.Dir(filepath.Dir(bin)))
+	feRaw, ferr := os.ReadFile(filepath.Join(feDir, "manifest.json"))
+	if ferr != nil {
+		return nil
+	}
+	fm, perr := parseFrontendManifest(feRaw)
+	if perr != nil {
+		return fmt.Errorf("read the active frontend manifest: %w", perr)
+	}
+	if len(fm.CompatibleToolchainIDs) == 0 {
+		return nil // unsigned candidate: no declared pairing to enforce
+	}
+	return assertFrontendToolchainPair(fm, tm)
 }

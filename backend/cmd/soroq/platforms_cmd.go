@@ -444,6 +444,13 @@ func withDerivedFlags(platform, projectDir string, args []string) ([]string, err
 	}
 	if !hasFlag(out, "release-id") {
 		if rid := deriveReleaseIDForPlatform(projectDir, platform); rid != "" {
+			// A flavored release gets a flavor-qualified id, so two flavors of one version never
+			// claim the same id. Unflavored ids are unchanged.
+			if flavor, err := flavorFromPlatformArgs(projectDir, out); err != nil {
+				return nil, err
+			} else if flavor != "" {
+				rid += "-" + strings.ToLower(flavor)
+			}
 			out = append(out, "--release-id", rid)
 		}
 	}
