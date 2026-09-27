@@ -32,6 +32,8 @@ func main() {
 		}
 		fmt.Printf("soroq %s\n", buildVersion)
 		return
+	case "analytics":
+		err = runAnalytics(os.Args[2:])
 	case "app":
 		err = runApp(os.Args[2:])
 	case "cache":
@@ -197,6 +199,7 @@ Ship updates:
   patch      publish a code update for the current project
   patches    list your updates, inspect one, promote it, or change its track
   rollback   return users to the previous good version
+  analytics  see how your updates are reaching devices (booted, failed, why)
   preview    show what this project would publish, without publishing
 
 Look around:
