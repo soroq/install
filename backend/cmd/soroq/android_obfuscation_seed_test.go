@@ -53,8 +53,15 @@ func TestAndroidObfuscationArgsValidation(t *testing.T) {
 		{[]string{"--obfuscate", "--split-debug-info=x", "--target-platform=android-arm64"}, ""},
 		{[]string{"--obfuscate", "--target-platform=android-arm64"}, "both --obfuscate and --split-debug-info"},
 		{[]string{"--split-debug-info=x", "--target-platform=android-arm64"}, "both --obfuscate and --split-debug-info"},
-		{[]string{"--obfuscate", "--split-debug-info=x"}, "must target exactly android-arm64"},
-		{[]string{"--obfuscate", "--split-debug-info=x", "--target-platform=android-arm64,android-arm"}, "must target exactly android-arm64"},
+		{[]string{"--obfuscate", "--split-debug-info=x"}, "must name its ABIs"},
+		// Several ABIs: allowed here; each ABI writes, and is later seeded from, its own map.
+		{[]string{"--obfuscate", "--split-debug-info=x", "--target-platform=android-arm64,android-arm"}, ""},
+		{[]string{"--obfuscate", "--split-debug-info=x", "--target-platform", "android-arm,android-arm64,android-x64"}, ""},
+		{[]string{"--obfuscate", "--split-debug-info=x", "--target-platform=android-arm64,android-arm64"}, "twice or an unsupported platform"},
+		{[]string{"--obfuscate", "--split-debug-info=x", "--target-platform=android-arm64,android-x86"}, "twice or an unsupported platform"},
+		// Any single supported ABI (arm64 keeps the v1 record; others get a per-ABI one).
+		{[]string{"--obfuscate", "--split-debug-info=x", "--target-platform=android-arm"}, ""},
+		{[]string{"--obfuscate", "--split-debug-info=x", "--target-platform=android-x86"}, "unsupported platform"},
 		{append(append([]string{}, seedObfArgs...), "--extra-gen-snapshot-options=--foo"), "--extra-gen-snapshot-options cannot be combined"},
 	}
 	for _, c := range cases {

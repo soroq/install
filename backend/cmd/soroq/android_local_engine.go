@@ -111,7 +111,8 @@ func materializeAndroidLocalEngineLayout(androidBundleDir string) error {
 	if err := linkOrCopyFile(packedEmbeddingJar, filepath.Join(targetOut, "flutter_embedding_release.jar")); err != nil {
 		return fmt.Errorf("materialize flutter_embedding_release.jar: %w", err)
 	}
-	return nil
+	// A multi-ABI toolchain's other engines, as sibling out dirs (android_multi_abi.go).
+	return materializeAndroidExtraABIs(androidBundleDir)
 }
 
 // assertSoroqEmbeddingJar fails (fail-safe) unless the jar's FlutterLoader class carries the SOROQ
@@ -244,7 +245,7 @@ func materializeStockAndroidEmbedding(cacheDir, targetOut string) error {
 			return err
 		}
 	}
-	return nil
+	return materializeAndroidExtraABIMaven(filepath.Dir(filepath.Dir(targetOut)), version)
 }
 
 // androidEmbeddingPomPins pins the stock flutter_embedding_release POM per embedding version. It is
@@ -353,8 +354,13 @@ func androidEmbeddingMavenMetadata(artifactID, version string) string {
 `
 }
 
-// writeAndroidEmbeddingJar builds a JAR (zip) containing lib/<abi>/libflutter.so from the soroq .so.
+// writeAndroidEmbeddingJar builds the arm64-v8a engine JAR (zip) containing lib/arm64-v8a/libflutter.so.
 func writeAndroidEmbeddingJar(libflutterPath, jarPath string) error {
+	return writeAndroidEngineJar(libflutterPath, jarPath, androidPrimaryABI)
+}
+
+// writeAndroidEngineJar builds an engine JAR (zip) containing lib/<abi>/libflutter.so from the soroq .so.
+func writeAndroidEngineJar(libflutterPath, jarPath, abi string) error {
 	if err := os.MkdirAll(filepath.Dir(jarPath), 0o755); err != nil {
 		return err
 	}
@@ -364,7 +370,7 @@ func writeAndroidEmbeddingJar(libflutterPath, jarPath string) error {
 		return err
 	}
 	zw := zip.NewWriter(out)
-	w, err := zw.Create("lib/arm64-v8a/libflutter.so")
+	w, err := zw.Create("lib/" + abi + "/libflutter.so")
 	if err != nil {
 		_ = out.Close()
 		_ = os.Remove(tmp)

@@ -23,6 +23,13 @@ func TestInstallUnsignedFrontendForLocalProof(t *testing.T) {
 	if archive == "" || manifestPath == "" {
 		t.Skip("SOROQ_LOCAL_FRONTEND_PROOF_ARCHIVE / _MANIFEST not set")
 	}
+	// TestMain gives every test an isolated temporary HOME, so the proof HOME must be named: without
+	// it the install lands in a directory deleted when the test binary exits.
+	proofHome := os.Getenv("SOROQ_LOCAL_FRONTEND_PROOF_HOME")
+	if proofHome == "" {
+		t.Fatal("SOROQ_LOCAL_FRONTEND_PROOF_HOME not set: name the HOME the frontend is installed into")
+	}
+	t.Setenv("HOME", proofHome)
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
 		t.Fatal(err)

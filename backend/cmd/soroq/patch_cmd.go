@@ -812,6 +812,12 @@ func runPatchAndroid(args []string) error {
 		if err != nil {
 			return err
 		}
+		// The candidate builds exactly the base's ABIs: an added or dropped ABI changes native
+		// libraries, which the code-patch lane refuses after the build anyway.
+		flutterBuildArgs, err = withBaseTargetPlatforms(flutterBuildArgs, androidrelease.DeriveABIs(baseSnapshot))
+		if err != nil {
+			return err
+		}
 		obfPlan, err := planAndroidPatchObfuscation(status.ProjectDir, resolvedReleaseID, buildToolchainVersion, flutterBuildArgs)
 		if err != nil {
 			return err
