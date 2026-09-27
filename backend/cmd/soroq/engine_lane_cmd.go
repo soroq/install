@@ -194,6 +194,7 @@ func runReleaseIOSEngineBuild(args []string) error {
 		return err
 	}
 	head, passthrough = iosFlavor.head, iosFlavor.passthrough
+	head = withProjectReleaseChannel(head, projectDir)
 	if err := guardSupportedIOSApplicationShape(projectDir); err != nil {
 		return err
 	}
@@ -534,4 +535,24 @@ func resolveSoroqctl() (string, error) {
 	return "", errors.New("engine lane requires the soroqctl binary (not found next to soroq or on PATH); " +
 		"build it (go build ./backend/cmd/soroqctl) and run `soroqctl <release|patch|rollback> ios-engine ...` directly, " +
 		"or place soroqctl alongside the soroq executable")
+}
+
+// withProjectReleaseChannel registers an UNFLAVORED iOS engine release on soroq.yaml's channel.
+//
+// A declared flavor already passes its own channel (resolveIOSEngineFlavorRoute), and an explicit
+// --channel wins. Without either, the delegate's default ("stable") was used whatever soroq.yaml said,
+// while the app and every patch use soroq.yaml's channel -- so an app on any other channel got a
+// release its patches were refused against ("patch channel does not match release channel").
+func withProjectReleaseChannel(head []string, projectDir string) []string {
+	if hasFlag(head, "channel") {
+		return head
+	}
+	status, err := inspectProject(projectDir)
+	if err != nil {
+		return head
+	}
+	if ch := strings.TrimSpace(status.Channel); ch != "" {
+		return append(append([]string{}, head...), "--channel", ch)
+	}
+	return head
 }
