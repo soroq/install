@@ -417,6 +417,17 @@ func runReleaseAndroid(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Refuse an engine-less ABI when Soroq built with a multi-ABI frontend (which filters them out, so
+	// one here is a real defect); warn for anything else, which cannot be fixed from here.
+	strictABIs := false
+	if soroqBuilt {
+		if flutterBin, binErr := resolveSoroqFlutterBin(); binErr == nil {
+			strictABIs = frontendSupportsAndroidMultiABI(flutterBin)
+		}
+	}
+	if err := guardIncompleteAndroidABIs(snapshot, strictABIs); err != nil {
+		return err
+	}
 	channelOverride := *channel
 	if flavorChannelDeclared {
 		// The artifact must carry this flavor's channel; the mismatch check below proves the build used it.
@@ -846,9 +857,12 @@ func resolveReleaseArchForArtifact(artifactType string, abis []string, override 
 			// An AAB legitimately covers every ABI: Play splits it per-device at delivery.
 			return "universal", nil
 		}
-		// A fat APK binds the release to ONE architecture while every ABI inside it shares a single
-		// runtime_id -- patch selection keys on runtime_id and channel, not arch. Devices running the
-		// other ABIs therefore sit on this release and are offered patches built from this slice.
+		// A fat APK labels the release with ONE architecture while every ABI inside it shares a single
+		// runtime_id -- patch selection keys on runtime_id and channel, not arch (today's clients do not
+		// report one). Devices running the other ABIs therefore sit on this release and are offered its
+		// patches. That is safe: a patch is built for all of the base's ABIs (withBaseTargetPlatforms)
+		// and carries one payload per ABI, and the device materializes only the payload whose base
+		// matches its own libapp.so. A client that DID report a different arch would not be served.
 		//
 		// Preferring arm64 is a deliberate, tested default and is kept: it is right for the overwhelming
 		// majority of shipped Flutter apps. What was wrong is that it happened SILENTLY, so a developer
@@ -861,10 +875,11 @@ func resolveReleaseArchForArtifact(artifactType string, abis []string, override 
 			}
 		}
 		fmt.Fprintf(os.Stderr,
-			"warning: this APK contains %d ABIs (%s); the release is bound to %s.\n"+
-				"  Patches are selected by runtime id, not architecture, so devices running %s would be offered\n"+
-				"  code built for %s. Pass --arch to choose explicitly, or ship an app bundle\n"+
-				"  (--artifact-type aab) so Play delivers a per-ABI split.\n",
+			"warning: this APK contains %d ABIs (%s); the release is labelled %s.\n"+
+				"  Every ABI still gets its own code: a patch carries one payload per ABI and each device\n"+
+				"  applies the one built from its own base libapp.so, so devices running %s are served too.\n"+
+				"  Only the label is %s. Pass --arch to choose it explicitly, or ship an app bundle\n"+
+				"  (--artifact-type aab), which is recorded as universal.\n",
 			len(abis), strings.Join(abis, ", "), chosen, strings.Join(uncovered, ", "), chosen)
 		return chosen, nil
 	}

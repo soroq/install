@@ -111,6 +111,11 @@ func runFlutterAndroidReleaseBuild(projectDir string, artifactType string, toolc
 			return fmt.Errorf("prepare cached Android toolchain local-engine layout: %w", err)
 		}
 	}
+	// Make the build's ABIs explicit: every ABI a multi-ABI stack has, or a refusal for one it lacks.
+	extraArgs, err = resolveAndroidTargetPlatformArgs(extraArgs, source, flutterBin)
+	if err != nil {
+		return err
+	}
 	effectiveExtraArgs := soroqAndroidBuildExtraArgsForSource(extraArgs, flutterBin, source)
 	args := append([]string{"build", target, "--release"}, effectiveExtraArgs...)
 	cmd := exec.Command(flutterBin, args...)
