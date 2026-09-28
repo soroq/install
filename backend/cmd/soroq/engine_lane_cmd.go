@@ -171,6 +171,16 @@ func runReleaseIOSEngineBuild(args []string) error {
 	if _, ok := flagValue(head, "patchable-manifest"); ok {
 		return errors.New("with --engine --build, the patchable manifest is generated from soroq.yaml; do not also pass --patchable-manifest")
 	}
+	// Opt-in signed IPA: check identity + profiles BEFORE the (long) build, so a missing identity or an
+	// expired/mismatched profile is reported in seconds rather than after a full engine build. The
+	// bundle-id checks need the built app and run at registration time (registerIOSEngineBaseline).
+	ipaRequest, err := parseIOSIPARequest(head)
+	if err != nil {
+		return err
+	}
+	if _, err := prepareIOSSigningPlan(ipaRequest); err != nil {
+		return err
+	}
 
 	// SHAPE GUARDS FOR THE REAL HARD-OTA ROUTE.
 	//
@@ -240,6 +250,9 @@ func runReleaseIOSEngineBuild(args []string) error {
 	if appDill == "" {
 		return buildErr
 	}
+	if buildErr != nil && ipaRequest != nil {
+		return fmt.Errorf("--ipa: the iOS build did not complete (%w); no signed IPA can be produced and no release was registered", buildErr)
+	}
 	if buildErr != nil {
 		// app.dill was produced before a tail (Xcode/codesign) failure; it is valid for baseline
 		// registration. Surface the tail failure as a note and proceed — a signed IPA is owner-gated.
@@ -256,7 +269,7 @@ func runReleaseIOSEngineBuild(args []string) error {
 		return err
 	}
 	delegateArgs = append(delegateArgs, "--app-dill", absDill, "--patchable-manifest", manifestPath)
-	return engineLaneDelegateFn("release", delegateArgs)
+	return registerIOSEngineBaseline(projectDir, engineLaneDelegateFn, "release", delegateArgs, false)
 }
 
 // iosEngineBuildPassthrough puts Soroq's base-retention contract before any

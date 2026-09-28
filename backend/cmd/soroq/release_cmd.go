@@ -88,6 +88,10 @@ func runRelease(args []string) error {
 		// soroqctl). Only --engine routes to the delegate — --toolchain belongs to --build.
 		// `release ios --engine --build` = UNIFIED fresh-dev path: generate scaffold + build
 		// app.dill + register baseline in one command.
+		if ipaHead, _ := splitFlutterPassthrough(args[1:]); hasIOSIPAFlags(ipaHead) &&
+			!(releaseIOSEngineRequested(ipaHead) && hasFlag(ipaHead, "build")) {
+			return errors.New("--ipa (signed IPA) is only available on the engine lane build: `soroq release ios --engine --build --toolchain <version> --ipa out.ipa --signing-identity <SHA1|name> --provisioning-profile <app.mobileprovision> [-- <flutter build flags>]`")
+		}
 		if releaseIOSEngineRequested(args[1:]) {
 			if hasFlag(args[1:], "build") {
 				return runReleaseIOSEngineBuild(args[1:])
@@ -605,6 +609,29 @@ func runReleaseIOS(args []string) error {
 	flavorFlag := fs.String("flavor", "", "Flutter build flavor (Xcode scheme) for the --build app-build leg only")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stdout, `usage: soroq release ios [--project-dir .] [--api https://api.soroq.dev] [--release-id my-ios-release] [--version 1.2.3+45] [--runtime-id ios-config-runtime] [--arch arm64] [--channel stable] [--manifest-key-id prod-primary] [--build --toolchain <version>] [--verbose|--quiet] [--json] [-- <flutter build flags>]`)
+		fmt.Fprintln(os.Stdout, `
+engine lane (Dart-code OTA baseline):
+  soroq release ios --engine --build --toolchain <version> [--release-id <id>] [--api <url>]
+      [--ipa <out.ipa> --signing-identity <SHA1|name> --provisioning-profile <app.mobileprovision>
+       [--extension-profile <bundle-id>=<profile.mobileprovision> ...] [--keychain <path>]]
+      [-- <flutter build flags, e.g. --no-codesign>]
+
+  Builds build/ios/iphoneos/Runner.app with the Soroq engine, writes the base identity into it and
+  registers the release. Without --ipa nothing is signed (behaviour unchanged).
+
+signed IPA (opt-in, engine lane only):
+  --ipa <out.ipa>                    write a signed, upload-ready IPA of the app this release registers
+  --signing-identity <SHA1|name>     codesigning identity (see: security find-identity -v -p codesigning)
+  --provisioning-profile <path>      profile for the app's CFBundleIdentifier (embedded.mobileprovision)
+  --extension-profile <id>=<path>    profile for each PlugIns/*.appex, by its bundle id (repeatable)
+  --keychain <path>                  keychain holding the identity; unlock it first, no password is taken
+
+  Identity and profiles are checked before the build (missing identity, expired profile, certificate
+  not in profile, team mismatch); bundle ids after it. Bundles are signed inside-out with entitlements
+  from each profile, verified with codesign --verify --deep --strict, and the SOROQ Flutter.framework
+  and soroq_base_identity.json are re-asserted before the IPA is packaged. The IPA is moved into place
+  only after the release registers. Watch apps, App Clips and embedded Swift runtime dylibs
+  (SwiftSupport/) are refused.`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

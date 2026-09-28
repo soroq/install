@@ -782,7 +782,8 @@ func freehandFinalizeBuild(head []string, projectDir, appDill string, buildErr e
 	if !hasFlag(delegateArgs, "api") {
 		delegateArgs = append(delegateArgs, "--api", defaultAPIBase())
 	}
-	return freehandReleaseDelegate("release", delegateArgs)
+	// The freehand base is keyed to soroq_base_identity.json, so a signed IPA must carry it (true).
+	return registerIOSEngineBaseline(projectDir, freehandReleaseDelegate, "release", delegateArgs, true)
 }
 
 // runReleaseIOSEngineBuildFreehand is the freehand build+persist flow. No patchable list, no lib/ files.

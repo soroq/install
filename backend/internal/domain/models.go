@@ -631,3 +631,49 @@ type Membership struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+
+// DeviceCheckin is one installed copy of an app having asked the control plane for an update.
+//
+// ClientHash is sha256(app_id NUL client_id) in hex. The raw per-install client id is never stored, and
+// neither is anything else about the request (no IP address, no user agent): the only question this
+// answers is "how many distinct installs are running this runtime", and a salted hash answers it.
+type DeviceCheckin struct {
+	AppID      string    `json:"app_id"`
+	RuntimeID  string    `json:"runtime_id"`
+	Channel    string    `json:"channel"`
+	ClientHash string    `json:"client_hash"`
+	SeenAt     time.Time `json:"seen_at"`
+}
+
+// DeviceCheckinRecord is the stored row: one per (app, runtime, client hash).
+type DeviceCheckinRecord struct {
+	AppID      string    `json:"app_id"`
+	RuntimeID  string    `json:"runtime_id"`
+	Channel    string    `json:"channel"`
+	ClientHash string    `json:"client_hash"`
+	FirstSeen  time.Time `json:"first_seen"`
+	LastSeen   time.Time `json:"last_seen"`
+}
+
+// DeviceCheckinRelease is a release registered under the runtime a group of devices reported.
+type DeviceCheckinRelease struct {
+	ID        string    `json:"id"`
+	Version   string    `json:"version"`
+	Platform  string    `json:"platform"`
+	Channel   string    `json:"channel"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// DeviceCheckinGroup aggregates the check-ins of one app for one (runtime, channel). A device is
+// counted under the channel it last reported. Releases lists every release registered with that
+// runtime id, newest first; it is empty when the runtime matches no registered release.
+type DeviceCheckinGroup struct {
+	RuntimeID string                 `json:"runtime_id"`
+	Channel   string                 `json:"channel"`
+	Devices   int                    `json:"devices"`
+	Active24h int                    `json:"active_24h"`
+	Active7d  int                    `json:"active_7d"`
+	FirstSeen time.Time              `json:"first_seen"`
+	LastSeen  time.Time              `json:"last_seen"`
+	Releases  []DeviceCheckinRelease `json:"releases"`
+}

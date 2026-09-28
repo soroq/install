@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func analyticsFixture() analyticsView {
@@ -66,5 +68,86 @@ func TestRenderAnalyticsGroupsByReleaseAndNeverShowsAbsentAsZero(t *testing.T) {
 	i, j := strings.Index(out, "crash_before_first_frame"), strings.Index(out, "crash_after_launch")
 	if i < 0 || j < 0 || i > j {
 		t.Fatalf("failure reasons not sorted by count:\n%s", out)
+	}
+}
+
+func devicesFixture() analyticsView {
+	v := analyticsFixture()
+	seen := time.Date(2026, 9, 28, 9, 30, 0, 0, time.UTC)
+	v.Devices = []analyticsDeviceRow{
+		{ReleaseID: "rel-a", Version: "1.0.41+57", RuntimeID: "a1b2c3d4e5f60718293a4b5c6d7e8f90", Channel: "stable", Devices: 120, Active24h: 80, Active7d: 110, LastSeen: seen},
+		{ReleaseID: "rel-b", ReleaseIDs: []string{"rel-b", "rel-b-ios"}, Version: "1.0.40+56", RuntimeID: "ffff", Channel: "beta", Devices: 3, Active24h: 0, Active7d: 1, LastSeen: seen},
+		{RuntimeID: "0000", Channel: "stable", Devices: 1, Active24h: 1, Active7d: 1, LastSeen: seen},
+	}
+	return v
+}
+
+func TestRenderAnalyticsShowsDevicesPerRelease(t *testing.T) {
+	var buf bytes.Buffer
+	renderAnalytics(&buf, devicesFixture())
+	out := buf.String()
+	for _, want := range []string{
+		"devices per release",
+		"RELEASE", "ACTIVE 24H", "ACTIVE 7D",
+		"rel-a", "1.0.41+57", "120", "80", "110", "2026-09-28 09:30", "a1b2c3d4e5f6\n",
+		"rel-b (+1)", "(unregistered)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "a1b2c3d4e5f60718") {
+		t.Fatalf("runtime id should be shortened:\n%s", out)
+	}
+}
+
+func TestRenderAnalyticsDevicesStatesAndOlderServers(t *testing.T) {
+	// An older server sends no devices field: no section at all.
+	var old bytes.Buffer
+	renderAnalytics(&old, analyticsFixture())
+	if strings.Contains(old.String(), "devices per release") {
+		t.Fatalf("older server output grew a devices section:\n%s", old.String())
+	}
+	// No devices yet, and no patches either: the section still renders.
+	var empty bytes.Buffer
+	v := analyticsView{AppID: "com.example.app", Devices: []analyticsDeviceRow{}}
+	renderAnalytics(&empty, v)
+	if !strings.Contains(empty.String(), "no devices have checked in yet") {
+		t.Fatalf("empty devices state:\n%s", empty.String())
+	}
+	var unavailable bytes.Buffer
+	renderAnalytics(&unavailable, analyticsView{AppID: "x", DevicesUnavailable: "device counts could not be read right now"})
+	if !strings.Contains(unavailable.String(), "devices per release: unavailable") {
+		t.Fatalf("unavailable state:\n%s", unavailable.String())
+	}
+}
+
+func TestFilterAnalyticsFiltersDevices(t *testing.T) {
+	if got := filterAnalytics(devicesFixture(), "", "beta").Devices; len(got) != 1 || got[0].ReleaseID != "rel-b" {
+		t.Fatalf("channel filter: %+v", got)
+	}
+	// A release sharing a runtime with the labelled one still matches.
+	if got := filterAnalytics(devicesFixture(), "rel-b-ios", "").Devices; len(got) != 1 || got[0].ReleaseID != "rel-b" {
+		t.Fatalf("release filter: %+v", got)
+	}
+	if got := filterAnalytics(devicesFixture(), "rel-none", "").Devices; got == nil || len(got) != 0 {
+		t.Fatalf("filtered-away devices should be empty, not absent: %#v", got)
+	}
+}
+
+func TestAnalyticsJSONCarriesDevices(t *testing.T) {
+	raw := []byte(`{"app_id":"a","totals":{},"patches":[],"devices":[{"release_id":"r","version":"1.0","runtime_id":"rt","channel":"stable","devices":2,"active_24h":1,"active_7d":2,"first_seen":"2026-09-01T00:00:00Z","last_seen":"2026-09-28T00:00:00Z"}]}`)
+	var v analyticsView
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"devices":2`, `"active_24h":1`, `"active_7d":2`, `"release_id":"r"`, `"last_seen":"2026-09-28T00:00:00Z"`} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("--json lost %s: %s", want, out)
+		}
 	}
 }
