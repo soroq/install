@@ -543,6 +543,8 @@ func runPatchHealth(args []string) error {
 }
 
 func runPatchAndroid(args []string) error {
+	projectDirForFrontend, _ := flagValue(args, "project-dir")
+	pinFrontendForPlatform(projectDirForFrontend, "android")
 	fs := flag.NewFlagSet("patch android", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
 	projectDir := fs.String("project-dir", ".", "Flutter app directory")
@@ -1471,6 +1473,8 @@ func summarizeAssetPatchBlockers(blockers []androidpatch.Blocker) string {
 }
 
 func runPatchIOS(args []string) error {
+	projectDirForFrontend, _ := flagValue(args, "project-dir")
+	pinFrontendForPlatform(projectDirForFrontend, "ios")
 	fs := flag.NewFlagSet("patch ios", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
 	projectDir := fs.String("project-dir", ".", "Flutter app directory")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -43,6 +44,8 @@ func runApp(args []string) error {
 		return runAppList(args[1:])
 	case "status":
 		return runAppStatus(args[1:])
+	case "delete":
+		return runAppDelete(args[1:])
 	case "-h", "--help", "help":
 		appUsage()
 		return nil
@@ -58,7 +61,8 @@ func appUsage() {
 commands:
   create  register a Soroq app in the control plane
   list    list registered Soroq apps
-  status  inspect a registered Soroq app in the control plane`)
+  status  inspect a registered Soroq app in the control plane
+  delete  delete an app with its releases, patches and device reports (owner only)`)
 }
 
 func addAppCreateHint(err error, appID string) error {
@@ -267,6 +271,58 @@ func resolveAppIDForProject(projectDir string, appID string) (projectStatus, str
 	}
 
 	return status, resolvedAppID, nil
+}
+
+type appDeleteSummary struct {
+	AppID    string `json:"app_id"`
+	Deleted  bool   `json:"deleted"`
+	Releases int    `json:"releases"`
+	Patches  int    `json:"patches"`
+}
+
+// runAppDelete removes an app from the control plane. The id is never taken from soroq.yaml: deleting
+// is the one command where "whatever project I happen to be in" must not be the default.
+func runAppDelete(args []string) error {
+	fs := flag.NewFlagSet("app delete", flag.ContinueOnError)
+	fs.SetOutput(os.Stdout)
+	apiBase := fs.String("api", defaultAPIBase(), "control plane base URL")
+	appID := fs.String("app-id", "", "app id to delete (required)")
+	yes := fs.Bool("yes", false, "confirm the deletion")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stdout, `usage: soroq app delete --app-id com.example.app --yes [--api https://api.soroq.dev] [--json]
+
+Deletes the app with all its releases, patches and device reports. It cannot be undone. Devices already
+running a patch keep it; they stop receiving updates.`)
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if err := refuseUnconsumedArguments("app delete", fs.Args(), nil); err != nil {
+		return err
+	}
+	resolvedAppID := strings.TrimSpace(*appID)
+	if resolvedAppID == "" {
+		return errors.New("--app-id is required")
+	}
+	if !*yes {
+		return fmt.Errorf("deleting %s removes its releases, patches and device reports for good; re-run with --yes to confirm", resolvedAppID)
+	}
+	target := appURL(strings.TrimRight(*apiBase, "/"), resolvedAppID) + "?confirm=" + url.QueryEscape(resolvedAppID)
+	summary, err := postNoBodyDecode[appDeleteSummary](http.MethodDelete, target)
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(summary)
+	}
+	fmt.Fprintf(os.Stdout, "deleted %s (%d releases, %d patches)\n", summary.AppID, summary.Releases, summary.Patches)
+	return nil
 }
 
 func appURL(apiBase string, appID string) string {

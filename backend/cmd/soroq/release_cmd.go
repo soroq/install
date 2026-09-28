@@ -229,6 +229,8 @@ func runReleaseStatus(args []string) error {
 }
 
 func runReleaseAndroid(args []string) error {
+	projectDirForFrontend, _ := flagValue(args, "project-dir")
+	pinFrontendForPlatform(projectDirForFrontend, "android")
 	fs := flag.NewFlagSet("release android", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
 	projectDir := fs.String("project-dir", ".", "Flutter app directory")
@@ -583,6 +585,8 @@ func runReleaseAndroid(args []string) error {
 }
 
 func runReleaseIOS(args []string) error {
+	projectDirForFrontend, _ := flagValue(args, "project-dir")
+	pinFrontendForPlatform(projectDirForFrontend, "ios")
 	fs := flag.NewFlagSet("release ios", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
 	projectDir := fs.String("project-dir", ".", "Flutter app directory")

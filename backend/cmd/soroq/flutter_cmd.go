@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -33,6 +35,8 @@ type flutterVersionEntry struct {
 	Platform         string `json:"platform"`
 	Tier             string `json:"tier"`
 	BuildMode        string `json:"build_mode"`
+	// CatalogV2 marks an entry read from the v2 catalog, which `soroq setup` installs by revision.
+	CatalogV2 bool `json:"catalog_v2"`
 }
 
 func runFlutter(args []string) error {
@@ -74,11 +78,12 @@ published, then "soroq flutter use <version>" to pin this project to one.`)
 // resolveSupportedFlutterVersions reads the SIGNED catalog and resolves each platform entry to the
 // exact Flutter identity recorded in its signed toolchain manifest.
 //
-// It reads whatever the catalog publishes. Today catalog.v1 carries one toolchain per platform, so this
-// returns one entry per platform; when the matrix publishes more, this returns more without a code
-// change. Nothing here caps, filters or invents a version.
+// It reads the signed v2 catalog, which can publish several Flutter versions per platform, and lists
+// every entry. v1 (one pair per platform) is read only when v2 is genuinely not published (a 404), the
+// same fallback rule every other v2 reader follows: an invalid v2 answer is a refusal, never a quiet
+// downgrade to v1. Nothing here caps, filters or invents a version.
 func resolveSupportedFlutterVersions(api string) ([]flutterVersionEntry, error) {
-	doc, err := fetchVerifiedCatalog(api)
+	pairs, err := publishedFlutterPairs(api)
 	if err != nil {
 		return nil, fmt.Errorf("read the supported Flutter list: %w", err)
 	}
@@ -86,14 +91,10 @@ func resolveSupportedFlutterVersions(api string) ([]flutterVersionEntry, error) 
 	// `for x in result` then fails on a machine where nothing is installed -- the exact machine a
 	// first run happens on. The command declares JSON; an empty array is what "no entries" looks like.
 	out := []flutterVersionEntry{}
-	for _, platform := range doc.platformNames() {
-		entry, err := doc.entryForPlatform(platform)
+	for _, pair := range pairs {
+		manifest, err := fetchCatalogToolchainManifest(api, pair.ToolchainVersion)
 		if err != nil {
-			continue
-		}
-		manifest, err := fetchCatalogToolchainManifest(api, entry.ToolchainVersion)
-		if err != nil {
-			return nil, fmt.Errorf("resolve toolchain %s: %w", entry.ToolchainVersion, err)
+			return nil, fmt.Errorf("resolve toolchain %s: %w", pair.ToolchainVersion, err)
 		}
 		out = append(out, flutterVersionEntry{
 			FlutterVersion:   manifest.FlutterVersion,
@@ -101,15 +102,16 @@ func resolveSupportedFlutterVersions(api string) ([]flutterVersionEntry, error) 
 			DartRevision:     manifest.DartRevision,
 			EngineRevision:   manifest.SoroqEngineRevision,
 			ToolchainVersion: manifest.SoroqToolchainVersion,
-			FrontendVersion:  entry.FrontendVersion,
-			Platform:         platform,
+			FrontendVersion:  pair.FrontendVersion,
+			Platform:         pair.Platform,
 			Tier:             manifest.Tier,
 			BuildMode:        manifest.BuildMode,
+			CatalogV2:        pair.Source == "v2",
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].FlutterVersion != out[j].FlutterVersion {
-			return out[i].FlutterVersion < out[j].FlutterVersion
+			return compareFlutterVersions(out[i].FlutterVersion, out[j].FlutterVersion) < 0
 		}
 		return out[i].Platform < out[j].Platform
 	})
@@ -161,7 +163,7 @@ func runFlutterVersions(args []string) error {
 		fmt.Printf("             %-8s dart %s, toolchain %s\n", "", shortRevision(e.DartRevision), e.ToolchainVersion)
 	}
 	fmt.Println()
-	fmt.Printf("Pin this project with:  soroq flutter use %s\n", entries[0].FlutterVersion)
+	fmt.Printf("Pin this project with:  soroq flutter use %s\n", newestFlutterVersion(entries))
 	return nil
 }
 
@@ -268,7 +270,8 @@ func runFlutterUse(args []string) error {
 		fmt.Printf("  %-8s engine    %s\n", "", shortRevision(e.EngineRevision))
 	}
 	fmt.Printf("\nWritten to %s\n", soroqLockPath(*projectDir))
-	fmt.Printf("Next:  soroq doctor --all\n")
+	fmt.Printf("Next:  %s\n", setupCommandFor(matched))
+	fmt.Printf("Then:  soroq doctor\n")
 	return nil
 }
 
@@ -291,4 +294,115 @@ func isHexString(s string) bool {
 		}
 	}
 	return len(s) > 0
+}
+
+// publishedFlutterPairs lists every (platform, frontend, toolchain) pair the control plane publishes.
+func publishedFlutterPairs(api string) ([]catalogSelection, error) {
+	doc, err := fetchVerifiedCatalogV2(api)
+	switch {
+	case err == nil:
+		var pairs []catalogSelection
+		for _, platform := range sortedPlatformKeys(doc.Platforms) {
+			for _, e := range doc.Platforms[platform].Entries {
+				pairs = append(pairs, catalogSelection{
+					Platform:         platform,
+					FrontendVersion:  e.FrontendVersion,
+					ToolchainVersion: e.ToolchainVersion,
+					FlutterRevision:  e.FlutterRevision,
+					FlutterVersion:   e.FlutterVersion,
+					Source:           "v2",
+				})
+			}
+		}
+		return pairs, nil
+	case errors.Is(err, errCatalogV2NotPublished):
+		v1, err := fetchVerifiedCatalog(api)
+		if err != nil {
+			return nil, err
+		}
+		var pairs []catalogSelection
+		for _, platform := range v1.platformNames() {
+			entry, err := v1.entryForPlatform(platform)
+			if err != nil {
+				continue
+			}
+			pairs = append(pairs, catalogSelection{
+				Platform:         platform,
+				FrontendVersion:  entry.FrontendVersion,
+				ToolchainVersion: entry.ToolchainVersion,
+				Source:           "v1",
+			})
+		}
+		return pairs, nil
+	default:
+		return nil, err
+	}
+}
+
+func sortedPlatformKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// setupCommandFor is the exact command that installs what `flutter use` pinned. A v2 pin needs the
+// revision selector; a v1 pin is what plain `soroq setup` installs.
+func setupCommandFor(matched []flutterVersionEntry) string {
+	platforms := make([]string, 0, len(matched))
+	revision := ""
+	v2 := false
+	for _, e := range matched {
+		platforms = append(platforms, e.Platform)
+		if e.CatalogV2 {
+			v2 = true
+			revision = e.FlutterRevision
+		}
+	}
+	sort.Strings(platforms)
+	cmd := "soroq setup --platforms " + strings.Join(platforms, ",")
+	if v2 && revision != "" {
+		cmd += " --catalog-v2 --flutter-revision " + revision
+	}
+	return cmd
+}
+
+// compareFlutterVersions orders versions numerically per dot-separated part (so x.y.9 sorts before x.y.10); a part that is
+// not a number compares as text).
+func compareFlutterVersions(a, b string) int {
+	ap, bp := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(ap) || i < len(bp); i++ {
+		var x, y string
+		if i < len(ap) {
+			x = ap[i]
+		}
+		if i < len(bp) {
+			y = bp[i]
+		}
+		xn, xerr := strconv.Atoi(x)
+		yn, yerr := strconv.Atoi(y)
+		switch {
+		case xerr == nil && yerr == nil && xn != yn:
+			if xn < yn {
+				return -1
+			}
+			return 1
+		case (xerr != nil || yerr != nil) && x != y:
+			return strings.Compare(x, y)
+		}
+	}
+	return 0
+}
+
+// newestFlutterVersion is the version to suggest: the highest one published.
+func newestFlutterVersion(entries []flutterVersionEntry) string {
+	newest := ""
+	for _, e := range entries {
+		if newest == "" || compareFlutterVersions(e.FlutterVersion, newest) > 0 {
+			newest = e.FlutterVersion
+		}
+	}
+	return newest
 }

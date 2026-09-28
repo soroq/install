@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,5 +111,74 @@ func TestFlutterHelpDoesNotAdvertiseAVersionRange(t *testing.T) {
 	}
 	if !strings.Contains(help, "exact") {
 		t.Error("flutter help does not tell the user versions are exact, which is the product constraint")
+	}
+}
+
+// The version list reads EVERY entry of the v2 catalog. Before this, it read v1 only, so a second
+// published stack could not be listed or pinned without hidden flags.
+func TestFlutterVersionsListEveryV2Entry(t *testing.T) {
+	signer := setupTestSigner(t)
+	v1 := v1Body()
+	v1Sig, _ := signer.SignToolchainManifest(v1)
+	v2 := v2Body()
+	v2Sig, _ := signer.SignToolchainManifest(v2)
+	srv := catalogBothVersionsServer(t, string(v1), v1Sig, http.StatusOK, string(v2), v2Sig)
+	defer srv.Close()
+
+	pairs, err := publishedFlutterPairs(srv.URL)
+	if err != nil {
+		t.Fatalf("publishedFlutterPairs: %v", err)
+	}
+	if len(pairs) != 2 {
+		t.Fatalf("got %d pairs, want both v2 entries: %+v", len(pairs), pairs)
+	}
+	for _, p := range pairs {
+		if p.Source != "v2" || p.FlutterRevision == "" {
+			t.Errorf("pair %+v was not read from v2 with its revision", p)
+		}
+	}
+}
+
+// v1 is read only when v2 is genuinely absent; any other v2 failure refuses rather than downgrading.
+func TestFlutterVersionsFallBackToV1OnlyOn404(t *testing.T) {
+	signer := setupTestSigner(t)
+	v1 := v1Body()
+	v1Sig, _ := signer.SignToolchainManifest(v1)
+
+	absent := catalogBothVersionsServer(t, string(v1), v1Sig, http.StatusNotFound, "", "")
+	pairs, err := publishedFlutterPairs(absent.URL)
+	absent.Close()
+	if err != nil || len(pairs) != 1 || pairs[0].Source != "v1" || pairs[0].ToolchainVersion != "tc-v1" {
+		t.Fatalf("v2 absent: got %+v, %v; want the single v1 pair", pairs, err)
+	}
+
+	broken := catalogBothVersionsServer(t, string(v1), v1Sig, http.StatusInternalServerError, "", "")
+	pairs, err = publishedFlutterPairs(broken.URL)
+	broken.Close()
+	if err == nil {
+		t.Fatalf("v2 failing with 500 produced %+v; it must refuse, not fall back to v1", pairs)
+	}
+}
+
+func TestNewestFlutterVersionComparesNumerically(t *testing.T) {
+	entries := []flutterVersionEntry{{FlutterVersion: "3.44.9"}, {FlutterVersion: "3.44.10"}, {FlutterVersion: "3.44.2"}}
+	if got := newestFlutterVersion(entries); got != "3.44.10" {
+		t.Errorf("newest = %q, want 3.44.10", got)
+	}
+}
+
+// After pinning a v2 entry, the next step must install THAT entry, which plain `soroq setup` does not.
+func TestFlutterUseSuggestsTheSetupThatInstallsThePin(t *testing.T) {
+	rev := strings.Repeat("ab", 20)
+	got := setupCommandFor([]flutterVersionEntry{
+		{Platform: "ios", FlutterRevision: rev, CatalogV2: true},
+		{Platform: "android", FlutterRevision: rev, CatalogV2: true},
+	})
+	want := "soroq setup --platforms android,ios --catalog-v2 --flutter-revision " + rev
+	if got != want {
+		t.Errorf("setup command = %q, want %q", got, want)
+	}
+	if got := setupCommandFor([]flutterVersionEntry{{Platform: "ios"}}); got != "soroq setup --platforms ios" {
+		t.Errorf("v1 pin setup command = %q", got)
 	}
 }
