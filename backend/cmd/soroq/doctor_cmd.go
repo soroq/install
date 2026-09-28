@@ -51,12 +51,12 @@ func runDoctor(args []string) error {
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stdout, `usage: soroq doctor [--project-dir .] [--api https://api.soroq.dev] [--config ~/.soroq/config.json] [--offline] [--fix] [--json]
 
-Checks the local environment + project for the iOS dart_eval patch-point OTA lane:
-Flutter project + soroq.yaml, soroq_flutter dependency + version, iOS bundle id, Xcode,
-Apple signing team, and control-plane auth. Exits non-zero if any check is an error.
---fix auto-applies only the offline/idempotent local fixes (scaffold soroq.yaml / manifest_trust);
-everything needing network/creds/download/Xcode/pub stays advisory.
-(Patch-point lane only — not Shorebird parity, not an App-Store-safe guarantee.)`)
+Checks that this project and machine are ready to release and patch with Soroq: the Flutter
+project and soroq.yaml, the soroq_flutter dependency and version, the iOS bundle id, Xcode, the
+Apple signing team, control-plane sign-in, a registered release, and an installed engine toolchain.
+Exits non-zero if any check is an error.
+--fix applies only offline, repeatable local fixes (scaffold soroq.yaml / manifest_trust); anything
+that needs the network, credentials, a download, Xcode or pub stays a suggestion.`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

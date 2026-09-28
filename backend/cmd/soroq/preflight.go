@@ -127,6 +127,13 @@ func (p *progressReporter) Write(b []byte) (int, error) {
 	return n, nil
 }
 
+// reset rewinds the byte count when a download has to start over, so progress never exceeds 100%.
+func (p *progressReporter) reset() {
+	if p != nil {
+		p.written = 0
+	}
+}
+
 func (p *progressReporter) render(now time.Time, final bool) {
 	elapsed := now.Sub(p.start).Seconds()
 	var rate float64

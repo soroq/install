@@ -175,6 +175,9 @@ func resolveSoroqFlutterFrontend() (soroqFrontendChoice, error) {
 			Provenance: "explicit SOROQ_FLUTTER_BIN",
 		}, nil
 	}
+	if platformFrontendPin.Bin != "" {
+		return platformFrontendPin, nil
+	}
 	root, rootErr := frontendsRoot()
 	flutterBin, err := resolveInstalledFrontendFlutterBin()
 	if err == nil && strings.TrimSpace(flutterBin) != "" {
@@ -1037,4 +1040,49 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 		}
 	})
 	return wasSet
+}
+
+// platformFrontendPin is the frontend soroq.lock pins for the platform the current command builds.
+//
+// ONE ACTIVE FRONTEND PER MACHINE IS NOT ENOUGH. Android and iOS can need different frontends for the
+// same Flutter version (the multi-ABI Android frontend, the R6 iOS one), and `soroq setup` activates
+// them in turn, so the active record names whichever was installed last. A release built with the
+// other platform's frontend is wrong in ways a build does not catch: the Campus app's first Android
+// release came out arm64-only with engine-less 32-bit directories. A platform's release and patch
+// commands therefore select the frontend soroq.lock pins for that platform when it is installed.
+var platformFrontendPin soroqFrontendChoice
+
+// pinFrontendForPlatform selects, for the rest of this command, the frontend soroq.lock pins for
+// platform. An explicit SOROQ_FLUTTER_BIN still wins. When the pinned frontend is not installed it says
+// so and leaves the active frontend in charge.
+func pinFrontendForPlatform(projectDir, platform string) {
+	platformFrontendPin = soroqFrontendChoice{}
+	if strings.TrimSpace(os.Getenv("SOROQ_FLUTTER_BIN")) != "" {
+		return
+	}
+	if strings.TrimSpace(projectDir) == "" {
+		projectDir = "."
+	}
+	lock, err := loadSoroqLock(projectDir)
+	if err != nil {
+		return
+	}
+	pin, ok := lock.Platforms[platform]
+	version := strings.TrimSpace(pin.FrontendVersion)
+	if !ok || version == "" {
+		return
+	}
+	dir, err := frontendVersionDir(version)
+	if err != nil {
+		return
+	}
+	bin := filepath.Join(dir, defaultFrontendSubdir, "bin", "flutter")
+	if info, err := os.Stat(bin); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+		platformFrontendPin = soroqFrontendChoice{
+			Bin:        bin,
+			Provenance: "soroq.lock pin for " + platform + ": " + version,
+		}
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: soroq.lock pins frontend %s for %s, but it is not installed; using the active frontend. Run `soroq setup %s` to install it.\n", version, platform, platform)
 }

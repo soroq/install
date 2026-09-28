@@ -254,3 +254,29 @@ func TestStringLiteralsDoNotTaintAPortableLibrary(t *testing.T) {
 		t.Errorf("a portable library was excluded because of a string literal: %v", reasons)
 	}
 }
+
+// FAIL CLOSED on dart: libraries the table does not know. The Campus app's first iOS release failed
+// because dart:ui_web (cached_network_image_web) and dart:mirrors (matcher) were unknown, treated as
+// available, and forced into the contract. Libraries the target really has must still survive.
+func TestUnknownOrNonIOSDartLibrariesAreExcluded(t *testing.T) {
+	dir := t.TempDir()
+	libPaths := map[string]string{
+		"package:w/web.dart":     writeDart(t, dir, "w/web.dart", "import 'dart:ui_web';\n"),
+		"package:m/mirrors.dart": writeDart(t, dir, "m/mirrors.dart", "import 'dart:mirrors';\n"),
+		"package:m/uses.dart":    writeDart(t, dir, "m/uses.dart", "import 'mirrors.dart';\n"),
+		"package:u/future.dart":  writeDart(t, dir, "u/future.dart", "import 'dart:not_a_real_library';\n"),
+		"package:ok/io.dart":     writeDart(t, dir, "ok/io.dart", "import 'dart:io';\nimport 'dart:ffi';\nimport 'dart:ui';\n"),
+		"package:ok/iso.dart":    writeDart(t, dir, "ok/iso.dart", "import 'dart:isolate';\nimport 'dart:typed_data';\n"),
+	}
+	bad, _ := targetIneligibleLibraries(libPaths, iosTargetEnvironment())
+	for _, uri := range []string{"package:w/web.dart", "package:m/mirrors.dart", "package:m/uses.dart", "package:u/future.dart"} {
+		if !bad[uri] {
+			t.Errorf("%s was kept in the iOS contract; it cannot compile for iOS", uri)
+		}
+	}
+	for _, uri := range []string{"package:ok/io.dart", "package:ok/iso.dart"} {
+		if bad[uri] {
+			t.Errorf("%s was excluded, but everything it imports exists on iOS", uri)
+		}
+	}
+}

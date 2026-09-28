@@ -981,30 +981,105 @@ func flutterRevisionOf(binPath string) (string, error) {
 // (hex) + byte count. Bytes are never buffered whole in memory. An optional progress sink (a
 // *progressReporter, or nil) is added to the MultiWriter so callers can report live download progress to
 // STDERR; it never affects the hash or the returned byte count.
+//
+// RESUMING. Frontends are 0.6-1.8 GB and a long download over a slow link drops. Instead of starting
+// over, a failed attempt is retried with `Range: bytes=<written>-` and the new bytes are appended; the
+// running sha256 continues over them, so the result is still the hash of the whole file and the caller's
+// check against the signed manifest is unchanged. A server that ignores the range (200) or answers with
+// a range starting anywhere else is not trusted to line up: the file is truncated and the download starts
+// again from byte 0.
 func streamDownloadToFile(rawURL string, dst *os.File, progress io.Writer) (string, int64, error) {
-	resp, err := http.Get(rawURL)
-	if err != nil {
-		return "", 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		msg := strings.TrimSpace(string(body))
-		if msg == "" {
-			msg = resp.Status
-		}
-		return "", 0, fmt.Errorf("GET %s: %s", rawURL, msg)
-	}
 	h := sha256.New()
-	writers := []io.Writer{dst, h}
-	if progress != nil {
-		writers = append(writers, progress)
+	var written int64
+	var lastErr error
+	restart := func() error {
+		if err := dst.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := dst.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		h = sha256.New()
+		written = 0
+		if p, ok := progress.(*progressReporter); ok {
+			p.reset()
+		}
+		return nil
 	}
-	n, err := io.Copy(io.MultiWriter(writers...), resp.Body)
-	if err != nil {
-		return "", 0, err
+	for attempt := 1; attempt <= archiveDownloadAttempts; attempt++ {
+		if attempt > 1 {
+			fmt.Fprintf(os.Stderr, "download interrupted (%v); resuming at %s (attempt %d of %d)\n",
+				lastErr, humanBytes(written), attempt, archiveDownloadAttempts)
+			time.Sleep(archiveDownloadBackoff(attempt))
+		}
+		req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+		if err != nil {
+			return "", 0, err
+		}
+		if written > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", written))
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		switch {
+		case resp.StatusCode == http.StatusPartialContent && written > 0 &&
+			strings.HasPrefix(resp.Header.Get("Content-Range"), fmt.Sprintf("bytes %d-", written)):
+			// Resumed exactly where we stopped.
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			if written > 0 {
+				if err := restart(); err != nil {
+					resp.Body.Close()
+					return "", 0, err
+				}
+			}
+		default:
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			msg := strings.TrimSpace(string(body))
+			if msg == "" {
+				msg = resp.Status
+			}
+			lastErr = fmt.Errorf("GET %s: %s", rawURL, msg)
+			if resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+				return "", 0, lastErr // a 4xx will not fix itself
+			}
+			if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+				if err := restart(); err != nil {
+					return "", 0, err
+				}
+			}
+			continue
+		}
+		writers := []io.Writer{dst, h}
+		if progress != nil {
+			writers = append(writers, progress)
+		}
+		n, err := io.Copy(io.MultiWriter(writers...), resp.Body)
+		resp.Body.Close()
+		written += n
+		if err == nil {
+			return hex.EncodeToString(h.Sum(nil)), written, nil
+		}
+		lastErr = err
 	}
-	return hex.EncodeToString(h.Sum(nil)), n, nil
+	return "", written, fmt.Errorf("download failed after %d attempts: %w", archiveDownloadAttempts, lastErr)
+}
+
+// archiveDownloadAttempts bounds retries: enough to ride out a flaky link, few enough that a download
+// that cannot succeed fails in minutes rather than hours.
+const archiveDownloadAttempts = 6
+
+// archiveDownloadBackoff is the pause before attempt n (n >= 2): 2 s, 4 s, 8 s, ... capped at 30 s.
+// A variable so tests can make it instant.
+var archiveDownloadBackoff = func(attempt int) time.Duration {
+	d := time.Duration(1<<uint(attempt-1)) * time.Second
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
 }
 
 // untarGzReader extracts gzip'd tar bytes from r into dst, refusing any entry that would write outside

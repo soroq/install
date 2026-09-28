@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -114,9 +115,97 @@ func contractProjectLibraries(projectDir string) (appLibs []string, depLibs []st
 	appLibs = dropURIs(appLibs, excluded)
 	depLibs = dropURIs(depLibs, excluded)
 
+	// REACHABILITY. The front end indexes only the libraries the app actually compiles; naming any other
+	// library in the dynamic interface crashes it ("The library ... has not been indexed"). A package can
+	// sit in dependencies without being imported (flutter_launcher_icons, a build tool, was the real
+	// case), and an app can carry dead files. Keep only what the entrypoint reaches for this target, and
+	// never a `part of` file, which is not a library at all. Leaving something out only means a patch
+	// cannot call into code the base never shipped.
+	if reach := reachableLibraries(g, projectDir, iosTargetEnvironment()); reach != nil {
+		unreachable := 0
+		keep := func(uris []string) []string {
+			out := uris[:0]
+			for _, u := range uris {
+				if reach[u] && !isPartFile(libPaths[u]) {
+					out = append(out, u)
+				} else {
+					unreachable++
+				}
+			}
+			return out
+		}
+		appLibs = keep(appLibs)
+		depLibs = keep(depLibs)
+		if unreachable > 0 {
+			fmt.Fprintf(os.Stderr, "soroq contract: [ios] %d libraries not reached from lib/main.dart left out\n", unreachable)
+		}
+	}
+
 	sort.Strings(depLibs)
 	return appLibs, depLibs, nil
 }
+
+// reachableLibraries returns every package: library reached from the app's lib/main.dart, following
+// only the import/export branches the target selects. Packages that are not in the contract (native
+// plugins, for example) are still read, because reachability passes through them. It returns nil when
+// there is no lib/main.dart, in which case the caller does not filter.
+func reachableLibraries(g depgraph.Graph, projectDir string, t targetEnvironment) map[string]bool {
+	root := g.RootPackage
+	if _, err := os.Stat(filepath.Join(projectDir, "lib", "main.dart")); err != nil || root == "" {
+		return nil
+	}
+	fileFor := func(uri string) string {
+		pkg, rest, ok := splitPackageURI(uri)
+		if !ok {
+			return ""
+		}
+		dir := ""
+		if pkg == root {
+			dir = projectDir
+		} else if p, found := g.Packages[pkg]; found {
+			dir = p.RootDir()
+		}
+		if dir == "" {
+			return ""
+		}
+		return filepath.Join(dir, "lib", filepath.FromSlash(rest))
+	}
+	seen := map[string]bool{}
+	queue := []string{"package:" + root + "/main.dart"}
+	for len(queue) > 0 {
+		uri := queue[0]
+		queue = queue[1:]
+		if seen[uri] {
+			continue
+		}
+		seen[uri] = true
+		src, err := os.ReadFile(fileFor(uri))
+		if err != nil {
+			continue
+		}
+		for _, d := range parseDartDirectives(string(src)) {
+			target, isDart, ok := resolveDirective(uri, d, t)
+			if ok && !isDart && !seen[target] {
+				queue = append(queue, target)
+			}
+		}
+	}
+	return seen
+}
+
+// isPartFile reports whether a Dart file is a `part of` file rather than a library.
+func isPartFile(path string) bool {
+	if path == "" {
+		return false
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return partOfDirective.Match(src)
+}
+
+var partOfDirective = regexp.MustCompile(`(?m)^\s*part\s+of\b`)
 
 // dropURIs returns uris with every member of drop removed.
 func dropURIs(uris []string, drop map[string]bool) []string {

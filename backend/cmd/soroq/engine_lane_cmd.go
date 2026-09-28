@@ -154,6 +154,8 @@ var (
 )
 
 func runReleaseIOSEngineBuild(args []string) error {
+	projectDirForFrontend, _ := flagValue(args, "project-dir")
+	pinFrontendForPlatform(projectDirForFrontend, "ios")
 	head, passthrough := splitFlutterPassthrough(args)
 	projectDir, _ := flagValue(head, "project-dir")
 	if strings.TrimSpace(projectDir) == "" {
@@ -271,6 +273,8 @@ func iosEngineBuildPassthrough(dynamicInterfacePath string, developerArgs []stri
 // patchable_manifest_sha256 in the baseline), then delegate to soroqctl forwarding the regenerated
 // manifest. A changed/reordered patchable set fails clearly here (a new base release is required).
 func runPatchIOSEngineScaffolded(args []string) error {
+	projectDirForFrontend, _ := flagValue(args, "project-dir")
+	pinFrontendForPlatform(projectDirForFrontend, "ios")
 	head, passthrough := splitFlutterPassthrough(args)
 	projectDir, _ := flagValue(head, "project-dir")
 	if strings.TrimSpace(projectDir) == "" {

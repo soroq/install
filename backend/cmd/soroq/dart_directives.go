@@ -57,6 +57,9 @@ func iosTargetEnvironment() targetEnvironment {
 			"dart.library.math":              true,
 			"dart.library.typed_data":        true,
 			"dart.library.ui":                true,
+			"dart.library.nativewrappers":    true,
+			"dart.library.mirrors":           false,
+			"dart.library.ui_web":            false,
 			"dart.library.html":              false,
 			"dart.library.indexed_db":        false,
 			"dart.library.js":                false,
@@ -72,13 +75,19 @@ func iosTargetEnvironment() targetEnvironment {
 // unavailableDartLibrary reports whether a `dart:` URI names a library this target does not have.
 // Importing one is a hard compile failure ("Dart library 'dart:js_interop' is not available on this
 // platform"), so a library that does it cannot be in the contract.
+//
+// FAIL CLOSED: a dart: library this table does not know is treated as unavailable. Treating unknown as
+// available let dart:ui_web (cached_network_image_web) and dart:mirrors (matcher) into a real app's
+// contract, which forced the AOT compiler to compile them and failed the iOS release. Leaving a library
+// out of the contract only means a patch cannot call into it; putting an uncompilable one in breaks the
+// build.
 func (t targetEnvironment) unavailableDartLibrary(uri string) bool {
 	if !strings.HasPrefix(uri, "dart:") {
 		return false
 	}
 	name := "dart.library." + strings.TrimPrefix(uri, "dart:")
 	avail, known := t.available[name]
-	return known && !avail
+	return !known || !avail
 }
 
 // dartDirective is one parsed import/export.
