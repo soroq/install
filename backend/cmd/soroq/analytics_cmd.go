@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 )
 
 type analyticsPatchRow struct {
@@ -51,6 +52,24 @@ type analyticsView struct {
 	FailureClasses map[string]int      `json:"failure_classes,omitempty"`
 	Patches        []analyticsPatchRow `json:"patches"`
 	Notice         string              `json:"notice,omitempty"`
+	// Devices is installs per release (runtime + channel), from device update checks. Older servers
+	// do not send it; the section is then simply absent.
+	Devices            []analyticsDeviceRow `json:"devices,omitempty"`
+	DevicesUnavailable string               `json:"devices_unavailable,omitempty"`
+}
+
+type analyticsDeviceRow struct {
+	ReleaseID  string    `json:"release_id"`
+	ReleaseIDs []string  `json:"release_ids,omitempty"`
+	Version    string    `json:"version"`
+	Platform   string    `json:"platform,omitempty"`
+	RuntimeID  string    `json:"runtime_id"`
+	Channel    string    `json:"channel"`
+	Devices    int       `json:"devices"`
+	Active24h  int       `json:"active_24h"`
+	Active7d   int       `json:"active_7d"`
+	FirstSeen  time.Time `json:"first_seen"`
+	LastSeen   time.Time `json:"last_seen"`
 }
 
 func runAnalytics(args []string) error {
@@ -67,7 +86,9 @@ func runAnalytics(args []string) error {
 
 Shows how your OTA updates are reaching devices: per patch, devices that booted it, devices where it
 failed (and why), and rollbacks. Numbers come from the boot reports devices send after applying a
-patch. Soroq collects nothing about what your app's users do.`)
+patch. Also shows devices per release: distinct installs that checked for updates (total, active in
+the last 24h / 7d). Only a salted hash of each install's random id is kept. Soroq collects nothing
+about what your app's users do.`)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -112,7 +133,19 @@ func filterAnalytics(view analyticsView, releaseID, channel string) analyticsVie
 	if releaseID == "" && channel == "" {
 		return view
 	}
-	out := analyticsView{AppID: view.AppID, Notice: view.Notice}
+	out := analyticsView{AppID: view.AppID, Notice: view.Notice, DevicesUnavailable: view.DevicesUnavailable}
+	if view.Devices != nil {
+		out.Devices = []analyticsDeviceRow{}
+	}
+	for _, row := range view.Devices {
+		if channel != "" && row.Channel != channel {
+			continue
+		}
+		if releaseID != "" && row.ReleaseID != releaseID && !containsString(row.ReleaseIDs, releaseID) {
+			continue
+		}
+		out.Devices = append(out.Devices, row)
+	}
 	classes := map[string]int{}
 	for _, row := range view.Patches {
 		if (releaseID != "" && row.ReleaseID != releaseID) || (channel != "" && row.Channel != channel) {
@@ -158,6 +191,7 @@ func renderAnalytics(w io.Writer, view analyticsView) {
 	fmt.Fprintln(w)
 	if len(view.Patches) == 0 {
 		fmt.Fprintln(w, "\nno patches published for this app yet")
+		renderDevices(w, view)
 		return
 	}
 
@@ -210,4 +244,54 @@ func renderAnalytics(w io.Writer, view analyticsView) {
 	if t.UnverifiedDevices > 0 {
 		fmt.Fprintf(w, "\nnote: %d of these device reports carried no signed identity; boot reports are open by design, so treat counts as indicative.\n", t.UnverifiedDevices)
 	}
+	renderDevices(w, view)
+}
+
+// renderDevices prints installs per release. Nothing is printed for a server that predates it.
+func renderDevices(w io.Writer, view analyticsView) {
+	if view.DevicesUnavailable != "" {
+		fmt.Fprintf(w, "\ndevices per release: unavailable (%s)\n", view.DevicesUnavailable)
+		return
+	}
+	if view.Devices == nil {
+		return
+	}
+	fmt.Fprintln(w, "\ndevices per release (distinct installs that checked for updates):")
+	if len(view.Devices) == 0 {
+		fmt.Fprintln(w, "  no devices have checked in yet")
+		return
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "RELEASE\tVERSION\tCHANNEL\tDEVICES\tACTIVE 24H\tACTIVE 7D\tLAST SEEN\tRUNTIME")
+	for _, row := range view.Devices {
+		release, version := row.ReleaseID, row.Version
+		if release == "" {
+			release = "(unregistered)"
+		} else if extra := len(row.ReleaseIDs) - 1; extra > 0 {
+			release = fmt.Sprintf("%s (+%d)", release, extra)
+		}
+		if version == "" {
+			version = "-"
+		}
+		runtime := row.RuntimeID
+		if len(runtime) > 12 {
+			runtime = runtime[:12]
+		}
+		lastSeen := "-"
+		if !row.LastSeen.IsZero() {
+			lastSeen = row.LastSeen.UTC().Format("2006-01-02 15:04")
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n",
+			release, version, row.Channel, row.Devices, row.Active24h, row.Active7d, lastSeen, runtime)
+	}
+	tw.Flush()
+}
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
