@@ -46,6 +46,14 @@ package main
 // refuses the PATCH, not the identity: a patch that also changes the folded value-returning function
 // is refused outright.
 //
+// PATH A BASES. A base built by an engine in freehandPathAEngineRevisions is checked by the precise
+// form of this rule in freehand_foldcheck_patha.go, which reads the base's app.dill (its embedded
+// source and TFA's inferred-type annotations) to attribute a shared constant to the declaration that
+// actually produced it. The Campus pilot showed what this rule costs without it: an edited string in
+// VersionCheckService.checkForUpdate and in UpdateDialog.build were both refused because their pools
+// share "" and "Update" with unrelated code. That file lists every propagation route a Path A engine
+// leaves open. Every other base keeps the rule below, unchanged.
+//
 // CONSERVATISM, stated plainly. The rule can flag a declaration whose pool merely happens to share a
 // constant with another Code. That costs a refusal on a declaration a developer is actively patching,
 // with a named remedy. The alternative costs a patch that publishes green and does nothing. The
@@ -78,6 +86,10 @@ type FreehandPropagatedValue struct {
 	// ReachedTotal is the true count before Reached was bounded, so a truncated list never reads as
 	// a complete one.
 	ReachedTotal int `json:"reached_total"`
+	// PathA marks an entry produced by the precise rule (freehand_foldcheck_patha.go); Why then says,
+	// per listed site, why its copy of the constant could not be attributed to its own source.
+	PathA bool   `json:"path_a,omitempty"`
+	Why   string `json:"why,omitempty"`
 }
 
 // FreehandValuePropagation is what the baseline carries. The 90+ MB profile it was computed from is
@@ -105,6 +117,10 @@ type snapshotProfile struct {
 	edgeFieldCount           int
 	iName, iType, iEdgeCount int
 	iEdgeTo                  int
+	// Edge names, used only by the Path A analysis (freehand_foldcheck_patha.go). iEdgeType and
+	// iEdgeName are -1 when a profile does not carry them.
+	edgeTypes            []string
+	iEdgeType, iEdgeName int
 }
 
 func (p *snapshotProfile) count() int { return len(p.nodes) / p.nodeFieldCount }
@@ -156,6 +172,7 @@ func loadSnapshotProfile(path string) (*snapshotProfile, error) {
 					NodeFields []string          `json:"node_fields"`
 					NodeTypes  []json.RawMessage `json:"node_types"`
 					EdgeFields []string          `json:"edge_fields"`
+					EdgeTypes  []json.RawMessage `json:"edge_types"`
 				} `json:"meta"`
 			}
 			if err := dec.Decode(&snap); err != nil {
@@ -170,6 +187,13 @@ func loadSnapshotProfile(path string) (*snapshotProfile, error) {
 				var names []string
 				if err := json.Unmarshal(raw, &names); err == nil {
 					p.nodeTypes = names
+					break
+				}
+			}
+			for _, raw := range snap.Meta.EdgeTypes {
+				var names []string
+				if err := json.Unmarshal(raw, &names); err == nil {
+					p.edgeTypes = names
 					break
 				}
 			}
@@ -206,6 +230,8 @@ func loadSnapshotProfile(path string) (*snapshotProfile, error) {
 	p.iType = idx(nodeFields, "type")
 	p.iEdgeCount = idx(nodeFields, "edge_count")
 	p.iEdgeTo = idx(edgeFields, "to_node")
+	p.iEdgeType = idx(edgeFields, "type")
+	p.iEdgeName = idx(edgeFields, "name_or_index")
 	if p.nodeFieldCount == 0 || p.edgeFieldCount == 0 ||
 		p.iName < 0 || p.iType < 0 || p.iEdgeCount < 0 || p.iEdgeTo < 0 {
 		return nil, fmt.Errorf("snapshot profile: missing required meta fields")
@@ -453,6 +479,17 @@ func valuePropagationRefusal(vp *FreehandValuePropagation, kind, class, vmName s
 		more := ""
 		if e.ReachedTotal > len(e.Reached) {
 			more = fmt.Sprintf(" (+%d more)", e.ReachedTotal-len(e.Reached))
+		}
+		if e.PathA {
+			return fmt.Sprintf(
+				"%s%s%s produces the constant %q, and the base code of %s%s loads that same constant although "+
+					"it cannot be attributed to their own source (%s). This base's engine never folds a direct "+
+					"call to a patchable declaration, so if the constant came from here it travelled a route "+
+					"that engine does not close: a field or parameter type-flow analysis proved single-valued, "+
+					"a closure call, or a call through a non-patchable interface. A redirect would publish green "+
+					"and change nothing at those sites. Make the value non-constant (route it through state the "+
+					"compiler cannot prove single-valued) and cut a new base release.",
+				class, dotIf(class), vmName, e.Constant, reached, more, e.Why)
 		}
 		return fmt.Sprintf(
 			"%s%s%s returns a value the precompiler already propagated into %s%s. "+

@@ -96,6 +96,20 @@ type FreehandBaselineMeta struct {
 	// re-checked on every patch.
 	ContractSchema string `json:"contract_schema"`
 	ContractDigest string `json:"contract_digest"`
+	// A USAGE-SCOPED (v2) base also persists, beside baseline.json, the exact dynamic interface it was
+	// built with (base_contract.yaml) and the patch-side validation spec derived from its source kernel
+	// (base_interface_validation.yaml). Both are required for a v2 base and absent for v1, so every v1
+	// baseline.json stays byte-identical.
+	ContractYAMLSHA256        string `json:"contract_yaml_sha256,omitempty"`
+	InterfaceValidationSHA256 string `json:"interface_validation_sha256,omitempty"`
+	// THE R8 DEPENDENCY MAP (freehand_dependency_map.go): every place this base's gen_snapshot copied a
+	// patchable function into other code, persisted beside the manifest as soroq_dependency_map.tsv. A base
+	// whose engine declares soroq_dependency_map_v1 REQUIRES the file (bound here by schema, digest and
+	// edge count); a base whose engine does not FORBIDS it. Omitted otherwise, so every older baseline.json
+	// stays byte-identical.
+	DependencyMapSchema string `json:"dependency_map_schema,omitempty"`
+	DependencyMapSHA256 string `json:"dependency_map_sha256,omitempty"`
+	DependencyMapEdges  int    `json:"dependency_map_edges,omitempty"`
 	// Retention is the load-bearing freehand-retention evidence; a base without it is refused at both
 	// release registration and patch time (see requireFreehandRetention).
 	Retention *FreehandRetentionEvidence `json:"retention"`
@@ -208,6 +222,7 @@ var freehandKnownIdentityCapabilities = map[string]bool{
 	freehandPublicFieldAccessorRetentionCapability:       true,
 	freehandPublicFieldAccessorDynamicDispatchCapability: true,
 	freehandObfuscatedIdentityTranslationCapability:      true,
+	freehandDependencyMapCapability:                      true,
 }
 
 // legacyDefaultRedirectKinds are the kinds that were demonstrably shipping before this tranche: they are
@@ -826,7 +841,68 @@ func verifyExistingBaseline(relDir string) (*FreehandBaselineMeta, error) {
 	if err := verifyBaselineObfuscationMap(relDir, &m); err != nil {
 		return nil, err
 	}
+	if err := verifyBaselineInterfaceFiles(relDir, &m); err != nil {
+		return nil, err
+	}
+	// The R8 dependency map, in both directions (required iff the recorded engine capability says so).
+	if err := verifyBaselineDependencyMap(relDir, &m, manifestBytes); err != nil {
+		return nil, err
+	}
 	return &m, nil
+}
+
+// Files a usage-scoped (v2) base persists beside baseline.json.
+const (
+	freehandBaseContractFile        = "base_contract.yaml"
+	freehandInterfaceValidationFile = "base_interface_validation.yaml"
+)
+
+// freehandBaselineInterfaceFiles carries a v2 base's interface files into the persist transaction.
+type freehandBaselineInterfaceFiles struct {
+	ContractYAML   []byte
+	ValidationYAML []byte
+}
+
+// verifyBaselineInterfaceFiles checks a baseline's interface files in both directions: a v2 base must
+// carry both, hashing to what baseline.json records; a v1 base must carry neither (a stray file inside an
+// immutable directory is refused rather than ignored, as with the obfuscation map).
+func verifyBaselineInterfaceFiles(relDir string, m *FreehandBaselineMeta) error {
+	files := map[string]string{
+		freehandBaseContractFile:        m.ContractYAMLSHA256,
+		freehandInterfaceValidationFile: m.InterfaceValidationSHA256,
+	}
+	if m.ContractSchema != freehandContractSchemaV2 {
+		for f, rec := range files {
+			if rec != "" {
+				return fmt.Errorf("baseline %s records %s but its contract schema is %s", relDir, f, m.ContractSchema)
+			}
+			if _, err := os.Lstat(filepath.Join(relDir, f)); err == nil {
+				return fmt.Errorf("baseline %s contains %s but its contract schema %s has none", relDir, f, m.ContractSchema)
+			}
+		}
+		return nil
+	}
+	for f, want := range files {
+		if !sha256HexRe.MatchString(want) {
+			return fmt.Errorf("usage-scoped baseline %s records no valid digest for %s", relDir, f)
+		}
+		p := filepath.Join(relDir, f)
+		lfi, err := os.Lstat(p)
+		if err != nil {
+			return fmt.Errorf("usage-scoped baseline missing %s: %w", f, err)
+		}
+		if !lfi.Mode().IsRegular() {
+			return fmt.Errorf("baseline %s is not a regular file", f)
+		}
+		got, err := sha256OfPath(p)
+		if err != nil {
+			return err
+		}
+		if got != want {
+			return fmt.Errorf("baseline %s hash mismatch: %s != recorded %s", f, got, want)
+		}
+	}
+	return nil
 }
 
 // verifyBaselineObfuscationMap checks the captured map against the baseline's binding, in both
@@ -933,6 +1009,11 @@ func immutableInputsEqual(a, b *FreehandBaselineMeta) bool {
 		a.DependencyPackageConfigSHA256 == b.DependencyPackageConfigSHA256 &&
 		a.ContractSchema == b.ContractSchema &&
 		a.ContractDigest == b.ContractDigest &&
+		a.ContractYAMLSHA256 == b.ContractYAMLSHA256 &&
+		a.InterfaceValidationSHA256 == b.InterfaceValidationSHA256 &&
+		a.DependencyMapSchema == b.DependencyMapSchema &&
+		a.DependencyMapSHA256 == b.DependencyMapSHA256 &&
+		a.DependencyMapEdges == b.DependencyMapEdges &&
 		retentionEqual(a.Retention, b.Retention) &&
 		obfuscationBindingEqual(a.Obfuscation, b.Obfuscation)
 }
@@ -957,6 +1038,32 @@ func obfuscationBindingEqual(a, b *FreehandObfuscationBinding) bool {
 // afterwards, because the verifier did not look. The map is now copied and fully verified inside the
 // temporary directory BEFORE baseline.json is written, so the rename publishes both or neither.
 func persistFreehandBaseline(projectDir string, meta FreehandBaselineMeta, appDillPath, sourceDillPath, manifestPath, graphPath string, depGraph depgraph.Graph, obfMapSrc string) (string, error) {
+	return persistFreehandBaselineWithInterface(projectDir, meta, appDillPath, sourceDillPath, manifestPath, graphPath, depGraph, obfMapSrc, nil)
+}
+
+// persistFreehandBaselineWithInterface is persistFreehandBaseline plus, for a usage-scoped (v2) base, the
+// contract YAML and patch-side validation spec, written INSIDE the same transaction and bound into
+// baseline.json by digest. iface must be non-nil exactly when meta.ContractSchema is v2.
+func persistFreehandBaselineWithInterface(projectDir string, meta FreehandBaselineMeta, appDillPath, sourceDillPath, manifestPath, graphPath string, depGraph depgraph.Graph, obfMapSrc string, iface *freehandBaselineInterfaceFiles) (string, error) {
+	return persistFreehandBaselineWithDependencyMap(projectDir, meta, appDillPath, sourceDillPath, manifestPath, graphPath, depGraph, obfMapSrc, iface, nil)
+}
+
+// persistFreehandBaselineWithDependencyMap is persistFreehandBaselineWithInterface plus the R8 dependency
+// map captured from this build. depMap must be non-nil exactly when the engine that built the base (as
+// derived below from the installed bundle matching its engine_revision) declares soroq_dependency_map_v1;
+// either mismatch is refused. The map is written INSIDE the same transaction, before baseline.json.
+func persistFreehandBaselineWithDependencyMap(projectDir string, meta FreehandBaselineMeta, appDillPath, sourceDillPath, manifestPath, graphPath string, depGraph depgraph.Graph, obfMapSrc string, iface *freehandBaselineInterfaceFiles, depMap *freehandDependencyMapCapture) (string, error) {
+	if (meta.ContractSchema == freehandContractSchemaV2) != (iface != nil) {
+		return "", fmt.Errorf("refusing to persist a baseline whose contract schema %q does not match its interface files (present=%v)", meta.ContractSchema, iface != nil)
+	}
+	meta.ContractYAMLSHA256, meta.InterfaceValidationSHA256 = "", ""
+	if iface != nil {
+		if len(iface.ContractYAML) == 0 || len(iface.ValidationYAML) == 0 {
+			return "", errors.New("refusing to persist a usage-scoped baseline with an empty contract or validation spec")
+		}
+		meta.ContractYAMLSHA256 = freehandSHA256Bytes(iface.ContractYAML)
+		meta.InterfaceValidationSHA256 = freehandSHA256Bytes(iface.ValidationYAML)
+	}
 	// The two halves must agree before anything is read or written. A binding with no map cannot be
 	// completed, and a map with no binding has no authority.
 	if err := meta.Obfuscation.validate(); err != nil {
@@ -1064,6 +1171,33 @@ func persistFreehandBaseline(projectDir string, meta FreehandBaselineMeta, appDi
 	}
 	meta.RedirectCapabilities = capabilities
 
+	// THE DEPENDENCY MAP must agree with the capability that was just derived, in both directions: an
+	// engine that inlines patchable code with the flag must leave its record, and a record from an engine
+	// that never declared the capability has no authority. Derived fields are overwritten, never merged.
+	meta.DependencyMapSchema, meta.DependencyMapSHA256, meta.DependencyMapEdges = "", "", 0
+	wantDepMap := capabilities.hasIdentityCapability(freehandDependencyMapCapability)
+	if wantDepMap && depMap == nil {
+		return "", fmt.Errorf("refusing to persist a baseline built by engine %s, which declares %s, without the dependency map its build recorded", meta.EngineRev, freehandDependencyMapCapability)
+	}
+	if !wantDepMap && depMap != nil {
+		return "", fmt.Errorf("refusing to persist a dependency map into a baseline whose engine %s does not declare %s", meta.EngineRev, freehandDependencyMapCapability)
+	}
+	if depMap != nil {
+		edges, perr := parseFreehandDependencyMap(depMap.Canonical)
+		if perr != nil {
+			return "", fmt.Errorf("refusing to persist a malformed dependency map: %w", perr)
+		}
+		if !bytes.Equal(renderFreehandDependencyMap(edges), depMap.Canonical) || len(edges) != depMap.Edges {
+			return "", errors.New("refusing to persist a dependency map that is not in canonical form")
+		}
+		if cerr := checkDependencyMapAgainstManifest(edges, manifestBytes); cerr != nil {
+			return "", cerr
+		}
+		meta.DependencyMapSchema = freehandDependencyMapSchema
+		meta.DependencyMapSHA256 = freehandSHA256Bytes(depMap.Canonical)
+		meta.DependencyMapEdges = len(edges)
+	}
+
 	releasesRoot := filepath.Join(projectDir, ".soroq", "releases")
 	relDir := filepath.Join(releasesRoot, meta.RuntimeID)
 	absRoot, err := filepath.Abs(releasesRoot)
@@ -1135,6 +1269,22 @@ func persistFreehandBaseline(projectDir string, meta FreehandBaselineMeta, appDi
 	}
 	if err := freehandFault("after-dependency-graph"); err != nil {
 		return "", err
+	}
+	if iface != nil {
+		if err := writeFileSync(filepath.Join(tmpDir, freehandBaseContractFile), iface.ContractYAML, 0o600); err != nil {
+			return "", err
+		}
+		if err := writeFileSync(filepath.Join(tmpDir, freehandInterfaceValidationFile), iface.ValidationYAML, 0o600); err != nil {
+			return "", err
+		}
+	}
+	if depMap != nil {
+		if err := writeFileSync(filepath.Join(tmpDir, freehandDependencyMapFile), depMap.Canonical, 0o600); err != nil {
+			return "", err
+		}
+		if err := freehandFault("after-dependency-map"); err != nil {
+			return "", err
+		}
 	}
 	// THE MAP, INSIDE THE TRANSACTION, BEFORE baseline.json.
 	if meta.Obfuscation.isEnabled() {
