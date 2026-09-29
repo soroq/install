@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // collectFrontendProvenance reads the ACTUAL installed frontend/toolchain revisions (no hardcoding):
@@ -556,7 +557,7 @@ func verifyFreehandStagingStrict(projectDir, appDill, analyzerSha string) (analy
 // receipt/index field, all hashes, the config digest, and the content address are recomputed from live
 // inputs and must match — then persists exactly the verified manifest/graph and the EXACT kernel that
 // gen_snapshot consumed.
-func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterRoot, toolchainVersion, preBuildSourceDigest, producedMapPath string, obfAuth *freehandObfuscationAuthorization, flavor string) (string, error) {
+func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterRoot, toolchainVersion, preBuildSourceDigest, producedMapPath string, obfAuth *freehandObfuscationAuthorization, flavor string, depMap *freehandDependencyMapCapture) (string, error) {
 	analysisDir, manifestPath, graphPath, err := verifyFreehandStagingStrict(projectDir, appDill, analyzerSha)
 	if err != nil {
 		return "", fmt.Errorf("freehand staging revalidation failed: %w", err)
@@ -619,9 +620,31 @@ func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterR
 	// Re-derive the freehand base contract from THIS project so its identity is bound into the immutable
 	// baseline. It is the same derivation the build used, so the digest describes the surface the base
 	// actually retained.
-	contract, err := generateFreehandBaseContract(projectDir, nil, nil)
+	//
+	// A USAGE-SCOPED (v2) contract is NOT re-derived: it was measured from a kernel of the build
+	// entrypoint before the build, and the record written then is what binds it. Re-deriving would need
+	// that kernel again and could only disagree. Its patch-side validation spec is derived here, from the
+	// source kernel every patch compiles against.
+	contract, scoped, err := loadBuiltFreehandBaseContract(projectDir)
 	if err != nil {
-		return "", fmt.Errorf("derive freehand base contract: %w", err)
+		return "", fmt.Errorf("load the usage-scoped base contract this build used: %w", err)
+	}
+	var ifaceFiles *freehandBaselineInterfaceFiles
+	if scoped {
+		installedAnalyzer := filepath.Join(flutterRoot, filepath.FromSlash(freehandAnalyzerRelPath))
+		spec, serr := deriveInterfaceValidationSpec(contract, flutterRoot, installedAnalyzer, sourceKernelPath)
+		if serr != nil {
+			return "", fmt.Errorf("derive the base's patch-side interface validation spec: %w", serr)
+		}
+		ifaceFiles = &freehandBaselineInterfaceFiles{
+			ContractYAML:   []byte(renderFreehandContractYAML(contract)),
+			ValidationYAML: []byte(spec),
+		}
+	} else {
+		contract, err = generateFreehandBaseContract(projectDir, nil, nil)
+		if err != nil {
+			return "", fmt.Errorf("derive freehand base contract: %w", err)
+		}
 	}
 	frontendRev, frameworkRev, dartRev, engineRev := collectFrontendProvenance(flutterRoot, toolchainVersion)
 	bl := FreehandBaselineMeta{
@@ -661,9 +684,13 @@ func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterR
 		}
 		bl.Obfuscation = obfBinding
 	}
-	relDir, err := persistFreehandBaseline(projectDir, bl, appDill, sourceKernelPath, manifestPath, graphPath, baseDepGraph, producedMapPath)
+	relDir, err := persistFreehandBaselineWithDependencyMap(projectDir, bl, appDill, sourceKernelPath, manifestPath, graphPath, baseDepGraph, producedMapPath, ifaceFiles, depMap)
 	if err != nil {
 		return "", err
+	}
+	if depMap != nil {
+		fmt.Fprintf(os.Stderr, "dependency map persisted with the baseline (%d edge(s)) -> %s\n",
+			depMap.Edges, filepath.Join(relDir, freehandDependencyMapFile))
 	}
 	if obfBinding != nil {
 		fmt.Fprintf(os.Stderr, "base obfuscation map published with the baseline (%d entries, mode %s) -> %s\n",
@@ -729,14 +756,14 @@ func adoptFreehandObjectGraph(projectDir, relDir string) error {
 // freehandFinalizeBuild persists the immutable baseline and registers the release AFTER a fully
 // successful build. Fail-build atomicity for the product release command: any non-nil buildErr aborts
 // with NO baseline persisted and NO release delegate invoked — nothing partial is left behind.
-func freehandFinalizeBuild(head []string, projectDir, appDill string, buildErr error, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath string, obfAuth *freehandObfuscationAuthorization, flavor string) error {
+func freehandFinalizeBuild(head []string, projectDir, appDill string, buildErr error, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath string, obfAuth *freehandObfuscationAuthorization, flavor string, depMap *freehandDependencyMapCapture) error {
 	if buildErr != nil {
 		return fmt.Errorf("freehand build failed; no baseline persisted and no release registered: %w", buildErr)
 	}
 	if strings.TrimSpace(appDill) == "" {
 		return errors.New("freehand build reported success but produced no app.dill")
 	}
-	relDir, err := freehandPersistFn(projectDir, appDill, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath, obfAuth, flavor)
+	relDir, err := freehandPersistFn(projectDir, appDill, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath, obfAuth, flavor, depMap)
 	if err != nil {
 		return fmt.Errorf("persist freehand baseline: %w", err)
 	}
@@ -814,7 +841,7 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 	if err != nil {
 		return err
 	}
-	_, analyzerSha, err := installFreehandAnalyzer(flutterRoot)
+	installedAnalyzer, analyzerSha, err := installFreehandAnalyzer(flutterRoot)
 	if err != nil {
 		return fmt.Errorf("install freehand analyzer: %w", err)
 	}
@@ -835,6 +862,16 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 			passthrough = append(passthrough,
 				"--extra-gen-snapshot-options=--write_v8_snapshot_profile_to="+graphPath)
 		}
+	}
+
+	// THE R8 DEPENDENCY MAP. When the resolved toolchain's engine declares soroq_dependency_map_v1, its
+	// gen_snapshot is told where to record every place it copies a patchable function into other code, and
+	// may then inline patchable code. The flag is Soroq's alone: a developer-supplied one would leave which
+	// file gen_snapshot wrote undefined, and on an R8 engine a map written elsewhere is a base that inlined
+	// with no record -- so it is refused outright, on every toolchain.
+	passthrough, depMapPath, depMapDeclared, err := withFreehandDependencyMap(projectDir, toolchain, passthrough)
+	if err != nil {
+		return err
 	}
 
 	// THE MAP COMES FROM THIS BUILD'S OWN gen_snapshot, not from a later re-run.
@@ -903,6 +940,13 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 	if _, perr := prepareSoroqBuildResolution(projectDir); perr != nil {
 		return fmt.Errorf("resolve dependencies before release: %w", perr)
 	}
+	// USAGE-SCOPED CONTRACT (v2). Only now is the build's entrypoint (the generated bootstrap) and its
+	// package resolution final, so only now can the base's own use of the SDK/Flutter be measured from a
+	// kernel of exactly what gen_snapshot will compile. The YAML is rewritten in place at the path the
+	// passthrough already names; a frontend whose analyzer predates the mode keeps the v1 contract.
+	if _, _, err := upgradeFreehandBaseContractToScoped(projectDir, flutterRoot, toolchain, installedAnalyzer, bootstrapRel, passthrough); err != nil {
+		return fmt.Errorf("derive the usage-scoped base contract: %w", err)
+	}
 	// TOCTOU: capture the COMPLETE resolved compilation-input digest (app + path-package sources,
 	// pubspec.lock, package_config, generated Dart) BEFORE the (long) AOT build so the post-build
 	// source-kernel compile can prove the source did not drift (else the source kernel would not match
@@ -914,8 +958,17 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 
 	// Fail-build atomicity: buildIOSAppDill's result is finalized as a PURE TAIL — freehandFinalizeBuild
 	// is the only post-build path, so a failed build persists no baseline and calls no release delegate.
+	buildStart := time.Now()
 	appDill, buildErr := buildIOSAppDill(projectDir, toolchain, passthrough)
-	return freehandFinalizeBuild(head, projectDir, appDill, buildErr, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath, obfAuth, freehandBuildFlavor(passthrough))
+	// The dependency map is collected ONLY after a fully successful build (a failed build persists nothing
+	// anyway). Any problem with it fails the release before a baseline exists.
+	var depMap *freehandDependencyMapCapture
+	if buildErr == nil && depMapDeclared {
+		if depMap, err = collectFreehandDependencyMap(projectDir, depMapPath, buildStart); err != nil {
+			return fmt.Errorf("freehand build succeeded but its dependency map is unusable; no baseline persisted and no release registered: %w", err)
+		}
+	}
+	return freehandFinalizeBuild(head, projectDir, appDill, buildErr, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath, obfAuth, freehandBuildFlavor(passthrough), depMap)
 }
 
 // freehandProjectAppID reads app_id from the project's soroq.yaml.

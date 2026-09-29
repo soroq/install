@@ -78,6 +78,11 @@ type FreehandPatchPlan struct {
 	DependencyDescriptor       *depgraph.Descriptor `json:"dependency_descriptor"`
 	DependencyDescriptorDigest string               `json:"dependency_descriptor_digest"`
 
+	// DependencyMapCallers are the callers an R8 base's dependency map added to this patch because they
+	// absorbed (inlined, or folded the result of) changed code. They are replaced exactly like changed
+	// declarations. Omitted when empty, so a plan against any other base serializes byte-for-byte as before.
+	DependencyMapCallers []FreehandDependencyMapCaller `json:"dependency_map_callers,omitempty"`
+
 	// Internal (not serialized): paths retained for the module-synthesis step. The caller must clean up.
 	candidateKernelPath string                     `json:"-"`
 	diffJSONPath        string                     `json:"-"`
@@ -89,6 +94,9 @@ type FreehandPatchPlan struct {
 	// obfuscation state from the base rather than from this command's arguments. Nil for a base that
 	// was not obfuscated, which is every base built before R6.
 	obfuscation *FreehandObfuscationBinding `json:"-"`
+	// interfaceValidation is the VERIFIED baseline's patch-side interface validation spec: set for a
+	// usage-scoped (v2) base, "" for a v1 base (whose whole-library contract was never validated here).
+	interfaceValidation string `json:"-"`
 }
 
 // cleanup removes the plan's transient artifacts (candidate kernel + diff dir).
@@ -350,6 +358,24 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string) (*Freehand
 	if !rep.Supported {
 		return nil, fmt.Errorf("freehand diff did not produce a supported patch (no changed patchable declarations)")
 	}
+	// DEPENDENCY-MAP EXPANSION (R8 bases only). Runs BEFORE every gate below, so the private-identity
+	// gate, the capability gate, the fold check, synthesis and the ABI bijection all see the same expanded
+	// set. A base without the capability returns nil and nothing here changes.
+	depMapCallers, err := expandFreehandChangedSetOverDependencyMap(base, relDir, rep, filepath.Join(diffOut, "freehand_diff.json"),
+		freehandExpansionKernels{
+			Candidate: func() ([]freehandKernelSymbol, error) {
+				return freehandAnalyzeKernelSymbolsFn(flutterRoot, candPath, filepath.Join(projectDir, ".dart_tool", "package_config.json"))
+			},
+			Base: func() ([]freehandKernelSymbol, error) {
+				return freehandAnalyzeKernelSymbolsFn(flutterRoot, filepath.Join(relDir, "source_app.dill"), filepath.Join(projectDir, ".dart_tool", "package_config.json"))
+			},
+		})
+	if err != nil {
+		os.Remove(candPath)
+		os.RemoveAll(diffOut)
+		os.Remove(capMapPath)
+		return nil, fmt.Errorf("freehand patch refused — %w", err)
+	}
 	// PRIVATE-IDENTITY GATE — refuse a redirect that gen_snapshot can never have marked patchable.
 	//
 	// gen_snapshot decides eligibility by an exact `\nlibrary::class::member\n` match against the
@@ -419,8 +445,9 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string) (*Freehand
 	// CONSTANT-PROPAGATION GATE. The capability gate above asks whether the engine can honour this KIND
 	// of identity. This one asks a question no runtime can answer: whether the base's own compiler
 	// already replaced the calls with the value, in which case a perfectly committed redirect changes
-	// nothing. See freehand_foldcheck.go for the measurement this rule is built on.
-	if err := assertFreehandNoFoldedValue(relDir, changedDecls); err != nil {
+	// nothing. See freehand_foldcheck.go for the measurement this rule is built on, and
+	// freehand_foldcheck_patha.go for the precise form used on bases built by a Path A engine.
+	if err := assertFreehandNoFoldedValueForBase(base, relDir, changedDecls); err != nil {
 		return nil, fmt.Errorf("freehand patch refused — %w", err)
 	}
 
@@ -454,11 +481,13 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string) (*Freehand
 		Diff:                       rep,
 		DependencyDescriptor:       &descriptor,
 		DependencyDescriptorDigest: descriptor.DescriptorDigest,
+		DependencyMapCallers:       depMapCallers,
 		candidateKernelPath:        candPath,
 		diffJSONPath:               filepath.Join(diffOut, "freehand_diff.json"),
 		recipe:                     recipe,
 		relDir:                     relDir,
 		obfuscation:                base.Obfuscation,
+		interfaceValidation:        freehandBaseInterfaceValidationPath(relDir, base),
 		inputDigest:                inputDigest,
 		capabilityMapPath:          capMapPath,
 	}, nil
@@ -1920,7 +1949,7 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 			}
 		}()
 	}
-	if err := compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, plan.relDir, moduleSrc, graphDigest, moduleSrcSHA, bytecodePath, synthManifest.NeedsFlutterTarget, obfBinding, receiptPath); err != nil {
+	if err := compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, plan.relDir, moduleSrc, graphDigest, moduleSrcSHA, bytecodePath, synthManifest.NeedsFlutterTarget, obfBinding, receiptPath, plan.interfaceValidation); err != nil {
 		return "", fmt.Errorf("compile freehand module: %w", err)
 	}
 	bytecodeSHA, err := sha256OfPath(bytecodePath)
@@ -2139,7 +2168,12 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 // the VM -- the main source sha alone was NOT sufficient, because an upgrade can change only a carried
 // library while soroq_freehand_module.dart stays byte-identical
 // loader's "library already loaded" check (bytecode_reader.cc), while keeping the URI + bytecode reproducible.
-func compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, baseRelDir, moduleSrc, moduleGraphDigest, mainSourceSHA, out string, needsFlutter bool, obf *FreehandObfuscationBinding, receiptOut string) error {
+//
+// interfaceValidation is the base's patch-side validation spec (usage-scoped bases only, "" otherwise).
+// When set, the module is first run through the front end's dynamic-module validator against it, and a
+// reference to a framework/SDK declaration the base does not expose is refused BEFORE any bytecode exists
+// (freehand_interface_validation.go).
+func compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, baseRelDir, moduleSrc, moduleGraphDigest, mainSourceSHA, out string, needsFlutter bool, obf *FreehandObfuscationBinding, receiptOut, interfaceValidation string) error {
 	dartaot := filepath.Join(bundleDir, "dartaotruntime")
 	dart2bc := filepath.Join(bundleDir, "dart2bytecode")
 	// Import-dill = the NON-tree-shaken base SOURCE kernel: it carries the COMPLETE API of every base
@@ -2223,6 +2257,12 @@ func compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, baseRelDi
 		"--filesystem-root", fsRoot,
 		"--prefix-library-uris", "import/prefix",
 	)
+	// USAGE-SCOPED INTERFACE GATE. Runs on the same inputs as the real compile, before it.
+	if strings.TrimSpace(interfaceValidation) != "" {
+		if err := validateFreehandModuleAgainstBaseInterface(dartaot, args, interfaceValidation, moduleURI, moduleSrc, projectDir); err != nil {
+			return err
+		}
+	}
 	// BASE-IDENTITY TRANSLATION. Derived entirely from the VERIFIED BASELINE: whether it happens at
 	// all, which map is the authority, and what digest that map must have. Nothing here comes from a
 	// public CLI argument, because a caller who could name a map could name any map.
