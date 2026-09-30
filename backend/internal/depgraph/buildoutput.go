@@ -20,6 +20,8 @@ import (
 	"strings"
 
 	"soroq/backend/internal/nativeelf"
+
+	"soroq/backend/internal/fontglyphs"
 )
 
 // OutputCategory classifies one entry of a build output.
@@ -55,6 +57,33 @@ type OutputEntry struct {
 	// comparison is unchanged. Fail-closed by construction: an unparseable or truncated library
 	// yields no normalised digest and falls back to strict equality rather than to a match.
 	CompareDigest string
+
+	// Glyphs is the set of code points a font asset (.otf/.ttf) draws; nil for anything else or for a
+	// font that cannot be read. A tree-shaken icon font changes whenever the app's icon set does, and a
+	// candidate font that draws only glyphs the base's font already draws is not drift: the device's
+	// font renders it. A font either side cannot read falls back to strict byte equality.
+	Glyphs map[rune]bool
+}
+
+func isFontPath(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".otf") || strings.HasSuffix(lower, ".ttf")
+}
+
+func fontGlyphs(category OutputCategory, name string, data []byte) map[rune]bool {
+	if category != CatAsset || !isFontPath(name) {
+		return nil
+	}
+	cps, err := fontglyphs.Codepoints(data)
+	if err != nil {
+		return nil
+	}
+	return cps
+}
+
+// fontCovered reports whether the candidate font draws nothing the base's does not.
+func fontCovered(b, c OutputEntry) bool {
+	return b.Glyphs != nil && c.Glyphs != nil && len(fontglyphs.Missing(b.Glyphs, c.Glyphs)) == 0
 }
 
 // compareDigest is the value native-library equality is tested on. Non-native entries and anything
@@ -158,7 +187,7 @@ func DiffBuildOutputs(base, cand map[string]OutputEntry) OutputDiff {
 		case CatAsset:
 			if !inBase {
 				d.AddedAssets = append(d.AddedAssets, p)
-			} else if b.SHA256 != c.SHA256 {
+			} else if b.SHA256 != c.SHA256 && !fontCovered(b, c) {
 				d.ChangedAssets = append(d.ChangedAssets, p)
 			}
 		case CatLicenseMeta:
@@ -224,13 +253,15 @@ func scanBuildDir(root string) (map[string]OutputEntry, error) {
 		}
 		category := categorizeOutputPath(relSlash)
 		var compare string
-		if category == CatNativeLib {
-			// Read in full only for native libraries; every other category still streams its hash.
+		var glyphs map[rune]bool
+		if category == CatNativeLib || (category == CatAsset && isFontPath(relSlash)) {
+			// Read in full only for native libraries and fonts; every other category still streams its hash.
 			if data, rerr := os.ReadFile(p); rerr == nil {
 				compare = nativeCompareDigest(category, data)
+				glyphs = fontGlyphs(category, relSlash, data)
 			}
 		}
-		out[relSlash] = OutputEntry{Path: relSlash, Category: category, SHA256: sha, Size: info.Size(), CompareDigest: compare}
+		out[relSlash] = OutputEntry{Path: relSlash, Category: category, SHA256: sha, Size: info.Size(), CompareDigest: compare, Glyphs: glyphs}
 		return nil
 	})
 	if err != nil {
@@ -267,6 +298,7 @@ func scanBuildArchive(path string) (map[string]OutputEntry, error) {
 			SHA256:        sha256Hex(data),
 			Size:          int64(len(data)),
 			CompareDigest: nativeCompareDigest(category, data),
+			Glyphs:        fontGlyphs(category, name, data),
 		}
 	}
 	return out, nil

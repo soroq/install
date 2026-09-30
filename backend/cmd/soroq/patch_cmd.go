@@ -911,12 +911,23 @@ func runPatchAndroid(args []string) error {
 		// flutter_assets. If the candidate also changed a font / FontManifest / image / manifest that
 		// the code patch cannot deliver, the OTA'd app would render against the base's stale asset.
 		// Refuse to emit a silently-broken code-only patch and tell the caller exactly which assets
-		// drifted and what to do. (Fix A ships the full icon font in the base, so an icon-only change
-		// does not alter the font and therefore does not trip this guard.) Scoped to auto-mode: an
-		// explicit --kind experimental_native_aot is the caller deliberately choosing the code lane.
+		// drifted and what to do. Icon fonts are compared by the glyphs they draw, not their bytes: a
+		// tree-shaken base's subset changes whenever the app's icon set does, and only a NEW glyph is
+		// something the device's font cannot draw. Scoped to auto-mode: an explicit --kind
+		// experimental_native_aot is the caller deliberately choosing the code lane -- except for a missing
+		// icon glyph, which no caller can want and which is refused in both modes.
 		// Dependency gate (applies in BOTH auto and explicit --kind modes, unlike the asset guard below):
 		// refuse a dependency change that pulls in native code, a plugin registration, or a real asset,
 		// naming the responsible package. Returns the license-metadata delta the code lane does not carry.
+		// Icons first: a new icon changes the icon font, and the gates below would refuse that as asset
+		// drift without saying which icon.
+		missingGlyphs, err := androidpatch.DetectMissingIconGlyphs(resolvedBaseArtifactPath, resolvedCandidateArtifactPath)
+		if err != nil {
+			return fmt.Errorf("check icon glyphs before emitting native-AOT code patch: %w", err)
+		}
+		if err := refuseMissingIconGlyphs(missingGlyphs); err != nil {
+			return err
+		}
 		licenseDelta, err := assertAndroidDependencyDeliverable(status.ProjectDir, resolvedBaseArtifactPath, resolvedCandidateArtifactPath)
 		if err != nil {
 			return err

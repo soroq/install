@@ -253,8 +253,11 @@ func completeIOSLocalEngineLayout(iosBundleDir, flutterBin string) error {
 		filepath.Join(hostOut, "dart-sdk"):                          filepath.Join(cacheDir, "dart-sdk"),
 		filepath.Join(hostOut, "frontend_server_aot.dart.snapshot"): filepath.Join(darwinHostEngine, "frontend_server_aot.dart.snapshot"),
 		filepath.Join(hostOut, "gen", "const_finder.dart.snapshot"): filepath.Join(darwinHostEngine, "const_finder.dart.snapshot"),
-		filepath.Join(hostOut, "flutter_patched_sdk"):               filepath.Join(commonEngine, "flutter_patched_sdk"),
-		filepath.Join(targetOut, "flutter_patched_sdk"):             filepath.Join(commonEngine, "flutter_patched_sdk"),
+		// Flutter's icon tree shaker (const_finder above finds the icons, font-subset cuts the font):
+		// release builds shake icon fonts, and without it every build fails in the asset bundle step.
+		filepath.Join(hostOut, "font-subset"):           filepath.Join(darwinHostEngine, "font-subset"),
+		filepath.Join(hostOut, "flutter_patched_sdk"):   filepath.Join(commonEngine, "flutter_patched_sdk"),
+		filepath.Join(targetOut, "flutter_patched_sdk"): filepath.Join(commonEngine, "flutter_patched_sdk"),
 	}
 	for dst, src := range stockLinks {
 		if _, err := os.Stat(src); err != nil {
@@ -505,7 +508,7 @@ func buildIOSAppDill(projectDir, toolchainVersion string, extraArgs []string) (s
 		"--local-engine-host=" + iosLocalEngineHostName,
 		"--local-engine-src-path=" + iosBundleDir,
 		"--no-codesign",
-		"--no-tree-shake-icons",
+		// Icon fonts are tree-shaken like any Flutter release build; see icon_glyph_guard.go.
 		// Soroq already installed a package_config resolved against the FRONTEND SDK. Letting Flutter
 		// run its own pub get here would both discard that and rewrite the customer's pubspec.lock.
 		"--no-pub",
@@ -538,6 +541,11 @@ func buildIOSAppDill(projectDir, toolchainVersion string, extraArgs []string) (s
 	cmd.Stdin = os.Stdin
 	cmd.Env = soroqFlutterBuildEnv(os.Environ())
 	buildErr := runSoroqBuildCommand(cmd, projectDir, "Building iOS app with the Soroq toolchain (--local-engine "+iosLocalEngineTargetName+")", "ios")
+	if retryArgs, retry := iconTreeShakeFallbackArgs(buildErr, args[1:]); retry {
+		retryCmd := exec.Command(flutterBin, append([]string{"build"}, retryArgs...)...)
+		retryCmd.Dir, retryCmd.Stdin, retryCmd.Env = cmd.Dir, cmd.Stdin, cmd.Env
+		buildErr = runSoroqBuildCommand(retryCmd, projectDir, "Building iOS app with the Soroq toolchain (full icon font)", "ios")
+	}
 
 	// Capture app.dill even on a tail failure: it is produced before the Xcode/codesign tail.
 	appDill, dillErr := locateFreshestAppDill(projectDir)

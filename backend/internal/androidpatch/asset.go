@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"soroq/backend/internal/domain"
+	"soroq/backend/internal/fontglyphs"
 	"soroq/backend/internal/signing"
 )
 
@@ -215,6 +216,9 @@ func BuildAssetPatchBundle(
 type FlutterAssetDrift struct {
 	Changed []AssetDiffEntry
 	Removed []string
+	// MissingGlyphs lists, per font file, the code points the candidate draws that the base's font does
+	// not. A changed font that draws nothing new is not drift (see fontCoverageDrift).
+	MissingGlyphs map[string][]rune
 }
 
 // HasDrift reports whether any non-.so flutter_asset changed between base and candidate.
@@ -254,15 +258,83 @@ func DetectCodePatchAssetDrift(baseArtifactPath, candidateArtifactPath string) (
 	}
 	diff := ignoreKernelBlobUnsupportedChange(diffAndroidFlutterAssets(base, candidate))
 
-	drift := FlutterAssetDrift{}
-	drift.Changed = append(drift.Changed, diff.overlayEntries...)
-	drift.Changed = append(drift.Changed, diff.unsupportedChanges...)
+	drift := FlutterAssetDrift{MissingGlyphs: map[string][]rune{}}
+	for _, entry := range append(append([]AssetDiffEntry{}, diff.overlayEntries...), diff.unsupportedChanges...) {
+		// A tree-shaken icon font changes whenever the set of icons the app uses changes. Only a change
+		// that needs a glyph the base's font lacks is drift; one that draws a subset of the base's glyphs
+		// renders correctly against the font the device already has.
+		if missing, covered := fontCoverageDrift(base, candidate, entry.Path); covered {
+			continue
+		} else if len(missing) > 0 {
+			drift.MissingGlyphs[entry.Path] = missing
+			entry.Change = "needs glyph(s) " + fontglyphs.FormatCodepoints(missing, 8) + " the store build's font does not have"
+		}
+		drift.Changed = append(drift.Changed, entry)
+	}
 	drift.Removed = append(drift.Removed, diff.removedOverlayEntries...)
 	sort.Slice(drift.Changed, func(i, j int) bool {
 		return drift.Changed[i].Path < drift.Changed[j].Path
 	})
 	sort.Strings(drift.Removed)
 	return drift, nil
+}
+
+// DetectMissingIconGlyphs reports only the font files whose candidate draws a glyph the base's font does
+// not. It is the check that applies even when a code lane was chosen explicitly: a patch cannot deliver a
+// font, so a missing glyph would render as a blank icon on every device.
+func DetectMissingIconGlyphs(baseArtifactPath, candidateArtifactPath string) (map[string][]rune, error) {
+	base, err := readFlutterAssetEntriesFromArtifact(baseArtifactPath)
+	if err != nil {
+		return nil, err
+	}
+	candidate, err := readFlutterAssetEntriesFromArtifact(candidateArtifactPath)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]rune{}
+	for path, cand := range candidate {
+		if !isFontAssetPath(path) {
+			continue
+		}
+		if b, ok := base[path]; ok && b.SHA256 == cand.SHA256 {
+			continue
+		}
+		// An unreadable or brand-new font yields no code points here; the drift guard reports it.
+		if missing, _ := fontCoverageDrift(base, candidate, path); len(missing) > 0 {
+			out[path] = missing
+		}
+	}
+	return out, nil
+}
+
+func isFontAssetPath(path string) bool {
+	lower := strings.ToLower(path)
+	return strings.HasSuffix(lower, ".otf") || strings.HasSuffix(lower, ".ttf")
+}
+
+// fontCoverageDrift compares one font asset present in both artifacts by the code points it draws.
+// covered is true when every code point of the candidate's font is drawn by the base's. When it is false,
+// missing lists the code points the base lacks -- empty when either font could not be read, which leaves
+// the change reported as plain drift.
+func fontCoverageDrift(base, candidate map[string]artifactFile, path string) (missing []rune, covered bool) {
+	if !isFontAssetPath(path) {
+		return nil, false
+	}
+	b, bok := base[path]
+	c, cok := candidate[path]
+	if !bok || !cok {
+		return nil, false
+	}
+	baseCps, err := fontglyphs.Codepoints(b.Bytes)
+	if err != nil {
+		return nil, false
+	}
+	candCps, err := fontglyphs.Codepoints(c.Bytes)
+	if err != nil {
+		return nil, false
+	}
+	missing = fontglyphs.Missing(baseCps, candCps)
+	return missing, len(missing) == 0
 }
 
 func readFlutterAssetEntriesFromArtifact(artifactPath string) (map[string]artifactFile, error) {

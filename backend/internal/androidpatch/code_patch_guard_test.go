@@ -217,3 +217,77 @@ func containsPath(paths []string, substr string) bool {
 	}
 	return false
 }
+
+// iconFont builds a minimal font whose cmap (format 12) draws exactly the given code points.
+func iconFont(cps ...rune) string {
+	be16 := func(v int) []byte { return []byte{byte(v >> 8), byte(v)} }
+	be32 := func(v uint32) []byte { return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)} }
+	sub := append(append(be16(12), be16(0)...), be32(uint32(16+12*len(cps)))...)
+	sub = append(append(sub, be32(0)...), be32(uint32(len(cps)))...)
+	for i, c := range cps {
+		sub = append(append(append(sub, be32(uint32(c))...), be32(uint32(c))...), be32(uint32(i+1))...)
+	}
+	cmap := append(append(append(be16(0), be16(1)...), append(be16(3), be16(10)...)...), be32(12)...)
+	cmap = append(cmap, sub...)
+	font := append(append(be32(0x00010000), be16(1)...), make([]byte, 6)...)
+	font = append(append(font, []byte("cmap")...), be32(0)...)
+	font = append(append(font, be32(28)...), be32(uint32(len(cmap)))...)
+	return string(append(font, cmap...))
+}
+
+func iconArtifacts(t *testing.T, baseFont, candidateFont string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	base, candidate := filepath.Join(dir, "base.apk"), filepath.Join(dir, "candidate.apk")
+	metadata := metadataForGuard()
+	writeArtifactZip(t, base, map[string]string{
+		"assets/flutter_assets/soroq/soroq_metadata.json":       metadata,
+		"assets/flutter_assets/fonts/MaterialIcons-Regular.otf": baseFont,
+		"lib/arm64-v8a/libapp.so":                               "base-libapp",
+	})
+	writeArtifactZip(t, candidate, map[string]string{
+		"assets/flutter_assets/soroq/soroq_metadata.json":       metadata,
+		"assets/flutter_assets/fonts/MaterialIcons-Regular.otf": candidateFont,
+		"lib/arm64-v8a/libapp.so":                               "candidate-libapp",
+	})
+	return base, candidate
+}
+
+// A tree-shaken base: a patch that stops using an icon shrinks the candidate's subset. Every glyph it
+// draws is already on the device, so it is not drift.
+func TestDetectCodePatchAssetDrift_ShakenFontLosesIcon_NoDrift(t *testing.T) {
+	t.Parallel()
+	base, candidate := iconArtifacts(t, iconFont(0xE09D, 0xE16A, 0xE145), iconFont(0xE09D, 0xE16A))
+	drift, err := DetectCodePatchAssetDrift(base, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drift.HasDrift() {
+		t.Fatalf("a candidate drawing a subset of the base's glyphs must not drift, got %v", drift.Paths())
+	}
+	missing, err := DetectMissingIconGlyphs(base, candidate)
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("DetectMissingIconGlyphs = %v, %v; want none", missing, err)
+	}
+}
+
+// A tree-shaken base: a patch that uses a NEW icon needs a glyph the device's font lacks. That is drift,
+// and the message names the code point.
+func TestDetectCodePatchAssetDrift_ShakenFontGainsIcon_NamesTheGlyph(t *testing.T) {
+	t.Parallel()
+	base, candidate := iconArtifacts(t, iconFont(0xE09D, 0xE16A), iconFont(0xE09D, 0xE16A, 0xF04B))
+	drift, err := DetectCodePatchAssetDrift(base, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !drift.HasDrift() {
+		t.Fatal("a new icon glyph must be drift")
+	}
+	if got := strings.Join(drift.Paths(), " "); !strings.Contains(got, "U+F04B") {
+		t.Fatalf("drift must name the missing glyph, got %q", got)
+	}
+	missing, err := DetectMissingIconGlyphs(base, candidate)
+	if err != nil || len(missing["fonts/MaterialIcons-Regular.otf"]) != 1 || missing["fonts/MaterialIcons-Regular.otf"][0] != 0xF04B {
+		t.Fatalf("DetectMissingIconGlyphs = %v, %v; want U+F04B", missing, err)
+	}
+}

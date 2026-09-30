@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -571,7 +573,7 @@ touch "$APP_DIR/build/app/outputs/bundle/release/app-release.aab"
 	if !strings.Contains(envText, "BUILD_MODE=release") {
 		t.Fatalf("expected release build mode, got %q", envText)
 	}
-	if !strings.Contains(envText, "FLUTTER_EXTRA_ARGS=--dart-define=API_ENV=prod --no-tree-shake-icons --target-platform android-arm64") {
+	if !strings.Contains(envText, "FLUTTER_EXTRA_ARGS=--dart-define=API_ENV=prod --target-platform android-arm64") {
 		t.Fatalf("expected passthrough Flutter args, got %q", envText)
 	}
 	if !strings.Contains(envText, "SOROQ_BUILD_RUST_JNI=1") {
@@ -692,7 +694,7 @@ touch "$APP_DIR/build/app/outputs/flutter-apk/app-release.apk"
 	if !strings.Contains(envText, "BUILD_MODE=release") {
 		t.Fatalf("expected release build mode, got %q", envText)
 	}
-	if !strings.Contains(envText, "FLUTTER_EXTRA_ARGS=--dart-define=API_ENV=prod --no-tree-shake-icons --target-platform android-arm64") {
+	if !strings.Contains(envText, "FLUTTER_EXTRA_ARGS=--dart-define=API_ENV=prod --target-platform android-arm64") {
 		t.Fatalf("expected passthrough Flutter args, got %q", envText)
 	}
 	if !strings.Contains(envText, "SOROQ_BUILD_RUST_JNI=1") {
@@ -749,28 +751,57 @@ func TestSoroqAndroidFallbackBuildExtraArgsPreservesExplicitLocalEngineSrcPath(t
 	}
 }
 
-// Fix A: patchable Soroq Android release builds must force --no-tree-shake-icons so the base APK
-// ships the FULL MaterialIcons font (any icon a later native-AOT code patch introduces already has
-// its glyph). soroqAndroidBuildHelperExtraArgs is the shared choke point for the direct-flutter path
-// (via soroqAndroidBuildExtraArgsForSource / soroqAndroidFallbackBuildExtraArgs) and the custom
-// build-script path (which forwards these args through FLUTTER_EXTRA_ARGS).
-func TestSoroqAndroidBuildHelperExtraArgsForcesNoTreeShakeIcons(t *testing.T) {
+// Icon fonts are tree-shaken by default (icon_glyph_guard.go): neither build path injects a tree-shake
+// flag of its own. soroqAndroidBuildHelperExtraArgs is the shared choke point for the direct-flutter path
+// and the custom build-script path (FLUTTER_EXTRA_ARGS), so both agree with the patch guard.
+func TestSoroqAndroidBuildHelperExtraArgsTreeShakesIconsByDefault(t *testing.T) {
 	args := soroqAndroidBuildHelperExtraArgs(nil)
-	if !hasFlutterFlag(args, "--no-tree-shake-icons") {
-		t.Fatalf("expected --no-tree-shake-icons to be injected, got %#v", args)
+	if hasFlutterFlag(args, "--no-tree-shake-icons") || hasFlutterFlag(args, "--tree-shake-icons") {
+		t.Fatalf("expected no tree-shake flag (Flutter's default: shake), got %#v", args)
 	}
 }
 
-func TestSoroqAndroidFallbackBuildExtraArgsForcesNoTreeShakeIcons(t *testing.T) {
+func TestSoroqAndroidFallbackBuildExtraArgsTreeShakesIconsByDefault(t *testing.T) {
 	t.Setenv("SOROQ_ENGINE_SRC", "")
 	t.Setenv("FLUTTER_ENGINE", "")
 	args := soroqAndroidFallbackBuildExtraArgs(nil, filepath.Join(t.TempDir(), "bin", "flutter"))
-	if !hasFlutterFlag(args, "--no-tree-shake-icons") {
-		t.Fatalf("expected fallback args to force --no-tree-shake-icons, got %#v", args)
+	if hasFlutterFlag(args, "--no-tree-shake-icons") {
+		t.Fatalf("expected no --no-tree-shake-icons in the fallback args, got %#v", args)
 	}
 }
 
-// Dedup: if the caller already passed --no-tree-shake-icons, do not duplicate it.
+// An app Flutter cannot shake is rebuilt with the full fonts; any other failure, or a caller's own
+// policy, is left alone.
+func TestIconTreeShakeFallbackArgs(t *testing.T) {
+	refusal := &soroqBuildFailure{err: errors.New("build failed"), output: []byte(
+		"This application cannot tree shake icons fonts. It has non-constant instances of IconData at the following locations:")}
+	args, retry := iconTreeShakeFallbackArgs(fmt.Errorf("wrapped: %w", refusal), []string{"--release"})
+	if !retry || !hasFlutterFlag(args, "--no-tree-shake-icons") || !hasFlutterFlag(args, "--release") {
+		t.Fatalf("refusal: retry=%v args=%#v", retry, args)
+	}
+	other := &soroqBuildFailure{err: errors.New("build failed"), output: []byte("Gradle task assembleRelease failed")}
+	if _, retry := iconTreeShakeFallbackArgs(other, nil); retry {
+		t.Fatal("an unrelated failure must not be retried")
+	}
+	if _, retry := iconTreeShakeFallbackArgs(refusal, []string{"--tree-shake-icons"}); retry {
+		t.Fatal("an explicit --tree-shake-icons must get its own failure back")
+	}
+	if _, retry := iconTreeShakeFallbackArgs(nil, nil); retry {
+		t.Fatal("a successful build is never retried")
+	}
+}
+
+func TestRefuseMissingIconGlyphsNamesEveryFontAndCodepoint(t *testing.T) {
+	if err := refuseMissingIconGlyphs(nil); err != nil {
+		t.Fatalf("nothing missing: %v", err)
+	}
+	err := refuseMissingIconGlyphs(map[string][]rune{"fonts/MaterialIcons-Regular.otf": {0xE145, 0xF04B}})
+	if err == nil || !strings.Contains(err.Error(), "U+E145, U+F04B") || !strings.Contains(err.Error(), "fonts/MaterialIcons-Regular.otf") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// An explicit --no-tree-shake-icons from the caller passes through exactly once.
 func TestSoroqAndroidBuildHelperExtraArgsDedupExplicitNoTreeShake(t *testing.T) {
 	args := soroqAndroidBuildHelperExtraArgs([]string{"--no-tree-shake-icons"})
 	count := 0
