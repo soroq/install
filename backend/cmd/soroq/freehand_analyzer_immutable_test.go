@@ -182,3 +182,43 @@ func TestPublishedGuardDoesNotArmOnALooseHexRun(t *testing.T) {
 		t.Fatalf("guard armed on a hex run outside the declared version")
 	}
 }
+
+// THE BUILD FRONTEND'S OWN ANALYZER IS USED, WHATEVER FRONTEND IS ACTIVE. Without an explicit override
+// the analyzer a frontend bundles is used in place and never replaced -- on 2026-10-01 an iOS build with
+// the Android frontend active overwrote the R9 frontend's analyzer with the Android one's.
+func TestInstallAnalyzerUsesTheBuildFrontendsOwnAnalyzer(t *testing.T) {
+	t.Setenv("SOROQ_FREEHAND_ANALYZER", "")
+	flutterRoot := filepath.Join(t.TempDir(), "flutter-sdk-src")
+	own := filepath.Join(flutterRoot, filepath.FromSlash(freehandAnalyzerRelPath))
+	if err := os.MkdirAll(filepath.Dir(own), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(own, []byte("THIS-FRONTENDS-ANALYZER"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wantSha, _ := sha256OfPath(own)
+	got, sha, err := installFreehandAnalyzer(flutterRoot)
+	if err != nil || got != own || sha != wantSha {
+		t.Fatalf("installFreehandAnalyzer = %s, %s, %v; want the frontend's own %s", got, sha, err, own)
+	}
+	if b, _ := os.ReadFile(own); string(b) != "THIS-FRONTENDS-ANALYZER" {
+		t.Fatalf("the frontend's analyzer was replaced: %q", b)
+	}
+}
+
+// A labelled published id carries the analyzer prefix in the MIDDLE; the guard must still recognise it.
+func TestFrontendDeclaresAnalyzerShaInALabelledPublishedID(t *testing.T) {
+	root := t.TempDir()
+	flutterRoot := filepath.Join(root, "flutter-sdk-src")
+	sha := "553e23b3c4e7594ab81507d56bf223aebd1701605a74fd25655271fa8ed1ef46"
+	manifest := `{"soroq_frontend_version":"soroq-flutter-frontend-6b182d2c-4a067bc8-553e23b3-private-state-r9-obfuscation-flavorch"}`
+	if err := os.WriteFile(filepath.Join(root, "manifest.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !frontendDeclaresAnalyzerSha(flutterRoot, sha) {
+		t.Fatal("the labelled id declares analyzer 553e23b3")
+	}
+	if frontendDeclaresAnalyzerSha(flutterRoot, "d055c6156b12863d8f4388809f2fba4afd256c9d5589a0a39249b6ec67974449") {
+		t.Fatal("an analyzer the id does not name must not count as declared")
+	}
+}

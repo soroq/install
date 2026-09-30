@@ -178,6 +178,13 @@ func pubspecVersion(projectDir string) string {
 	return ""
 }
 
+// analyzerBesideExecutable reports whether a soroq_kernel_analyze.dill sits next to the running soroq --
+// the developer override resolveBundledAnalyzerSource honours before any frontend's copy.
+func analyzerBesideExecutable() bool {
+	exe, err := os.Executable()
+	return err == nil && fileExists(filepath.Join(filepath.Dir(exe), "soroq_kernel_analyze.dill"))
+}
+
 // resolveBundledAnalyzerSource finds the analyzer snapshot to install: SOROQ_FREEHAND_ANALYZER, else
 // soroq_kernel_analyze.dill next to the running soroq executable.
 func resolveBundledAnalyzerSource() (string, error) {
@@ -214,6 +221,21 @@ func resolveBundledAnalyzerSource() (string, error) {
 // installFreehandAnalyzer copies the bundled analyzer to the fixed frontend path and returns its
 // installed path + real sha (idempotent: skips copy when bytes already match).
 func installFreehandAnalyzer(flutterRoot string) (string, string, error) {
+	// THE FRONTEND BEING BUILT WITH OWNS ITS ANALYZER. Without an explicit override, a frontend that
+	// bundles an analyzer is used exactly as it is: it is the analyzer its id advertises. Resolving the
+	// source from the ACTIVE frontend instead copied another frontend's analyzer over it whenever the
+	// build frontend was not the active one (an Android frontend activated by `soroq setup android`, then
+	// an iOS build) -- the build then ran an analyzer the frontend never shipped.
+	if strings.TrimSpace(os.Getenv("SOROQ_FREEHAND_ANALYZER")) == "" && !analyzerBesideExecutable() {
+		own := filepath.Join(flutterRoot, filepath.FromSlash(freehandAnalyzerRelPath))
+		if fileExists(own) {
+			sha, err := sha256OfPath(own)
+			if err != nil {
+				return "", "", err
+			}
+			return own, sha, nil
+		}
+	}
 	src, err := resolveBundledAnalyzerSource()
 	if err != nil {
 		return "", "", err
@@ -298,9 +320,16 @@ func frontendDeclaresAnalyzerSha(flutterRoot, sha string) bool {
 		// Shape 2: the digest prefix is the trailing id segment of the declared frontend version
 		// (published manifests). Anchor on the version string so an unrelated hex run elsewhere in
 		// the file cannot arm the guard by coincidence.
+		// A published id carries the analyzer prefix as one hyphen-delimited segment -- trailing in plain
+		// frontends (…-70bae0fd), followed by a label in labelled ones
+		// (…-553e23b3-private-state-r9-obfuscation-flavorch). Matching only the trailing segment left the
+		// guard inert for every labelled frontend, and a build overwrote the published R9 frontend's
+		// analyzer that way on 2026-10-01.
 		if v := frontendDeclaredVersion(body); v != "" {
-			if i := strings.LastIndex(v, "-"); i >= 0 && v[i+1:] == prefix {
-				return true
+			for _, segment := range strings.Split(v, "-") {
+				if segment == prefix {
+					return true
+				}
 			}
 		}
 	}
@@ -714,6 +743,11 @@ func persistFreehandBaselineFromBuild(projectDir, appDill, analyzerSha, flutterR
 	if err := adoptFreehandObjectGraph(projectDir, relDir); err != nil {
 		fmt.Fprintf(os.Stderr, "NOTICE: could not keep the base object graph (%v); `soroq patch` will "+
 			"not be able to run the constant-propagation check against this baseline\n", err)
+	}
+	// The fonts this store build shipped, for the patch-time icon check. REQUIRED, not best-effort:
+	// without them a patch could not be checked against tree-shaken icon fonts.
+	if err := keepFreehandBaseIconFonts(projectDir, relDir); err != nil {
+		return "", fmt.Errorf("keep the store build's fonts beside the baseline: %w", err)
 	}
 	return relDir, nil
 }

@@ -126,7 +126,14 @@ func runFlutterAndroidReleaseBuild(projectDir string, artifactType string, toolc
 	if androidABIs := soroqAndroidABIsForTargetPlatforms(effectiveExtraArgs); androidABIs != "" {
 		cmd.Env = appendDefaultEnv(cmd.Env, "SOROQ_ANDROID_ABIS", androidABIs)
 	}
-	if err := runSoroqBuildCommand(cmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with Soroq Flutter", "android"); err != nil {
+	err = runSoroqBuildCommand(cmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with Soroq Flutter", "android")
+	if retryArgs, retry := iconTreeShakeFallbackArgs(err, effectiveExtraArgs); retry {
+		args = append([]string{"build", target, "--release"}, retryArgs...)
+		retryCmd := exec.Command(flutterBin, args...)
+		retryCmd.Dir, retryCmd.Stdin, retryCmd.Env = cmd.Dir, cmd.Stdin, cmd.Env
+		err = runSoroqBuildCommand(retryCmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with Soroq Flutter (full icon font)", "android")
+	}
+	if err != nil {
 		return errors.New("flutter " + strings.Join(args, " ") + " failed: " + err.Error())
 	}
 	return nil
@@ -335,7 +342,14 @@ func runProjectSoroqAndroidBuildScript(projectDir string, target string, toolcha
 	} else if repoRoot := discoverSoroqRepoRoot(projectDir); repoRoot != "" && strings.TrimSpace(os.Getenv("SOROQ_REPO_ROOT")) == "" {
 		cmd.Env = append(cmd.Env, "SOROQ_REPO_ROOT="+repoRoot)
 	}
-	if err := runSoroqBuildCommand(cmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with project helper", "android"); err != nil {
+	err = runSoroqBuildCommand(cmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with project helper", "android")
+	if retryArgs, retry := iconTreeShakeFallbackArgs(err, effectiveExtraArgs); retry {
+		retryCmd := exec.Command("bash", buildScriptPath)
+		retryCmd.Dir, retryCmd.Stdin = cmd.Dir, cmd.Stdin
+		retryCmd.Env = append(append([]string{}, cmd.Env...), "FLUTTER_EXTRA_ARGS="+strings.Join(retryArgs, " "))
+		err = runSoroqBuildCommand(retryCmd, projectDir, "Building "+androidBuildTargetLabel(target)+" with project helper (full icon font)", "android")
+	}
+	if err != nil {
 		return true, errors.New(buildScriptPath + " failed: " + err.Error())
 	}
 	return true, nil
@@ -406,7 +420,10 @@ func runSoroqBuildCommand(cmd *exec.Cmd, projectDir string, label string, platfo
 		fmt.Fprintf(os.Stderr, "Build log: %s\n", logPath)
 	}
 	if runErr != nil {
-		return fmt.Errorf("build command failed after %s; full log: %s; rerun with --verbose for raw output: %w", duration, logPath, runErr)
+		return &soroqBuildFailure{
+			err:    fmt.Errorf("build command failed after %s; full log: %s; rerun with --verbose for raw output: %w", duration, logPath, runErr),
+			output: output,
+		}
 	}
 	if writeErr != nil {
 		return fmt.Errorf("build succeeded but writing build log %s failed: %w", logPath, writeErr)
@@ -580,20 +597,12 @@ func isNoisyFlutterBuildLine(line string) bool {
 
 func soroqAndroidBuildHelperExtraArgs(extraArgs []string) []string {
 	effectiveArgs := append([]string{}, extraArgs...)
-	// Patchable-correctness (Fix A): force the FULL MaterialIcons font into every Soroq Android
-	// release build unless the user explicitly chose a tree-shake policy. Soroq Android release
-	// builds feed `soroq release`/`patch`, and the native-AOT code-patch lane ships only libapp.so
-	// (never flutter_assets/fonts + FontManifest.json). If the base APK tree-shook the icon font, a
-	// later patch that introduces a new icon references a glyph the shipped subset lacks, so the icon
-	// renders blank/wrong on the OTA'd device. Shipping the full font (+~0.6-1.6MB) guarantees any
-	// glyph a future patch introduces is already present in the base. Dedup: respect an explicit
-	// --tree-shake-icons / --no-tree-shake-icons the caller already passed. This single choke point is
-	// shared by the direct-flutter build path (soroqAndroidBuildExtraArgsForSource) and the custom
-	// build-script path (which receives these args via the FLUTTER_EXTRA_ARGS env it forwards to
-	// `flutter build`), so the flag is applied on both.
-	if !hasFlutterFlag(effectiveArgs, "--no-tree-shake-icons") && !hasFlutterFlag(effectiveArgs, "--tree-shake-icons") {
-		effectiveArgs = append(effectiveArgs, "--no-tree-shake-icons")
-	}
+	// Icon fonts are tree-shaken, as in any Flutter release build (see icon_glyph_guard.go): the store
+	// build ships only the glyphs it uses, and `soroq patch` refuses a patch that needs one it lacks. An
+	// explicit --tree-shake-icons / --no-tree-shake-icons from the caller is passed through untouched;
+	// an app Flutter cannot shake (non-constant IconData) is rebuilt with the full font automatically
+	// (iconTreeShakeFallbackArgs). This single choke point is shared by the direct-flutter build path
+	// and the custom build-script path (FLUTTER_EXTRA_ARGS), so both builds agree.
 	for _, arg := range effectiveArgs {
 		if arg == "--target-platform" || strings.HasPrefix(arg, "--target-platform=") {
 			return effectiveArgs

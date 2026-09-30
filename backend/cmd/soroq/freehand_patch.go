@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"soroq/backend/internal/depgraph"
 )
@@ -234,6 +235,7 @@ func runFreehandAnalyzerDiff(flutterRoot, baselineSourceDill, candidateSourceDil
 // recorded recipe, diffs, and returns a fully-bound plan. Fails closed on incompatible/tampered baseline
 // or any unsupported change. Produces NOTHING persistent (the caller decides on module-gen/registration).
 func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string, planOpts ...freehandPlanOptions) (*FreehandPatchPlan, error) {
+	planStart := time.Now()
 	soroqConfig, err := readProjectSoroqYAML(projectDir)
 	if err != nil {
 		return nil, err
@@ -396,6 +398,14 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string, planOpts .
 			}
 			return nil, fmt.Errorf("freehand patch refused — %w", perr)
 		}
+	}
+	// ICON GLYPHS (icon_glyph_guard.go): a store build with tree-shaken icon fonts can draw only the icons it
+	// shipped, and a patch cannot deliver a font.
+	if err := assertFreehandIconGlyphs(projectDir, relDir, planStart, planOpts); err != nil {
+		os.Remove(candPath)
+		os.RemoveAll(diffOut)
+		os.Remove(capMapPath)
+		return nil, err
 	}
 	// PRIVATE-IDENTITY GATE — refuse a redirect that gen_snapshot can never have marked patchable.
 	//

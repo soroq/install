@@ -230,6 +230,9 @@ type freehandPlanOptions struct {
 	passthrough []string
 	// buildCandidateFingerprints is injectable for tests; nil means the real candidate build.
 	buildCandidateFingerprints func(projectDir, toolchain, relDir string, passthrough []string) (map[string]string, error)
+	// buildCandidateApp builds the candidate app without fingerprints (the icon-glyph check needs only
+	// its assets); injectable for tests, nil means the real candidate build.
+	buildCandidateApp func(projectDir, toolchain, relDir string, passthrough []string) error
 }
 
 // stripObfuscationArgs removes obfuscation flags: the fingerprints are taken before gen_snapshot renames
@@ -251,6 +254,18 @@ func stripObfuscationArgs(args []string) []string {
 // engine inlines patchable code only with it) and the generated bootstrap -- and returns the fingerprints
 // its gen_snapshot wrote. Only build outputs change; the baseline is untouched.
 func freehandBuildCandidateFingerprints(projectDir, toolchain, relDir string, passthrough []string) (map[string]string, error) {
+	return freehandBuildCandidate(projectDir, toolchain, relDir, passthrough, true)
+}
+
+// freehandBuildCandidateApp builds the candidate the same way without asking gen_snapshot for
+// fingerprints -- for checks that need only the built app (the icon-glyph check), on engines with or
+// without the fingerprint capability.
+func freehandBuildCandidateApp(projectDir, toolchain, relDir string, passthrough []string) error {
+	_, err := freehandBuildCandidate(projectDir, toolchain, relDir, passthrough, false)
+	return err
+}
+
+func freehandBuildCandidate(projectDir, toolchain, relDir string, passthrough []string, withFingerprints bool) (map[string]string, error) {
 	contract, err := os.ReadFile(filepath.Join(relDir, freehandBaseContractFile))
 	if err != nil {
 		return nil, fmt.Errorf("read the base contract: %w", err)
@@ -282,7 +297,9 @@ func freehandBuildCandidateFingerprints(projectDir, toolchain, relDir string, pa
 	if err != nil {
 		return nil, err
 	}
-	pt = append(pt, "--extra-gen-snapshot-options="+freehandCodeFingerprintsFlag+"="+fpPath)
+	if withFingerprints {
+		pt = append(pt, "--extra-gen-snapshot-options="+freehandCodeFingerprintsFlag+"="+fpPath)
+	}
 	bootstrapRel, err := prepareFreehandZeroTouch(projectDir, pinnedKeyHex, pt)
 	if err != nil {
 		return nil, fmt.Errorf("generate zero-touch freehand runtime wiring: %w", err)
@@ -292,6 +309,13 @@ func freehandBuildCandidateFingerprints(projectDir, toolchain, relDir string, pa
 		return nil, fmt.Errorf("verify cached freehand analysis: %w", err)
 	}
 	start := time.Now()
+	if !withFingerprints {
+		fmt.Fprintln(os.Stderr, "soroq patch ios --engine (freehand): building the candidate to check the icons it draws")
+		if _, err := buildIOSAppDill(projectDir, toolchain, pt); err != nil {
+			return nil, fmt.Errorf("candidate build for the icon check failed: %w", err)
+		}
+		return nil, nil
+	}
 	fmt.Fprintln(os.Stderr, "soroq patch ios --engine (freehand): building the candidate to find changes that compile to the base's own machine code")
 	if _, err := buildIOSAppDill(projectDir, toolchain, pt); err != nil {
 		return nil, fmt.Errorf("candidate build for machine-code comparison failed: %w", err)
