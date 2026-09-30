@@ -548,3 +548,63 @@ func TestEveryContentAddressInputChangesTheAddress(t *testing.T) {
 		t.Errorf("the address is not deterministic: %s vs %s", base, again)
 	}
 }
+
+// The package graph Flutter reads next to the package_config is the one from the SAME resolution. Plugin
+// injection runs pub in the project first and leaves a graph from the developer's resolution; left in
+// place, Flutter skipped build hooks for packages the installed config resolves (objective_c), and the
+// app shipped without their native frameworks.
+func TestResolutionInstallsTheGraphOfThePinnedResolution(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	projectDir, restore := fakeResolvedProject(t)
+	defer restore()
+
+	emitConfig := runFlutterPubGetIn
+	graphFor := func(dir string) string {
+		if filepath.Clean(dir) == filepath.Clean(projectDir) {
+			return `{"roots":["demo_app"],"packages":[{"name":"demo_app","version":"1.0.0","dependencies":["soroq_flutter"]},{"name":"soroq_flutter","version":"0.3.4","dependencies":[]}],"configVersion":1}`
+		}
+		return `{"roots":["demo_app"],"packages":[{"name":"demo_app","version":"1.0.0","dependencies":["dynamic_modules","soroq_flutter"]},{"name":"dynamic_modules","version":"0.0.1","dependencies":["objective_c"]},{"name":"objective_c","version":"9.0.0","dependencies":[]},{"name":"soroq_flutter","version":"0.3.3","dependencies":[]}],"configVersion":1}`
+	}
+	var workspaceGraph string
+	runFlutterPubGetIn = func(dir string) error {
+		if err := emitConfig(dir); err != nil {
+			return err
+		}
+		g := graphFor(dir)
+		if filepath.Clean(dir) != filepath.Clean(projectDir) {
+			workspaceGraph = g
+		}
+		return os.WriteFile(filepath.Join(dir, ".dart_tool", "package_graph.json"), []byte(g), 0o644)
+	}
+
+	if _, err := prepareSoroqBuildResolution(projectDir); err != nil {
+		t.Fatalf("prepareSoroqBuildResolution: %v", err)
+	}
+	if workspaceGraph == "" {
+		t.Fatal("the isolated resolution never ran")
+	}
+	got, err := os.ReadFile(filepath.Join(projectDir, ".dart_tool", "package_graph.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != workspaceGraph {
+		t.Fatalf("installed package_graph.json is not the pinned resolution's:\n got  %s\n want %s", got, workspaceGraph)
+	}
+}
+
+// A resolver that writes no graph leaves the project's alone: the same frontend reads none.
+func TestResolutionWithoutAGraphLeavesTheProjectGraph(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	projectDir, restore := fakeResolvedProject(t)
+	defer restore()
+	existing := `{"roots":["demo_app"],"packages":[],"configVersion":1}`
+	mustWriteFile(t, filepath.Join(projectDir, ".dart_tool", "package_graph.json"), existing)
+
+	if _, err := prepareSoroqBuildResolution(projectDir); err != nil {
+		t.Fatalf("prepareSoroqBuildResolution: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(projectDir, ".dart_tool", "package_graph.json"))
+	if err != nil || string(got) != existing {
+		t.Fatalf("project graph = %q, %v; want it untouched", got, err)
+	}
+}
