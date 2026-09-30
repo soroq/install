@@ -108,6 +108,7 @@ var freehandPathAEngineRevisions = map[string]string{
 var freehandDependencyMapEngineRevisions = map[string]string{
 	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r8_obfuscation": "3.44.9-private-state-r8-obfuscation",
 	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r9_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r10_obfuscation": "3.44.9-private-state-r9-obfuscation",
 }
 
 // freehandBasePathA reports whether the base was built by an engine known to carry Path A. Both the

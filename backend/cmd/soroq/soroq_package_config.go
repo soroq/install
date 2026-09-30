@@ -115,13 +115,27 @@ func prepareSoroqBuildResolution(projectDir string) (string, error) {
 		return "", err
 	}
 
-	configBytes, pinnedLock, err := resolveSoroqBuildInputs(projectDir, installDir)
+	inputs, err := resolveSoroqBuildInputs(projectDir, installDir)
 	if err != nil {
 		return "", err
 	}
-	if err := installPackageConfig(projectDir, configBytes); err != nil {
+	if err := installPackageConfig(projectDir, inputs.config); err != nil {
 		return "", err
 	}
+	// The package graph goes in WITH the package_config it describes. Plugin injection above ran pub in
+	// the project, which wrote a package_graph.json from ITS resolution -- the developer's lock, without
+	// dynamic_modules. Flutter decides which packages' build hooks run (objective_c's among them) from
+	// the graph, and resolves their code from the package_config. A graph from one resolution next to a
+	// config from another built an app whose code imported a package whose native framework was never
+	// built: soroq_flutter's configure threw at launch and the updater never ran, with a green build.
+	//
+	// A frontend whose pub writes no graph also reads none, so its absence here needs no action.
+	if inputs.graph != nil {
+		if err := writeFileAtomic(filepath.Join(projectDir, ".dart_tool", "package_graph.json"), inputs.graph); err != nil {
+			return "", fmt.Errorf("install package_graph.json: %w", err)
+		}
+	}
+	pinnedLock := inputs.lock
 	// Persist the lock the pinned toolchain resolved, NEXT TO the package_config it belongs with.
 	//
 	// installPackageConfig writes the toolchain's package_config into the project, but the project's
@@ -174,12 +188,24 @@ func resolveRuntimeGraphPinned(projectDir string) (depgraph.Graph, error) {
 // resolveSoroqPackageConfig resolves the project's dependencies PLUS dynamic_modules in a throwaway
 // workspace and returns the package_config.json bytes, rewritten to point at the real project.
 func resolveSoroqPackageConfig(projectDir, dynamicModulesDir string) ([]byte, error) {
-	cfg, _, err := resolveSoroqBuildInputs(projectDir, dynamicModulesDir)
-	return cfg, err
+	inputs, err := resolveSoroqBuildInputs(projectDir, dynamicModulesDir)
+	if err != nil {
+		return nil, err
+	}
+	return inputs.config, nil
 }
 
-// resolveSoroqBuildInputs performs the isolated, TOOLCHAIN-PINNED resolution once and returns both
-// artifacts it produces: the rewritten package_config.json and the pubspec.lock that resolution pinned.
+// soroqBuildInputs is everything one isolated, toolchain-pinned resolution produces. The three belong
+// together: each describes the same resolution, and none may be installed next to another's.
+type soroqBuildInputs struct {
+	config []byte // package_config.json, rewritten to point at the real project
+	lock   []byte // pubspec.lock; nil when the resolver wrote none
+	graph  []byte // package_graph.json; nil when the resolver wrote none
+}
+
+// resolveSoroqBuildInputs performs the isolated, TOOLCHAIN-PINNED resolution once and returns the
+// artifacts it produces: the rewritten package_config.json, the pubspec.lock that resolution pinned, and
+// the package_graph.json that describes it.
 //
 // The lock is returned rather than thrown away because the dependency graph on BOTH sides of a patch
 // has to come from the same SDK. The base graph is resolved here at release time; if the candidate side
@@ -187,26 +213,26 @@ func resolveSoroqPackageConfig(projectDir, dynamicModulesDir string) ([]byte, er
 // versions and every SDK-adjacent package the toolchain pulls in (objective_c, code_assets, hooks,
 // record_use) reads as a removal. That is a false refusal caused by a developer running `flutter pub
 // get` -- an entirely ordinary command -- so the candidate side uses this lock too.
-func resolveSoroqBuildInputs(projectDir, dynamicModulesDir string) (cfgBytes []byte, lockBytes []byte, err error) {
+func resolveSoroqBuildInputs(projectDir, dynamicModulesDir string) (inputs soroqBuildInputs, err error) {
 	projectDir, err = filepath.Abs(projectDir)
 	if err != nil {
-		return nil, nil, err
+		return soroqBuildInputs{}, err
 	}
 	pubspecPath := filepath.Join(projectDir, "pubspec.yaml")
 	pubspec, err := os.ReadFile(pubspecPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s: %w", pubspecPath, err)
+		return soroqBuildInputs{}, fmt.Errorf("read %s: %w", pubspecPath, err)
 	}
 	packageName := strings.TrimSpace(parseTopLevelYaml(pubspec)["name"])
 	if packageName == "" {
-		return nil, nil, fmt.Errorf("%s has no top-level package name", pubspecPath)
+		return soroqBuildInputs{}, fmt.Errorf("%s has no top-level package name", pubspecPath)
 	}
 
 	// A unique workspace per build: two concurrent builds of the SAME project cannot share or overwrite
 	// each other's resolution. MkdirTemp guarantees the uniqueness.
 	workspace, err := os.MkdirTemp("", "soroq-resolve-")
 	if err != nil {
-		return nil, nil, err
+		return soroqBuildInputs{}, err
 	}
 	// Removed on success AND on every failure path below, so no temporary state survives an error or a
 	// mid-resolve abort.
@@ -214,14 +240,14 @@ func resolveSoroqBuildInputs(projectDir, dynamicModulesDir string) (cfgBytes []b
 
 	withDep, _, err := pubspecWithPathDependency(string(pubspec), "dynamic_modules", dynamicModulesDir)
 	if err != nil {
-		return nil, nil, err
+		return soroqBuildInputs{}, err
 	}
 	// Relative path dependencies are relative to the DEVELOPER'S project, not to this temp workspace.
 	// Without this, any monorepo or locally-developed plugin fails to resolve here while resolving
 	// fine in the developer's own tree.
 	withDep = pubspecWithAbsolutePathDependencies(withDep, projectDir)
 	if err := os.WriteFile(filepath.Join(workspace, "pubspec.yaml"), []byte(withDep), 0o644); err != nil {
-		return nil, nil, err
+		return soroqBuildInputs{}, err
 	}
 	// Seed the workspace so resolution starts from existing pins instead of drifting to the newest of
 	// everything. PREFER SOROQ'S OWN PINNED LOCK over the developer's.
@@ -242,18 +268,18 @@ func resolveSoroqBuildInputs(projectDir, dynamicModulesDir string) (cfgBytes []b
 	}
 	if lock, err := os.ReadFile(seed); err == nil {
 		if err := os.WriteFile(filepath.Join(workspace, "pubspec.lock"), lock, 0o644); err != nil {
-			return nil, nil, err
+			return soroqBuildInputs{}, err
 		}
 	}
 
 	if err := runFlutterPubGetIn(workspace); err != nil {
-		return nil, nil, fmt.Errorf("resolve Soroq build dependencies in an isolated workspace: %w", err)
+		return soroqBuildInputs{}, fmt.Errorf("resolve Soroq build dependencies in an isolated workspace: %w", err)
 	}
 
 	generated := filepath.Join(workspace, ".dart_tool", "package_config.json")
 	raw, err := os.ReadFile(generated)
 	if err != nil {
-		return nil, nil, fmt.Errorf("isolated resolution produced no package_config.json: %w", err)
+		return soroqBuildInputs{}, fmt.Errorf("isolated resolution produced no package_config.json: %w", err)
 	}
 	// A missing lock is not fatal. The package_config is the artifact the build needs; the lock is an
 	// additional consistency input for graph resolution, and callers fall back to the project's own when
@@ -263,11 +289,17 @@ func resolveSoroqBuildInputs(projectDir, dynamicModulesDir string) (cfgBytes []b
 	if lockErr != nil {
 		pinnedLock = nil
 	}
+	// The graph holds package names and versions only -- no paths -- so it is installed as written. Its
+	// root is the workspace's package, which carries the project's own name.
+	graph, graphErr := os.ReadFile(filepath.Join(workspace, ".dart_tool", "package_graph.json"))
+	if graphErr != nil {
+		graph = nil
+	}
 	rewritten, err := rewritePackageConfigRoots(raw, packageName, projectDir, workspace)
 	if err != nil {
-		return nil, nil, err
+		return soroqBuildInputs{}, err
 	}
-	return rewritten, pinnedLock, nil
+	return soroqBuildInputs{config: rewritten, lock: pinnedLock, graph: graph}, nil
 }
 
 // rewritePackageConfigRoots makes every rootUri absolute and repoints the ROOT package at the real

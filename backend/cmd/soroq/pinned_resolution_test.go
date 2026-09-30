@@ -188,7 +188,7 @@ func TestWorkspaceSeedsFromThePinnedLockNotTheProjectLock(t *testing.T) {
 	}
 	defer func() { runFlutterPubGetIn = orig }()
 
-	if _, _, err := resolveSoroqBuildInputs(dir, t.TempDir()); err != nil {
+	if _, err := resolveSoroqBuildInputs(dir, t.TempDir()); err != nil {
 		t.Fatalf("resolution failed: %v", err)
 	}
 	if !strings.Contains(seeded, "objective_c") {
