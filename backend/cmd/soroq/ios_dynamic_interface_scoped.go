@@ -64,6 +64,48 @@ import (
 
 const freehandContractSchemaV2 = "soroq.freehand.base_contract.v2"
 
+// freehandContractSchemaV3 is v2 with the pure SDK libraries' EXTENDABLE surface usage-scoped too
+// (FreehandBaseContract.ExtendableScopedLibraries). v2 listed dart:core, dart:collection, ... whole under
+// extendable, which marks List, Map, Set, Iterable, Iterator, Future, Stream, num and every other public
+// SDK class as possibly subclassed by a module. The AOT compiler then gives up class-id range type checks,
+// CHA devirtualization and unboxed calling conventions for all of them, in every base. Measured on the
+// benchmark workloads (same kernel, only the interface differs): collection-heavy code ~10% faster and
+// JSON ~9% faster with v3. What a module can still extend: every SDK class the base's own (consumer)
+// classes extend, implement or mix in -- exactly what a module that re-declares or carries a base class
+// needs -- plus every public exception and error type and Comparable (which pure-Dart packages a patch may
+// newly add, such as package:decimal, implement). Callable and can-be-used-as-type stay whole: a patch may
+// still CALL or NAME anything in the pure SDK. A patch that declares a NEW subtype of anything else (a
+// custom List, Stream, Codec ...) is refused at patch build time by the interface validation, by name.
+const freehandContractSchemaV3 = "soroq.freehand.base_contract.v3"
+
+// sdkExtendableSchema is what the analyzer's --interface-sdk-extendable-schema probe prints.
+const sdkExtendableSchema = "soroq.freehand.sdk_extendable.v1"
+
+// isScopedContractSchema reports whether a base contract is usage-scoped (v2 or v3): such a base carries a
+// contract YAML and a patch-side interface validation spec in its baseline.
+func isScopedContractSchema(schema string) bool {
+	return schema == freehandContractSchemaV2 || schema == freehandContractSchemaV3
+}
+
+// pureSDKContractLibraries are the SDK libraries a scoped contract lists whole for callable and
+// can-be-used-as-type: sdkContractLibraries minus the scoped ones. Sorted.
+func pureSDKContractLibraries() []string {
+	var out []string
+	for _, l := range sdkContractLibraries {
+		scoped := false
+		for _, s := range scopedSDKLibraries {
+			if s == l {
+				scoped = true
+			}
+		}
+		if !scoped {
+			out = append(out, l)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // interfaceUsageSchema is what the analyzer's --interface-usage mode emits (and --interface-usage-schema
 // prints).
 const interfaceUsageSchema = "soroq.freehand.interface_usage.v1"
@@ -162,7 +204,12 @@ type interfaceUsage struct {
 	ConsumerPackages  []string        `json:"consumer_packages"`
 	ConsumerLibraries int             `json:"consumer_libraries"`
 	Entries           []ContractEntry `json:"entries"`
-	Libraries         []usageLibrary  `json:"libraries"`
+	// PureSDK and SDKExtendable are present only when the analyzer ran with --interface-sdk-extendable:
+	// the pure SDK classes the base's consumer classes extend / implement / mix in, plus every public
+	// exception and error type. nil means the analyzer was not asked (a v2 base).
+	PureSDK       []string         `json:"pure_sdk_libraries,omitempty"`
+	SDKExtendable *[]ContractEntry `json:"sdk_extendable,omitempty"`
+	Libraries     []usageLibrary   `json:"libraries"`
 }
 
 type usageLibrary struct {
@@ -207,6 +254,27 @@ func parseInterfaceUsage(raw []byte, domain scopedDomain) (interfaceUsage, error
 		if !domain.isScoped(e.Library) {
 			return interfaceUsage{}, fmt.Errorf("usage entry %s %s is outside the scoped domain", e.Library, e.Name)
 		}
+	}
+	if u.SDKExtendable != nil {
+		got := append([]string(nil), u.PureSDK...)
+		sort.Strings(got)
+		if strings.Join(got, ",") != strings.Join(pureSDKContractLibraries(), ",") {
+			return interfaceUsage{}, fmt.Errorf("the analyzer's pure SDK libraries %v differ from this CLI's %v", got, pureSDKContractLibraries())
+		}
+		pure := map[string]bool{}
+		for _, l := range got {
+			pure[l] = true
+		}
+		for _, e := range *u.SDKExtendable {
+			if err := e.validate(); err != nil {
+				return interfaceUsage{}, err
+			}
+			if e.Kind != "extendable" || !pure[e.Library] {
+				return interfaceUsage{}, fmt.Errorf("sdk_extendable entry %s %s %s is not an extendable pure-SDK class", e.Library, e.Kind, e.Name)
+			}
+		}
+	} else if u.PureSDK != nil {
+		return interfaceUsage{}, errors.New("interface usage lists pure SDK libraries without sdk_extendable")
 	}
 	for _, l := range u.Libraries {
 		// Library URIs are emitted verbatim into single-quoted YAML scalars.
@@ -304,12 +372,26 @@ func buildScopedFreehandBaseContract(appLibraries, depLibraries []string, domain
 		libs = append(libs, l)
 	}
 	sort.Strings(libs)
+	schema := freehandContractSchemaV2
+	var extScoped []string
+	if usage.SDKExtendable != nil {
+		// v3: the pure SDK libraries stay whole for callable / can-be-used-as-type, but only the usage-
+		// scoped set is extendable.
+		schema = freehandContractSchemaV3
+		for _, l := range pureSDKContractLibraries() {
+			if whole[l] {
+				extScoped = append(extScoped, l)
+			}
+		}
+		entries = append(entries, *usage.SDKExtendable...)
+	}
 	c := FreehandBaseContract{
-		Schema:         freehandContractSchemaV2,
-		Libraries:      libs,
-		Entries:        sortedUniqueEntries(entries),
-		ScopedPackages: append([]string(nil), domain.packages...),
-		Sections:       contractSections,
+		Schema:                    schema,
+		ExtendableScopedLibraries: extScoped,
+		Libraries:                 libs,
+		Entries:                   sortedUniqueEntries(entries),
+		ScopedPackages:            append([]string(nil), domain.packages...),
+		Sections:                  contractSections,
 	}
 	for _, e := range c.Entries {
 		if err := e.validate(); err != nil {
@@ -395,10 +477,34 @@ func renderScopedFreehandContractYAML(c FreehandBaseContract) string {
 	fmt.Fprintf(&b, "# schema: %s\n", c.Schema)
 	b.WriteString("# Usage-scoped: application and eligible Dart-only dependency libraries whole; SDK and\n")
 	b.WriteString("# Flutter declarations only where this base uses them (class granularity).\n")
+	if c.Schema == freehandContractSchemaV3 {
+		b.WriteString("# v3: pure SDK libraries are whole for callable / can-be-used-as-type; extendable lists only\n")
+		b.WriteString("# the SDK classes this base's own classes extend, plus exception and error types.\n")
+	}
 	for _, section := range c.Sections {
-		writeInterfaceSection(&b, section, c.Libraries, c.Entries)
+		writeInterfaceSection(&b, section, sectionWholeLibraries(section, c.Libraries, c.ExtendableScopedLibraries), c.Entries)
 	}
 	return b.String()
+}
+
+// sectionWholeLibraries is the whole-library list of one section: every whole library, except that the
+// extendable section of a v3 contract leaves out the libraries whose extendable surface is usage-scoped
+// (their extendable classes are declaration entries instead).
+func sectionWholeLibraries(section string, whole, extendableScoped []string) []string {
+	if section != "extendable" || len(extendableScoped) == 0 {
+		return whole
+	}
+	drop := map[string]bool{}
+	for _, l := range extendableScoped {
+		drop[l] = true
+	}
+	var out []string
+	for _, l := range whole {
+		if !drop[l] {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // renderInterfaceValidationYAML builds the PATCH-SIDE validation spec for a v2 base from the base's
@@ -415,8 +521,8 @@ func renderScopedFreehandContractYAML(c FreehandBaseContract) string {
 //
 // Dynamic-call diagnostics are not interface questions and are ignored by the caller.
 func renderInterfaceValidationYAML(c FreehandBaseContract, sourceKernel interfaceUsage) (string, error) {
-	if c.Schema != freehandContractSchemaV2 {
-		return "", fmt.Errorf("an interface validation spec is only derived for %s bases, not %s", freehandContractSchemaV2, c.Schema)
+	if !isScopedContractSchema(c.Schema) {
+		return "", fmt.Errorf("an interface validation spec is only derived for %s / %s bases, not %s", freehandContractSchemaV2, freehandContractSchemaV3, c.Schema)
 	}
 	domain := newScopedDomain(c.ScopedPackages)
 	present := map[string]bool{}
@@ -439,8 +545,12 @@ func renderInterfaceValidationYAML(c FreehandBaseContract, sourceKernel interfac
 	sort.Strings(whole)
 	sort.Strings(all)
 	entries := own
+	extScoped := map[string]bool{}
+	for _, l := range c.ExtendableScopedLibraries {
+		extScoped[l] = true
+	}
 	for _, e := range c.Entries {
-		if domain.isScoped(e.Library) && present[e.Library] {
+		if (domain.isScoped(e.Library) || extScoped[e.Library]) && present[e.Library] {
 			entries = append(entries, e)
 		}
 	}
@@ -450,7 +560,7 @@ func renderInterfaceValidationYAML(c FreehandBaseContract, sourceKernel interfac
 	b.WriteString("# PATCH-SIDE validation spec for a usage-scoped base. Not a build input.\n")
 	fmt.Fprintf(&b, "# base contract: %s %s\n", c.Schema, c.Digest)
 	for _, section := range c.Sections {
-		writeInterfaceSection(&b, section, whole, entries)
+		writeInterfaceSection(&b, section, sectionWholeLibraries(section, whole, c.ExtendableScopedLibraries), entries)
 		if section == "callable" {
 			writeConstEntries(&b, sourceKernel.Libraries, present)
 		}
@@ -529,7 +639,7 @@ func loadBuiltFreehandBaseContract(projectDir string) (FreehandBaseContract, boo
 		return FreehandBaseContract{}, false, fmt.Errorf("decode scoped contract record: %w", err)
 	}
 	c := rec.Contract
-	if rec.Schema != scopedContractRecordSchema || c.Schema != freehandContractSchemaV2 {
+	if rec.Schema != scopedContractRecordSchema || !isScopedContractSchema(c.Schema) {
 		return FreehandBaseContract{}, false, fmt.Errorf("scoped contract record has schema %q/%q", rec.Schema, c.Schema)
 	}
 	if got := freehandContractDigest(c); got != c.Digest {
@@ -565,9 +675,16 @@ func analyzerSupportsInterfaceUsage(dart, analyzer string) bool {
 	return err == nil && strings.TrimSpace(string(out)) == interfaceUsageSchema
 }
 
+// analyzerSupportsSDKExtendable asks the analyzer whether it can usage-scope the pure SDK's extendable
+// surface (--interface-sdk-extendable). An analyzer that predates it answers with an error or other text.
+func analyzerSupportsSDKExtendable(dart, analyzer string) bool {
+	out, err := exec.Command(dart, analyzer, "--interface-sdk-extendable-schema").Output()
+	return err == nil && strings.TrimSpace(string(out)) == sdkExtendableSchema
+}
+
 // consumers names the packages whose code counts as use (nil: every non-scoped package; used when only
 // the library table is wanted).
-func runInterfaceUsageAnalyzer(dart, analyzer, dill string, domain scopedDomain, consumers []string) (interfaceUsage, error) {
+func runInterfaceUsageAnalyzer(dart, analyzer, dill string, domain scopedDomain, consumers []string, sdkExtendable bool) (interfaceUsage, error) {
 	outFile, err := os.CreateTemp("", "soroq-interface-usage-*.json")
 	if err != nil {
 		return interfaceUsage{}, err
@@ -585,6 +702,9 @@ func runInterfaceUsageAnalyzer(dart, analyzer, dill string, domain scopedDomain,
 		}
 		args = append(args, "--interface-consumer-packages", strings.Join(consumers, ","))
 	}
+	if sdkExtendable {
+		args = append(args, "--interface-sdk-extendable")
+	}
 	cmd := exec.Command(dart, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return interfaceUsage{}, fmt.Errorf("analyzer --interface-usage failed: %w\n%s", err, string(out))
@@ -596,6 +716,9 @@ func runInterfaceUsageAnalyzer(dart, analyzer, dill string, domain scopedDomain,
 	u, err := parseInterfaceUsage(raw, domain)
 	if err != nil {
 		return interfaceUsage{}, err
+	}
+	if sdkExtendable != (u.SDKExtendable != nil) {
+		return interfaceUsage{}, fmt.Errorf("the analyzer was asked for sdk_extendable=%v but returned it=%v", sdkExtendable, u.SDKExtendable != nil)
 	}
 	if consumers != nil {
 		got := append([]string(nil), u.ConsumerPackages...)
@@ -771,7 +894,7 @@ func upgradeFreehandBaseContractToScoped(projectDir, flutterRoot, toolchain, ins
 	// refused at patch build time by the interface validation, never on a device.
 	domain := newScopedDomain(append(pinned, dependencyPackagesOf(depLibs, appLibs)...))
 	consumers := interfaceConsumerPackages(appLibs, depLibs, domain)
-	usage, err := runInterfaceUsageAnalyzer(dart, analyzer, dill, domain, consumers)
+	usage, err := runInterfaceUsageAnalyzer(dart, analyzer, dill, domain, consumers, analyzerSupportsSDKExtendable(dart, analyzer))
 	if err != nil {
 		return zero, false, err
 	}
@@ -787,8 +910,12 @@ func upgradeFreehandBaseContractToScoped(projectDir, flutterRoot, toolchain, ins
 	for _, e := range usage.Entries {
 		libs[e.Library] = true
 	}
-	fmt.Fprintf(os.Stderr, "soroq contract: %s (usage-scoped) -- %d SDK/Flutter declarations in %d declaring libraries (framework-pinned packages scoped too: %v), %d whole app/dependency libraries, digest %s\n",
-		c.Schema, len(usage.Entries), len(libs), domain.packages, len(c.Libraries), short12(c.Digest))
+	sdkExt := 0
+	if usage.SDKExtendable != nil {
+		sdkExt = len(*usage.SDKExtendable)
+	}
+	fmt.Fprintf(os.Stderr, "soroq contract: %s (usage-scoped) -- %d SDK/Flutter declarations in %d declaring libraries (framework-pinned packages scoped too: %v), %d extendable pure-SDK classes, %d whole app/dependency libraries, digest %s\n",
+		c.Schema, len(usage.Entries), len(libs), domain.packages, sdkExt, len(c.Libraries), short12(c.Digest))
 	return c, true, nil
 }
 
@@ -798,9 +925,9 @@ func deriveInterfaceValidationSpec(c FreehandBaseContract, flutterRoot, installe
 	dart := filepath.Join(flutterRoot, "bin", "cache", "dart-sdk", "bin", "dart")
 	analyzer := interfaceUsageAnalyzer(installedAnalyzer)
 	if !analyzerSupportsInterfaceUsage(dart, analyzer) {
-		return "", fmt.Errorf("the analyzer %s cannot describe the base source kernel (--interface-usage), so a %s base's patch-side validation spec cannot be derived", analyzer, freehandContractSchemaV2)
+		return "", fmt.Errorf("the analyzer %s cannot describe the base source kernel (--interface-usage), so a %s base's patch-side validation spec cannot be derived", analyzer, c.Schema)
 	}
-	table, err := runInterfaceUsageAnalyzer(dart, analyzer, sourceKernel, newScopedDomain(c.ScopedPackages), nil)
+	table, err := runInterfaceUsageAnalyzer(dart, analyzer, sourceKernel, newScopedDomain(c.ScopedPackages), nil, false)
 	if err != nil {
 		return "", err
 	}

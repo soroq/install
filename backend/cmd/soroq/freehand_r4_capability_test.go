@@ -22,11 +22,13 @@ import (
 func TestR4IntroducesNoNewCapability(t *testing.T) {
 	// R6 added exactly one name, obfuscated_identity_translation_v1, for a behaviour that can be
 	// pointed at: translating module identities into an obfuscated base's namespace. R8 added exactly
-	// one more, soroq_dependency_map_v1 (gen_snapshot records every inlined/folded patchable edge). r4
-	// still adds none, which is what this asserts -- the set is the three r3 names plus those two, and
-	// nothing else.
-	if len(freehandKnownIdentityCapabilities) != 5 || !freehandKnownIdentityCapabilities[freehandDependencyMapCapability] {
-		t.Fatalf("the closed set has %d entries, want the 3 r3 names plus the r6 and r8 ones: %v",
+	// one more, soroq_dependency_map_v1 (gen_snapshot records every inlined/folded patchable edge), and
+	// R9 one more, soroq_tagged_stack_boundary_v1 (every patchable boundary uses the tagged stack calling
+	// convention). r4 still adds none, which is what this asserts -- the set is the three r3 names plus
+	// those three, and nothing else.
+	if len(freehandKnownIdentityCapabilities) != 7 || !freehandKnownIdentityCapabilities[freehandDependencyMapCapability] ||
+		!freehandKnownIdentityCapabilities[freehandTaggedStackBoundaryCapability] {
+		t.Fatalf("the closed set has %d entries, want the 3 r3 names plus the r6, r8 and two r9 ones: %v",
 			len(freehandKnownIdentityCapabilities), freehandKnownIdentityCapabilities)
 	}
 	if !freehandKnownIdentityCapabilities[freehandObfuscatedIdentityTranslationCapability] {
@@ -123,10 +125,12 @@ func TestPublishedPatchSetsAreUnchanged(t *testing.T) {
 }
 
 func TestR5KeepsTheR4CapabilityContract(t *testing.T) {
-	// r5 still adds nothing. The set grew to four only in R6, by obfuscated_identity_translation_v1, and
-	// to five only in R8, by soroq_dependency_map_v1 -- each a behaviour that can be pointed at.
-	if len(freehandKnownIdentityCapabilities) != 5 || !freehandKnownIdentityCapabilities[freehandDependencyMapCapability] {
-		t.Fatalf("the closed capability set is %v, want the 3 r3 names plus the r6 and r8 ones", freehandKnownIdentityCapabilities)
+	// r5 still adds nothing. The set grew to four only in R6, by obfuscated_identity_translation_v1, to
+	// five only in R8, by soroq_dependency_map_v1, and to six only in R9, by
+	// soroq_tagged_stack_boundary_v1 -- each a behaviour that can be pointed at.
+	if len(freehandKnownIdentityCapabilities) != 7 || !freehandKnownIdentityCapabilities[freehandDependencyMapCapability] ||
+		!freehandKnownIdentityCapabilities[freehandTaggedStackBoundaryCapability] {
+		t.Fatalf("the closed capability set is %v, want the 3 r3 names plus the r6, r8 and two r9 ones", freehandKnownIdentityCapabilities)
 	}
 	if !freehandKnownIdentityCapabilities[freehandObfuscatedIdentityTranslationCapability] {
 		t.Fatalf("the closed set lost the r6 capability %q", freehandObfuscatedIdentityTranslationCapability)

@@ -93,6 +93,10 @@ type FreehandBaseContract struct {
 	// ScopedPackages (v2 only) are the packages narrowed like the framework in addition to
 	// package:flutter/ -- see flutterPinnedScopedPackages.
 	ScopedPackages []string `json:"scoped_packages,omitempty"`
+	// ExtendableScopedLibraries (v3 only) are whole libraries whose EXTENDABLE section is usage-scoped: they
+	// are left out of the extendable section's whole-library list, and their extendable classes are
+	// declaration entries instead.
+	ExtendableScopedLibraries []string `json:"extendable_scoped_libraries,omitempty"`
 	// Sections lists which dynamic-interface sections were emitted, in order.
 	Sections []string `json:"sections"`
 	// Digest is the sha256 of the exact YAML bytes written to disk.
@@ -148,7 +152,7 @@ func buildFreehandBaseContract(sdkAvailable, flutterAvailable, appLibraries, dep
 // renderFreehandContractYAML produces the exact bytes written to disk. Deterministic: sections in
 // canonical order, libraries sorted, no timestamps or absolute paths.
 func renderFreehandContractYAML(c FreehandBaseContract) string {
-	if c.Schema == freehandContractSchemaV2 {
+	if isScopedContractSchema(c.Schema) {
 		return renderScopedFreehandContractYAML(c)
 	}
 	var b strings.Builder
@@ -181,6 +185,10 @@ func freehandContractDigest(c FreehandBaseContract) string {
 	}
 	for _, e := range c.Entries {
 		fmt.Fprintf(h, "decl:%s|%s|%s\n", e.Library, e.Kind, e.Name)
+	}
+	// v3 only; absent from v1/v2 digests, which are therefore unchanged.
+	for _, l := range c.ExtendableScopedLibraries {
+		fmt.Fprintf(h, "ext-scoped:%s\n", l)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

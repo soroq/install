@@ -110,6 +110,13 @@ type FreehandBaselineMeta struct {
 	DependencyMapSchema string `json:"dependency_map_schema,omitempty"`
 	DependencyMapSHA256 string `json:"dependency_map_sha256,omitempty"`
 	DependencyMapEdges  int    `json:"dependency_map_edges,omitempty"`
+	// CANONICAL CODE FINGERPRINTS (freehand_code_fingerprints.go): per patchable function, a fingerprint of
+	// the machine code THIS base ships. A patch drops the redirect of a changed declaration whose candidate
+	// compiles to the same fingerprint. Required iff the engine declares soroq_code_fingerprints_v1; omitted
+	// otherwise, so every older baseline.json stays byte-identical.
+	CodeFingerprintsSchema string `json:"code_fingerprints_schema,omitempty"`
+	CodeFingerprintsSHA256 string `json:"code_fingerprints_sha256,omitempty"`
+	CodeFingerprints       int    `json:"code_fingerprints,omitempty"`
 	// Retention is the load-bearing freehand-retention evidence; a base without it is refused at both
 	// release registration and patch time (see requireFreehandRetention).
 	Retention *FreehandRetentionEvidence `json:"retention"`
@@ -215,6 +222,14 @@ const freehandPublicFieldAccessorRetentionCapability = "public_instance_field_ac
 // signed immutable manifest exists, but never treat it as proof of working dynamic field dispatch.
 const freehandPublicFieldAccessorDynamicDispatchCapability = "public_instance_field_accessor_dynamic_dispatch_v1"
 
+// freehandTaggedStackBoundaryCapability: the engine compiles every patchable function, and every instance
+// member sharing a name (hence possibly a dispatch selector) with one, with the tagged stack calling
+// convention (no register arguments, no unboxed parameters or return). A redirect enters InterpretCall,
+// which reads tagged stack arguments only; without this, a public member of a private or non-callable
+// class received register/unboxed arguments as garbage once patched (R9 device finding: `this` was a
+// raw stack address).
+const freehandTaggedStackBoundaryCapability = "soroq_tagged_stack_boundary_v1"
+
 // freehandKnownIdentityCapabilities is the closed set an engine may declare. An unknown name fails
 // closed rather than being carried through as an opaque string a future guard might match by accident.
 var freehandKnownIdentityCapabilities = map[string]bool{
@@ -223,6 +238,8 @@ var freehandKnownIdentityCapabilities = map[string]bool{
 	freehandPublicFieldAccessorDynamicDispatchCapability: true,
 	freehandObfuscatedIdentityTranslationCapability:      true,
 	freehandDependencyMapCapability:                      true,
+	freehandTaggedStackBoundaryCapability:                true,
+	freehandCodeFingerprintsCapability:                   true,
 }
 
 // legacyDefaultRedirectKinds are the kinds that were demonstrably shipping before this tranche: they are
@@ -848,6 +865,10 @@ func verifyExistingBaseline(relDir string) (*FreehandBaselineMeta, error) {
 	if err := verifyBaselineDependencyMap(relDir, &m, manifestBytes); err != nil {
 		return nil, err
 	}
+	// Code fingerprints, in both directions (required iff the recorded engine capability says so).
+	if _, err := loadVerifiedBaselineCodeFingerprints(relDir, &m); err != nil {
+		return nil, err
+	}
 	return &m, nil
 }
 
@@ -871,7 +892,7 @@ func verifyBaselineInterfaceFiles(relDir string, m *FreehandBaselineMeta) error 
 		freehandBaseContractFile:        m.ContractYAMLSHA256,
 		freehandInterfaceValidationFile: m.InterfaceValidationSHA256,
 	}
-	if m.ContractSchema != freehandContractSchemaV2 {
+	if !isScopedContractSchema(m.ContractSchema) {
 		for f, rec := range files {
 			if rec != "" {
 				return fmt.Errorf("baseline %s records %s but its contract schema is %s", relDir, f, m.ContractSchema)
@@ -1014,6 +1035,9 @@ func immutableInputsEqual(a, b *FreehandBaselineMeta) bool {
 		a.DependencyMapSchema == b.DependencyMapSchema &&
 		a.DependencyMapSHA256 == b.DependencyMapSHA256 &&
 		a.DependencyMapEdges == b.DependencyMapEdges &&
+		a.CodeFingerprintsSchema == b.CodeFingerprintsSchema &&
+		a.CodeFingerprintsSHA256 == b.CodeFingerprintsSHA256 &&
+		a.CodeFingerprints == b.CodeFingerprints &&
 		retentionEqual(a.Retention, b.Retention) &&
 		obfuscationBindingEqual(a.Obfuscation, b.Obfuscation)
 }
@@ -1053,7 +1077,7 @@ func persistFreehandBaselineWithInterface(projectDir string, meta FreehandBaseli
 // derived below from the installed bundle matching its engine_revision) declares soroq_dependency_map_v1;
 // either mismatch is refused. The map is written INSIDE the same transaction, before baseline.json.
 func persistFreehandBaselineWithDependencyMap(projectDir string, meta FreehandBaselineMeta, appDillPath, sourceDillPath, manifestPath, graphPath string, depGraph depgraph.Graph, obfMapSrc string, iface *freehandBaselineInterfaceFiles, depMap *freehandDependencyMapCapture) (string, error) {
-	if (meta.ContractSchema == freehandContractSchemaV2) != (iface != nil) {
+	if isScopedContractSchema(meta.ContractSchema) != (iface != nil) {
 		return "", fmt.Errorf("refusing to persist a baseline whose contract schema %q does not match its interface files (present=%v)", meta.ContractSchema, iface != nil)
 	}
 	meta.ContractYAMLSHA256, meta.InterfaceValidationSHA256 = "", ""
@@ -1197,6 +1221,28 @@ func persistFreehandBaselineWithDependencyMap(projectDir string, meta FreehandBa
 		meta.DependencyMapSHA256 = freehandSHA256Bytes(depMap.Canonical)
 		meta.DependencyMapEdges = len(edges)
 	}
+	// CODE FINGERPRINTS travel with the dependency map (same gen_snapshot run) and obey the same rule.
+	meta.CodeFingerprintsSchema, meta.CodeFingerprintsSHA256, meta.CodeFingerprints = "", "", 0
+	wantFingerprints := capabilities.hasIdentityCapability(freehandCodeFingerprintsCapability)
+	haveFingerprints := depMap != nil && depMap.CodeFingerprints != nil
+	if wantFingerprints && !haveFingerprints {
+		return "", fmt.Errorf("refusing to persist a baseline built by engine %s, which declares %s, without the code fingerprints its build recorded", meta.EngineRev, freehandCodeFingerprintsCapability)
+	}
+	if !wantFingerprints && haveFingerprints {
+		return "", fmt.Errorf("refusing to persist code fingerprints into a baseline whose engine %s does not declare %s", meta.EngineRev, freehandCodeFingerprintsCapability)
+	}
+	if haveFingerprints {
+		fps, perr := parseFreehandCodeFingerprints(depMap.CodeFingerprints)
+		if perr != nil {
+			return "", fmt.Errorf("refusing to persist malformed code fingerprints: %w", perr)
+		}
+		if !bytes.Equal(renderFreehandCodeFingerprints(fps), depMap.CodeFingerprints) {
+			return "", errors.New("refusing to persist code fingerprints that are not in canonical form")
+		}
+		meta.CodeFingerprintsSchema = freehandCodeFingerprintsSchema
+		meta.CodeFingerprintsSHA256 = freehandSHA256Bytes(depMap.CodeFingerprints)
+		meta.CodeFingerprints = len(fps)
+	}
 
 	releasesRoot := filepath.Join(projectDir, ".soroq", "releases")
 	relDir := filepath.Join(releasesRoot, meta.RuntimeID)
@@ -1284,6 +1330,11 @@ func persistFreehandBaselineWithDependencyMap(projectDir string, meta FreehandBa
 		}
 		if err := freehandFault("after-dependency-map"); err != nil {
 			return "", err
+		}
+		if depMap.CodeFingerprints != nil {
+			if err := writeFileSync(filepath.Join(tmpDir, freehandCodeFingerprintsFile), depMap.CodeFingerprints, 0o600); err != nil {
+				return "", err
+			}
 		}
 	}
 	// THE MAP, INSIDE THE TRANSACTION, BEFORE baseline.json.
