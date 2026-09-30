@@ -233,7 +233,7 @@ func runFreehandAnalyzerDiff(flutterRoot, baselineSourceDill, candidateSourceDil
 // computeFreehandPatchPlan loads+verifies the v2 baseline, compiles the candidate source kernel via the
 // recorded recipe, diffs, and returns a fully-bound plan. Fails closed on incompatible/tampered baseline
 // or any unsupported change. Produces NOTHING persistent (the caller decides on module-gen/registration).
-func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string) (*FreehandPatchPlan, error) {
+func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string, planOpts ...freehandPlanOptions) (*FreehandPatchPlan, error) {
 	soroqConfig, err := readProjectSoroqYAML(projectDir)
 	if err != nil {
 		return nil, err
@@ -376,6 +376,27 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string) (*Freehand
 		os.Remove(capMapPath)
 		return nil, fmt.Errorf("freehand patch refused — %w", err)
 	}
+	// MACHINE-CODE PRUNING (bases whose engine declares soroq_code_fingerprints_v1): a changed declaration
+	// that compiles to exactly the base's machine code keeps running natively instead of being redirected.
+	if len(planOpts) > 0 && planOpts[0].toolchain != "" {
+		if _, perr := pruneFreehandUnchangedMachineCode(projectDir, relDir, base, rep, filepath.Join(diffOut, "freehand_diff.json"),
+			freehandExpansionKernels{
+				Candidate: func() ([]freehandKernelSymbol, error) {
+					return freehandAnalyzeKernelSymbolsFn(flutterRoot, candPath, filepath.Join(projectDir, ".dart_tool", "package_config.json"))
+				},
+				Base: func() ([]freehandKernelSymbol, error) {
+					return freehandAnalyzeKernelSymbolsFn(flutterRoot, filepath.Join(relDir, "source_app.dill"), filepath.Join(projectDir, ".dart_tool", "package_config.json"))
+				},
+			}, planOpts[0]); perr != nil {
+			os.Remove(candPath)
+			os.RemoveAll(diffOut)
+			os.Remove(capMapPath)
+			if perr == errFreehandIdenticalMachineCode {
+				return nil, errFreehandNoOp
+			}
+			return nil, fmt.Errorf("freehand patch refused — %w", perr)
+		}
+	}
 	// PRIVATE-IDENTITY GATE — refuse a redirect that gen_snapshot can never have marked patchable.
 	//
 	// gen_snapshot decides eligibility by an exact `\nlibrary::class::member\n` match against the
@@ -428,6 +449,12 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string) (*Freehand
 				caps.EngineRevision, strings.Join(caps.IdentityCapabilities, ", "), caps.Source,
 				freehandPrivateEnclosingClassCapability)
 		}
+	}
+
+	// CALLING-CONVENTION GATE (bases whose engine predates soroq_tagged_stack_boundary_v1). Runs on the
+	// dependency-map-expanded set, since every added caller becomes a redirect too.
+	if err := assertFreehandCallingConventionSafe(base, relDir, rep.ChangedPatchable); err != nil {
+		return nil, fmt.Errorf("freehand patch refused — %w", err)
 	}
 
 	// CAPABILITY GATE — the diff has produced changed-patchable declarations, and nothing has been
@@ -1629,7 +1656,8 @@ func runPatchIOSEngineFreehand(head, passthrough []string, projectDir string) er
 	if _, _, err := installFreehandAnalyzer(flutterRoot); err != nil {
 		return fmt.Errorf("install freehand analyzer: %w", err)
 	}
-	plan, err := computeFreehandPatchPlan(projectDir, flutterRoot, freehandBuildFlavor(passthrough))
+	plan, err := computeFreehandPatchPlan(projectDir, flutterRoot, freehandBuildFlavor(passthrough),
+		freehandPlanOptions{toolchain: toolchain, passthrough: passthrough})
 	if err != nil {
 		if err == errFreehandNoOp {
 			fmt.Fprintln(os.Stdout, "freehand: no patchable change detected — nothing to patch (clean no-op).")

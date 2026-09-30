@@ -211,6 +211,9 @@ func sortedCopy(xs []string) []string {
 type freehandDependencyMapCapture struct {
 	Canonical []byte
 	Edges     int
+	// CodeFingerprints is the canonical soroq_code_fingerprints.tsv from the same gen_snapshot run, or nil
+	// when the engine does not declare soroq_code_fingerprints_v1.
+	CodeFingerprints []byte
 }
 
 // toolchainDeclaresDependencyMap reads the resolved toolchain's own engine.json. An absent capability

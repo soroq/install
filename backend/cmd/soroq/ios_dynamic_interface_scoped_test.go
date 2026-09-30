@@ -378,3 +378,122 @@ func TestScopedContractAlwaysExposesSynthesizerPragma(t *testing.T) {
 		t.Fatal("dart:core pragma missing from soroqModuleSynthesizerEntries")
 	}
 }
+
+func testUsageSDKExt(domain scopedDomain, entries []ContractEntry, libs []usageLibrary, sdkExt []ContractEntry, pure []string) []byte {
+	var m map[string]any
+	_ = json.Unmarshal(testUsage(domain, entries, libs), &m)
+	m["pure_sdk_libraries"] = pure
+	m["sdk_extendable"] = sdkExt
+	raw, _ := json.Marshal(m)
+	return raw
+}
+
+var testSDKExtendable = []ContractEntry{
+	{Library: "dart:collection", Kind: "extendable", Name: "ListBase"},
+	{Library: "dart:core", Kind: "extendable", Name: "Exception"},
+	{Library: "dart:core", Kind: "extendable", Name: "StateError"},
+}
+
+// v3: the pure SDK stays whole for callable / can-be-used-as-type, but its EXTENDABLE surface is only
+// what the analyzer listed -- List, Map, Iterable, Comparable, num ... are no longer extendable unless the
+// base itself extends them.
+func TestScopedContract_V3ScopesTheSDKExtendableSurface(t *testing.T) {
+	d := newScopedDomain(nil)
+	u, err := parseInterfaceUsage(testUsageSDKExt(d, testScopedEntries, nil, testSDKExtendable, pureSDKContractLibraries()), d)
+	if err != nil {
+		t.Fatalf("well-formed v3 usage refused: %v", err)
+	}
+	c, err := buildScopedFreehandBaseContract([]string{"package:app/main.dart"}, nil, d, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Schema != freehandContractSchemaV3 || c.Digest != freehandContractDigest(c) {
+		t.Fatalf("bad v3 identity: %+v", c)
+	}
+	if strings.Join(c.ExtendableScopedLibraries, ",") != strings.Join(pureSDKContractLibraries(), ",") {
+		t.Fatalf("extendable-scoped libraries = %v", c.ExtendableScopedLibraries)
+	}
+	y := renderFreehandContractYAML(c)
+	callable, ext, typ := yamlSection(t, y, "callable"), yamlSection(t, y, "extendable"), yamlSection(t, y, "can-be-used-as-type")
+	for _, lib := range pureSDKContractLibraries() {
+		if !yamlListsWhole(callable, lib) || !yamlListsWhole(typ, lib) {
+			t.Fatalf("%s must stay whole for callable and can-be-used-as-type:\n%s", lib, y)
+		}
+		if yamlListsWhole(ext, lib) {
+			t.Fatalf("%s must not be whole under extendable in v3:\n%s", lib, ext)
+		}
+	}
+	for _, want := range []string{
+		"  - library: 'dart:collection'\n    class: ['ListBase']\n",
+		"  - library: 'dart:core'\n    class: ['Exception', 'StateError']\n",
+		"  - library: 'package:app/main.dart'\n",
+		"    class: ['StatelessWidget']\n",
+	} {
+		if !strings.Contains(ext, want) {
+			t.Fatalf("v3 extendable missing %q:\n%s", want, ext)
+		}
+	}
+	if strings.Contains(callable, "'ListBase'") || strings.Contains(typ, "'Exception'") {
+		t.Fatalf("SDK extendable entries leaked into another section:\n%s", y)
+	}
+	// Bound into the digest, and a v3 record round-trips through the loader's schema check.
+	v2 := c
+	v2.ExtendableScopedLibraries = nil
+	if freehandContractDigest(v2) == c.Digest {
+		t.Fatal("the extendable-scoped library set must be bound into the digest")
+	}
+
+	// The patch side narrows extendable exactly like the base: whole for everything else, the SDK by entry.
+	table, err := parseInterfaceUsage(testUsage(d, nil, []usageLibrary{
+		{URI: "dart:core"}, {URI: "dart:collection"}, {URI: "dart:io"}, {URI: "dart:ui", Scoped: true},
+		{URI: "package:app/main.dart"},
+	}), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := renderInterfaceValidationYAML(c, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sExt := yamlSection(t, spec, "extendable")
+	if yamlListsWhole(sExt, "dart:core") || yamlListsWhole(sExt, "dart:collection") || !yamlListsWhole(sExt, "dart:io") || !yamlListsWhole(sExt, "package:app/main.dart") {
+		t.Fatalf("validation spec extendable wrong:\n%s", sExt)
+	}
+	if !strings.Contains(sExt, "  - library: 'dart:core'\n    class: ['Exception', 'StateError']\n") || !strings.Contains(sExt, "  - library: 'dart:collection'\n    class: ['ListBase']\n") {
+		t.Fatalf("validation spec must list the SDK extendable classes:\n%s", sExt)
+	}
+	if !yamlListsWhole(yamlSection(t, spec, "callable"), "dart:core") {
+		t.Fatalf("validation spec must keep dart:core whole for callable:\n%s", spec)
+	}
+}
+
+func TestScopedContract_V3ParseRefusesBadSDKExtendable(t *testing.T) {
+	d := newScopedDomain(nil)
+	pure := pureSDKContractLibraries()
+	for name, bad := range map[string]ContractEntry{
+		"not extendable kind": {Library: "dart:core", Kind: "class", Name: "List"},
+		"scoped sdk library":  {Library: "dart:ui", Kind: "extendable", Name: "Color"},
+		"package library":     {Library: "package:app/main.dart", Kind: "extendable", Name: "Home"},
+		"private":             {Library: "dart:core", Kind: "extendable", Name: "_List"},
+	} {
+		if _, err := parseInterfaceUsage(testUsageSDKExt(d, testScopedEntries, nil, []ContractEntry{bad}, pure), d); err == nil {
+			t.Fatalf("%s: sdk_extendable entry %+v must be refused", name, bad)
+		}
+	}
+	if _, err := parseInterfaceUsage(testUsageSDKExt(d, testScopedEntries, nil, testSDKExtendable, []string{"dart:core"}), d); err == nil {
+		t.Fatal("a pure SDK library set that differs from the CLI's must be refused")
+	}
+	// Without the analyzer flag the usage has neither key and the contract stays v2.
+	u, err := parseInterfaceUsage(testUsage(d, testScopedEntries, nil), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := buildScopedFreehandBaseContract([]string{"package:app/main.dart"}, nil, d, u)
+	if err != nil || c.Schema != freehandContractSchemaV2 || len(c.ExtendableScopedLibraries) != 0 {
+		t.Fatalf("usage without sdk_extendable must build v2: %+v %v", c, err)
+	}
+	raw, _ := json.Marshal(c)
+	if strings.Contains(string(raw), "extendable_scoped_libraries") {
+		t.Fatalf("v2 contract JSON gained a v3 key: %s", raw)
+	}
+}

@@ -873,6 +873,14 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 	if err != nil {
 		return err
 	}
+	// CODE FINGERPRINTS from the same gen_snapshot run (engines declaring soroq_code_fingerprints_v1).
+	passthrough, fpPath, fpDeclared, err := withFreehandCodeFingerprints(projectDir, toolchain, passthrough)
+	if err != nil {
+		return err
+	}
+	if fpDeclared && !depMapDeclared {
+		return fmt.Errorf("toolchain %s declares %s without %s; code fingerprints are only recorded alongside the dependency map", toolchain, freehandCodeFingerprintsCapability, freehandDependencyMapCapability)
+	}
 
 	// THE MAP COMES FROM THIS BUILD'S OWN gen_snapshot, not from a later re-run.
 	//
@@ -966,6 +974,11 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 	if buildErr == nil && depMapDeclared {
 		if depMap, err = collectFreehandDependencyMap(projectDir, depMapPath, buildStart); err != nil {
 			return fmt.Errorf("freehand build succeeded but its dependency map is unusable; no baseline persisted and no release registered: %w", err)
+		}
+		if fpDeclared {
+			if depMap.CodeFingerprints, _, err = collectFreehandCodeFingerprints(fpPath, buildStart); err != nil {
+				return fmt.Errorf("freehand build succeeded but its code fingerprints are unusable; no baseline persisted and no release registered: %w", err)
+			}
 		}
 	}
 	return freehandFinalizeBuild(head, projectDir, appDill, buildErr, analyzerSha, flutterRoot, toolchain, preBuildSourceDigest, producedMapPath, obfAuth, freehandBuildFlavor(passthrough), depMap)

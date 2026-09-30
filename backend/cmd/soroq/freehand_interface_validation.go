@@ -39,7 +39,7 @@ import (
 
 // freehandBaseInterfaceValidationPath is the validation spec of a VERIFIED baseline, or "" for a v1 base.
 func freehandBaseInterfaceValidationPath(relDir string, base *FreehandBaselineMeta) string {
-	if base == nil || base.ContractSchema != freehandContractSchemaV2 {
+	if base == nil || !isScopedContractSchema(base.ContractSchema) {
 		return ""
 	}
 	return filepath.Join(relDir, freehandInterfaceValidationFile)
