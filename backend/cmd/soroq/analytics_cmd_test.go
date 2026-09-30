@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -149,5 +150,49 @@ func TestAnalyticsJSONCarriesDevices(t *testing.T) {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("--json lost %s: %s", want, out)
 		}
+	}
+}
+
+func TestRenderAnalyticsSplitsDevicesByPlatform(t *testing.T) {
+	rows := func(platforms ...[]analyticsDevicePlatform) analyticsView {
+		v := analyticsView{AppID: "com.example.app", Devices: []analyticsDeviceRow{}}
+		for i, p := range platforms {
+			total := 0
+			for _, c := range p {
+				total += c.Devices
+			}
+			v.Devices = append(v.Devices, analyticsDeviceRow{
+				ReleaseID: fmt.Sprintf("rel-%d", i), Version: "1.0.43+59", Channel: "stable",
+				RuntimeID: "1ef6587d82a14dd0", Devices: total, Platforms: p,
+			})
+		}
+		return v
+	}
+	// Every install attributed: ANDROID and IOS columns, no UNKNOWN column and no note.
+	var attributed bytes.Buffer
+	renderAnalytics(&attributed, rows([]analyticsDevicePlatform{{Platform: "android", Devices: 879}, {Platform: "ios", Devices: 12}}))
+	out := attributed.String()
+	for _, want := range []string{"DEVICES  ANDROID  IOS  ACTIVE 24H", "891      879      12"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "UNKNOWN") || strings.Contains(out, "not attributed") {
+		t.Fatalf("unknown column or note with every install attributed:\n%s", out)
+	}
+	// Some installs not yet attributed: an UNKNOWN column and a note saying why.
+	var partial bytes.Buffer
+	renderAnalytics(&partial, rows([]analyticsDevicePlatform{{Platform: "android", Devices: 5}, {Platform: "unknown", Devices: 7}}))
+	out = partial.String()
+	for _, want := range []string{"ANDROID  IOS  UNKNOWN", "12       5        0    7", "7 install(s) are not attributed"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	// A server that predates the split: no platform columns at all.
+	var older bytes.Buffer
+	renderAnalytics(&older, rows(nil))
+	if strings.Contains(older.String(), "ANDROID") {
+		t.Fatalf("platform columns for a server that does not split:\n%s", older.String())
 	}
 }
