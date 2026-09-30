@@ -638,12 +638,23 @@ type Membership struct {
 // neither is anything else about the request (no IP address, no user agent): the only question this
 // answers is "how many distinct installs are running this runtime", and a salted hash answers it.
 type DeviceCheckin struct {
-	AppID      string    `json:"app_id"`
-	RuntimeID  string    `json:"runtime_id"`
-	Channel    string    `json:"channel"`
-	ClientHash string    `json:"client_hash"`
-	SeenAt     time.Time `json:"seen_at"`
+	AppID      string `json:"app_id"`
+	RuntimeID  string `json:"runtime_id"`
+	Channel    string `json:"channel"`
+	ClientHash string `json:"client_hash"`
+	// Platform is DevicePlatformAndroid, DevicePlatformIOS, or "" when the lane the device polled does
+	// not tell (see the API's device_checkins.go).
+	Platform string    `json:"platform,omitempty"`
+	SeenAt   time.Time `json:"seen_at"`
 }
+
+// Platforms a device check-in can be attributed to. An unattributed check-in has Platform "".
+const (
+	DevicePlatformAndroid = "android"
+	DevicePlatformIOS     = "ios"
+	// DevicePlatformUnknown is how an unattributed count is reported, never a stored value.
+	DevicePlatformUnknown = "unknown"
+)
 
 // DeviceCheckinRecord is the stored row: one per (app, runtime, client hash).
 type DeviceCheckinRecord struct {
@@ -651,6 +662,7 @@ type DeviceCheckinRecord struct {
 	RuntimeID  string    `json:"runtime_id"`
 	Channel    string    `json:"channel"`
 	ClientHash string    `json:"client_hash"`
+	Platform   string    `json:"platform,omitempty"`
 	FirstSeen  time.Time `json:"first_seen"`
 	LastSeen   time.Time `json:"last_seen"`
 }
@@ -676,4 +688,16 @@ type DeviceCheckinGroup struct {
 	FirstSeen time.Time              `json:"first_seen"`
 	LastSeen  time.Time              `json:"last_seen"`
 	Releases  []DeviceCheckinRelease `json:"releases"`
+	// Platforms splits Devices / Active24h / Active7d by platform: android, then ios, then unknown
+	// (installs that have not checked in through a lane that tells), each present only when non-zero.
+	// The entries add up to the group's totals.
+	Platforms []DeviceCheckinPlatformCount `json:"platforms"`
+}
+
+// DeviceCheckinPlatformCount is one platform's share of a DeviceCheckinGroup.
+type DeviceCheckinPlatformCount struct {
+	Platform  string `json:"platform"`
+	Devices   int    `json:"devices"`
+	Active24h int    `json:"active_24h"`
+	Active7d  int    `json:"active_7d"`
 }

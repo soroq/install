@@ -70,6 +70,26 @@ type analyticsDeviceRow struct {
 	Active7d   int       `json:"active_7d"`
 	FirstSeen  time.Time `json:"first_seen"`
 	LastSeen   time.Time `json:"last_seen"`
+	// Platforms splits the counts by platform (android, ios, unknown). Older servers do not send it;
+	// the per-platform columns are then left out.
+	Platforms []analyticsDevicePlatform `json:"platforms,omitempty"`
+}
+
+type analyticsDevicePlatform struct {
+	Platform  string `json:"platform"`
+	Devices   int    `json:"devices"`
+	Active24h int    `json:"active_24h"`
+	Active7d  int    `json:"active_7d"`
+}
+
+// platformDevices returns the devices counted under one platform of a row.
+func (row analyticsDeviceRow) platformDevices(platform string) int {
+	for _, p := range row.Platforms {
+		if p.Platform == platform {
+			return p.Devices
+		}
+	}
+	return 0
 }
 
 func runAnalytics(args []string) error {
@@ -261,8 +281,22 @@ func renderDevices(w io.Writer, view analyticsView) {
 		fmt.Fprintln(w, "  no devices have checked in yet")
 		return
 	}
+	// Per-platform columns only when the server splits by platform; UNKNOWN only when some install is not
+	// yet attributed.
+	split, unknown := false, 0
+	for _, row := range view.Devices {
+		split = split || row.Platforms != nil
+		unknown += row.platformDevices("unknown")
+	}
+	platformHeader := ""
+	if split {
+		platformHeader = "ANDROID\tIOS\t"
+		if unknown > 0 {
+			platformHeader += "UNKNOWN\t"
+		}
+	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "RELEASE\tVERSION\tCHANNEL\tDEVICES\tACTIVE 24H\tACTIVE 7D\tLAST SEEN\tRUNTIME")
+	fmt.Fprintln(tw, "RELEASE\tVERSION\tCHANNEL\tDEVICES\t"+platformHeader+"ACTIVE 24H\tACTIVE 7D\tLAST SEEN\tRUNTIME")
 	for _, row := range view.Devices {
 		release, version := row.ReleaseID, row.Version
 		if release == "" {
@@ -281,10 +315,21 @@ func renderDevices(w io.Writer, view analyticsView) {
 		if !row.LastSeen.IsZero() {
 			lastSeen = row.LastSeen.UTC().Format("2006-01-02 15:04")
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n",
-			release, version, row.Channel, row.Devices, row.Active24h, row.Active7d, lastSeen, runtime)
+		platforms := ""
+		if split {
+			platforms = fmt.Sprintf("%d\t%d\t", row.platformDevices("android"), row.platformDevices("ios"))
+			if unknown > 0 {
+				platforms += fmt.Sprintf("%d\t", row.platformDevices("unknown"))
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s%d\t%d\t%s\t%s\n",
+			release, version, row.Channel, row.Devices, platforms, row.Active24h, row.Active7d, lastSeen, runtime)
 	}
 	tw.Flush()
+	if unknown > 0 {
+		fmt.Fprintf(w, "note: %d install(s) are not attributed to a platform yet; each is once it next checks for updates"+
+			" through the iOS engine or the Android runtime lane.\n", unknown)
+	}
 }
 
 func containsString(values []string, want string) bool {
