@@ -485,7 +485,7 @@ func buildIOSAppDill(projectDir, toolchainVersion string, extraArgs []string) (s
 	// "Target kernel_snapshot_program failed: Exception" and leaves a ZERO-BYTE app.dill, after minutes
 	// of build, naming neither artifact. The publisher already states which toolchains a frontend pairs
 	// with, so that statement is checked here and the refusal names both.
-	if err := assertActiveFrontendPairsWithToolchain(toolchainVersion, iosBundleDir); err != nil {
+	if err := assertActiveFrontendPairsWithToolchain(toolchainVersion, iosBundleDir, flutterBin); err != nil {
 		return "", err
 	}
 
@@ -664,7 +664,12 @@ func iosFrameworkInfoPlistFor(buildMode string) string {
 // reading BOTH signed manifests from their caches. An unsigned candidate frontend carries no
 // compatible_toolchain_ids to check, so it is left to the candidate path's own provenance warning
 // rather than being failed here.
-func assertActiveFrontendPairsWithToolchain(toolchainVersion, iosBundleDir string) error {
+//
+// The frontend checked is the one THIS build runs (flutterBin, which honours the project's soroq.lock
+// pin), not the globally active one. A project pinned to an older release's frontend (an R9 base while
+// R10 is active, say) builds with its pinned frontend; checking the active one refused a correct pair
+// and accepted nothing it should not have.
+func assertActiveFrontendPairsWithToolchain(toolchainVersion, iosBundleDir, flutterBin string) error {
 	tcDir, err := toolchainVersionDir(toolchainVersion)
 	if err != nil {
 		return err
@@ -680,9 +685,12 @@ func assertActiveFrontendPairsWithToolchain(toolchainVersion, iosBundleDir strin
 		return fmt.Errorf("read the cached toolchain manifest for %q: %w", toolchainVersion, err)
 	}
 
-	bin, berr := resolveInstalledFrontendFlutterBin()
-	if berr != nil || strings.TrimSpace(bin) == "" {
-		return nil // no installed frontend record to pair against
+	bin := strings.TrimSpace(flutterBin)
+	if bin == "" {
+		var berr error
+		if bin, berr = resolveInstalledFrontendFlutterBin(); berr != nil || strings.TrimSpace(bin) == "" {
+			return nil // no installed frontend record to pair against
+		}
 	}
 	// <version>/flutter-sdk-src/bin/flutter -> <version>/manifest.json
 	feDir := filepath.Dir(filepath.Dir(filepath.Dir(bin)))

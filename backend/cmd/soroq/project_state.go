@@ -1061,12 +1061,21 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 // commands therefore select the frontend soroq.lock pins for that platform when it is installed.
 var platformFrontendPin soroqFrontendChoice
 
+// iosPatchBaseFrontend is the frontend an iOS PATCH must use: the one declaring the toolchain whose
+// engine built the base (see deriveIOSPatchToolchainFromBase). It outranks soroq.lock, whose pin is the
+// latest release's and not necessarily this base's.
+var iosPatchBaseFrontend soroqFrontendChoice
+
 // pinFrontendForPlatform selects, for the rest of this command, the frontend soroq.lock pins for
 // platform. An explicit SOROQ_FLUTTER_BIN still wins. When the pinned frontend is not installed it says
 // so and leaves the active frontend in charge.
 func pinFrontendForPlatform(projectDir, platform string) {
 	platformFrontendPin = soroqFrontendChoice{}
 	if strings.TrimSpace(os.Getenv("SOROQ_FLUTTER_BIN")) != "" {
+		return
+	}
+	if platform == "ios" && iosPatchBaseFrontend.Bin != "" {
+		platformFrontendPin = iosPatchBaseFrontend
 		return
 	}
 	if strings.TrimSpace(projectDir) == "" {

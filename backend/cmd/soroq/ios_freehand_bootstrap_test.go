@@ -66,6 +66,9 @@ func hashDirTree(t *testing.T, root string) string {
 const testPinnedKeyHex = "ab12cd34ef567890ab12cd34ef567890ab12cd34ef567890ab12cd34ef567890"
 
 func TestFreehandZeroTouch_GeneratesGlueWithoutTouchingLib(t *testing.T) {
+	// Pinned to the LEGACY ordering: this test asserts that template. A new base's default is covered by
+	// TestFreehandColdStartOrdering_NewBaseActivatesFirstAndRecordedOrderingWins.
+	t.Setenv("SOROQ_ACTIVATE_BEFORE_MAIN", "0")
 	dir := zeroTouchFixture(t, "import 'package:flutter/material.dart';\n\nvoid main() {\n  runApp(const SizedBox());\n}\n")
 	libBefore := hashDirTree(t, filepath.Join(dir, "lib"))
 
@@ -267,4 +270,74 @@ func readFixture(t *testing.T, dir, rel string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// A NEW base activates before developer main (a patch is live before any object exists, as with a
+// whole-program patch). A patch build regenerates the bootstrap its BASE was compiled from: the ordering
+// recorded in that base's baseline wins, and a baseline without the field is the legacy ordering.
+func TestFreehandColdStartOrdering_NewBaseActivatesFirstAndRecordedOrderingWins(t *testing.T) {
+	t.Setenv("SOROQ_ACTIVATE_BEFORE_MAIN", "")
+	dir := t.TempDir()
+	const rid = "1111111111111111111111111111111111111111111111111111111111111111"
+	if freehandActivateBeforeMain(dir, rid) {
+		t.Fatal("a new base whose soroq_flutter cannot stage changes for the next launch keeps the legacy ordering")
+	}
+	// A soroq_flutter that stages changes while a patch runs: a new base activates before main.
+	sf := filepath.Join(t.TempDir(), "soroq_flutter")
+	writeFixtureFile(t, sf, filepath.Join("lib", "src", "engine_lane_ota.dart"),
+		"final bool changesWhilePatchedApplyNextLaunch;\n")
+	writeFixtureFile(t, dir, filepath.Join(".dart_tool", "package_config.json"),
+		`{"configVersion":2,"packages":[{"name":"soroq_flutter","rootUri":"file://`+sf+`","packageUri":"lib/"}]}`)
+	if !freehandActivateBeforeMain(dir, rid) {
+		t.Fatal("a project with no base and a staging soroq_flutter must get the activate-before-main ordering")
+	}
+	rel := freehandReleaseDir(dir, rid)
+	if err := os.MkdirAll(rel, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(body string) {
+		if err := os.WriteFile(filepath.Join(rel, "baseline.json"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`{"runtime_id":"` + rid + `"}`)
+	if freehandActivateBeforeMain(dir, rid) {
+		t.Fatal("a base persisted without cold_start_ordering is the legacy ordering")
+	}
+	write(`{"runtime_id":"` + rid + `","cold_start_ordering":"activate-before-main"}`)
+	if !freehandActivateBeforeMain(dir, rid) {
+		t.Fatal("a base recorded as activate-before-main must regenerate that ordering")
+	}
+	t.Setenv("SOROQ_ACTIVATE_BEFORE_MAIN", "0")
+	if freehandActivateBeforeMain(dir, rid) {
+		t.Fatal("SOROQ_ACTIVATE_BEFORE_MAIN=0 must override")
+	}
+}
+
+// The ordering is DERIVED from the generated bootstrap the base was compiled from.
+func TestDeriveFreehandColdStartOrdering(t *testing.T) {
+	dir := t.TempDir()
+	if got := deriveFreehandColdStartOrdering(dir); got != "" {
+		t.Fatalf("no bootstrap: got %q", got)
+	}
+	for _, tc := range []struct {
+		first bool
+		want  string
+	}{{true, freehandOrderingActivateBeforeMain}, {false, ""}} {
+		src := freehandBootstrapSource(freehandBootstrapConfig{
+			AppID: "dev.soroq.x", RuntimeID: strings.Repeat("a", 64), Channel: "stable",
+			ControlPlaneBaseURL: "https://api.soroq.dev", PinnedEnginePubKeyHex: strings.Repeat("b", 64),
+			EntrypointImport: "package:x/main.dart", ActivateBeforeDeveloperMain: tc.first,
+		})
+		p := filepath.Join(dir, freehandBootstrapRelPath)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := deriveFreehandColdStartOrdering(dir); got != tc.want {
+			t.Fatalf("activateFirst=%v: derived %q, want %q", tc.first, got, tc.want)
+		}
+	}
 }

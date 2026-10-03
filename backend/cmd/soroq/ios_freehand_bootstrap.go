@@ -26,8 +26,10 @@ package main
 // already directs.
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -214,10 +216,10 @@ type freehandBootstrapConfig struct {
 	PinnedEnginePubKeyHex string
 	EntrypointImport      string // package:<pkg>/<path under lib/>
 	// ActivateBeforeDeveloperMain selects the cold-start ordering that lets developer initialization
-	// observe a retained patch. DEFAULT FALSE, deliberately: installing redirects before Flutter's
-	// first frame was reproduced 3/3 on a physical iPhone as a permanently black window, and the
-	// corrected ordering (Soroq owns a real first frame, activates, then calls developer main) has not
-	// yet passed a physical cold-start run. Opt in with SOROQ_ACTIVATE_BEFORE_MAIN=1.
+	// observe a retained patch: Soroq owns a real first frame, activates, then calls developer main. It is
+	// the DEFAULT for a new base (see freehandActivateBeforeMain). The earlier black-window failure was
+	// redirects installed before ANY frame; this ordering presents Soroq's own frame first, and it passed
+	// on a physical iPhone (no black frame, patched first build, initState, retention, rollback).
 	ActivateBeforeDeveloperMain bool
 	// LaunchColorARGB is the developer-declared launch-screen colour from soroq.yaml, as 0xAARRGGBB.
 	// Empty means undeclared, and the generated bootstrap then omits the argument so the package
@@ -332,7 +334,7 @@ func prepareFreehandZeroTouch(projectDir, pinnedKeyHex string, developerPassthro
 		return "", launchErr
 	}
 	cfg := freehandBootstrapConfig{
-		ActivateBeforeDeveloperMain: os.Getenv("SOROQ_ACTIVATE_BEFORE_MAIN") == "1",
+		ActivateBeforeDeveloperMain: freehandActivateBeforeMain(projectDir, runtimeID),
 		LaunchColorARGB:             launchColor,
 		AppID:                       appID,
 		RuntimeID:                   strings.ToLower(runtimeID),
@@ -466,4 +468,72 @@ func withFreehandBootstrapEntrypoint(bootstrapRel string, developerPassthrough [
 	out := make([]string, 0, len(stripped)+2)
 	out = append(out, "-t", bootstrapRel)
 	return append(out, stripped...)
+}
+
+// freehandActivateBeforeMain decides the cold-start ordering a generated bootstrap gets.
+//
+// A patch replaces code the way a whole-program patch does only if it is live before developer code
+// runs: a replacement class reaches only objects created after activation, and a moved variable is the
+// only storage only if nothing used the base one first. So a NEW base activates before developer main().
+// A patch build must regenerate the SAME bootstrap its base was compiled from (the bootstrap is part of
+// the program being diffed), so an existing base's recorded ordering wins; a base persisted before the
+// ordering was recorded used the legacy ordering. SOROQ_ACTIVATE_BEFORE_MAIN=1/0 overrides both.
+func freehandActivateBeforeMain(projectDir, runtimeID string) bool {
+	switch strings.TrimSpace(os.Getenv("SOROQ_ACTIVATE_BEFORE_MAIN")) {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+	relDir := freehandReleaseDir(projectDir, runtimeID)
+	raw, err := os.ReadFile(filepath.Join(relDir, "baseline.json"))
+	if err != nil {
+		// No base yet: this build IS the base. Activate-before-main needs a runtime that defers changes
+		// arriving while a patch runs to the next launch; without one, a patch-to-patch switch in a
+		// running app would leave the previous patch's objects alive, so such a project keeps the
+		// legacy ordering (whose State pass-through covers the running app).
+		return soroqFlutterStagesNextLaunch(projectDir)
+	}
+	var meta struct {
+		ColdStartOrdering string `json:"cold_start_ordering"`
+	}
+	if json.Unmarshal(raw, &meta) != nil {
+		return false
+	}
+	return meta.ColdStartOrdering == freehandOrderingActivateBeforeMain
+}
+
+// soroqFlutterStagesNextLaunch reports whether the soroq_flutter this project resolves defers changes that
+// arrive while a patch runs to the next launch (SoroqEngineLaneController.changesWhilePatchedApplyNextLaunch).
+// Read from the resolved package source, so a path dependency, an override and a hosted version are all
+// judged by what will actually be compiled.
+func soroqFlutterStagesNextLaunch(projectDir string) bool {
+	cfgPath := filepath.Join(projectDir, ".dart_tool", "package_config.json")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return false
+	}
+	var cfg struct {
+		Packages []struct {
+			Name    string `json:"name"`
+			RootURI string `json:"rootUri"`
+		} `json:"packages"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil {
+		return false
+	}
+	for _, p := range cfg.Packages {
+		if p.Name != "soroq_flutter" {
+			continue
+		}
+		root := p.RootURI
+		if u, err := url.Parse(root); err == nil && u.Scheme == "file" {
+			root = u.Path
+		} else if !filepath.IsAbs(root) {
+			root = filepath.Join(filepath.Dir(cfgPath), filepath.FromSlash(root))
+		}
+		src, err := os.ReadFile(filepath.Join(root, "lib", "src", "engine_lane_ota.dart"))
+		return err == nil && strings.Contains(string(src), "changesWhilePatchedApplyNextLaunch")
+	}
+	return false
 }

@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"soroq/backend/internal/patchanalyzer"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,22 @@ import (
 
 	"soroq/backend/internal/depgraph"
 )
+
+// splitFrozenIdentityKey splits a v1 frozen identity key `v1|<lib>|<kind>|<class>|<member>|<sig>`.
+// The MEMBER segment may itself contain `|`: the VM names an extension (or extension type) member
+// `<Extension>|<member>` (e.g. `Twice|twice`), so a plain six-way split rejected every key for a changed
+// extension method as malformed. Library, kind and class never contain `|`, and the signature is last.
+func splitFrozenIdentityKey(key string) ([6]string, bool) {
+	var out [6]string
+	parts := strings.Split(key, "|")
+	if len(parts) < 6 || parts[0] != "v1" {
+		return out, false
+	}
+	copy(out[:4], parts[:4])
+	out[4] = strings.Join(parts[4:len(parts)-1], "|")
+	out[5] = parts[len(parts)-1]
+	return out, true
+}
 
 // FreehandDiffReport mirrors the analyzer's freehand_diff.json (schema soroq.freehand.diff.v1).
 type FreehandDiffReport struct {
@@ -187,11 +204,72 @@ func writeCapabilityMap(g depgraph.Graph, d *depgraph.Descriptor) (string, error
 	return path, nil
 }
 
+// freehandPatchAnalyzer is the analyzer snapshot a PATCH runs (diff + synthesis), and the one whose sha
+// the patch's toolchain binding records. It is the frontend's own snapshot unless
+// SOROQ_FREEHAND_PATCH_ANALYZER names another. The analyzer decides which source changes a patch can
+// deliver; it is not part of the base (the base is pinned by its kernels, engine and toolchain, all
+// verified separately), so a newer analyzer can serve an older base as long as it reads the same kernel
+// format. The binding records exactly which one ran.
+func freehandPatchAnalyzer(flutterRoot string) (string, error) {
+	if p := strings.TrimSpace(os.Getenv("SOROQ_FREEHAND_PATCH_ANALYZER")); p != "" {
+		if !fileExists(p) {
+			return "", fmt.Errorf("SOROQ_FREEHAND_PATCH_ANALYZER=%s does not exist", p)
+		}
+		return p, nil
+	}
+	if p, ok := bundledPatchAnalyzerFor(flutterRoot); ok {
+		freehandBundledAnalyzerSelected = true
+		return p, nil
+	}
+	return filepath.Join(flutterRoot, "bin", "cache", "soroq", "soroq_kernel_analyze.dill"), nil
+}
+
+// bundledPatchAnalyzerFor returns the patch analyzer shipped BESIDE this CLI binary when it can read the
+// project's kernels. The analyzer decides which changes a patch can deliver and builds the module, so a
+// newer one serves bases that shipped with an older frontend -- as long as both speak the same kernel
+// format, which is fixed by the Dart SDK version. The bundle carries the version it was built with
+// (soroq_patch_analyzer.dart_version); it is used only when that equals the frontend's dart-sdk/version.
+// Its name differs from soroq_kernel_analyze.dill on purpose: an analyzer by THAT name beside the binary
+// is what `soroq release` installs into a frontend, and a patch analyzer must never be mistaken for it.
+func bundledPatchAnalyzerFor(flutterRoot string) (string, bool) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", false
+	}
+	dir := filepath.Dir(exe)
+	dill := filepath.Join(dir, "soroq_patch_analyzer.dill")
+	have, err2 := os.ReadFile(filepath.Join(flutterRoot, "bin", "cache", "dart-sdk", "version"))
+	if err2 != nil {
+		return "", false
+	}
+	want, err1 := os.ReadFile(filepath.Join(dir, "soroq_patch_analyzer.dart_version"))
+	if fileExists(dill) && err1 == nil && strings.TrimSpace(string(want)) == strings.TrimSpace(string(have)) {
+		return dill, true
+	}
+	// The analyzer this binary carries (internal/patchanalyzer), extracted once under ~/.soroq/analyzers.
+	if patchanalyzer.Available() && patchanalyzer.DartVersion() == strings.TrimSpace(string(have)) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", false
+		}
+		path, err := patchanalyzer.Extract(filepath.Join(home, ".soroq", "analyzers"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not extract the bundled patch analyzer: %v\n", err)
+			return "", false
+		}
+		return path, true
+	}
+	return "", false
+}
+
 // runFreehandAnalyzerDiff runs the installed analyzer in --diff mode (baseline source kernel vs candidate
 // source kernel) and returns the parsed report. The analyzer .dill is run by the fork's dart.
 func runFreehandAnalyzerDiff(flutterRoot, baselineSourceDill, candidateSourceDill, packageConfig, outDir, capabilityMapPath string) (*FreehandDiffReport, error) {
 	dart := filepath.Join(flutterRoot, "bin", "cache", "dart-sdk", "bin", "dart")
-	analyzer := filepath.Join(flutterRoot, "bin", "cache", "soroq", "soroq_kernel_analyze.dill")
+	analyzer, err := freehandPatchAnalyzer(flutterRoot)
+	if err != nil {
+		return nil, err
+	}
 	for _, p := range []string{dart, analyzer, baselineSourceDill, candidateSourceDill, packageConfig} {
 		if !fileExists(p) {
 			return nil, fmt.Errorf("freehand diff input missing: %s", p)
@@ -615,7 +693,11 @@ func computeToolchainBinding(flutterRoot, bundleDir, toolchain string, needsFlut
 	if b.DartAotRuntimeSHA256, err = shaOf(filepath.Join(bundleDir, "dartaotruntime")); err != nil {
 		return b, err
 	}
-	if b.AnalyzerSnapshotSHA256, err = shaOf(filepath.Join(flutterRoot, "bin", "cache", "soroq", "soroq_kernel_analyze.dill")); err != nil {
+	analyzerPath, aerr := freehandPatchAnalyzer(flutterRoot)
+	if aerr != nil {
+		return b, aerr
+	}
+	if b.AnalyzerSnapshotSHA256, err = shaOf(analyzerPath); err != nil {
 		return b, err
 	}
 	if needsFlutter {
@@ -830,6 +912,11 @@ type freehandModuleManifest struct {
 	// ModuleSourceTree is the canonical manifest of every generated module-local source file.
 	ModuleSourceTree       []freehandModuleTreeEntry `json:"module_source_tree"`
 	ModuleSourceTreeDigest string                    `json:"module_source_tree_digest"`
+	// Kernel-level module (freehand_kernel_module.go): the module was built from the candidate kernel,
+	// not synthesized source. module_format names that; the class lists say what the builder placed.
+	ModuleFormat   string   `json:"module_format,omitempty"`
+	VehicleClasses []string `json:"vehicle_classes,omitempty"`
+	MovedClasses   []string `json:"moved_classes,omitempty"`
 	// DependencyDescriptorDigest is the dependency delta this module was synthesized under. Because the
 	// manifest's SHA is bound into the artifact id, this makes the dependency descriptor part of the
 	// artifact's identity: swapping in a different descriptor changes the artifact.
@@ -1067,8 +1154,8 @@ func changedDeclsFromDiff(diffChanged []map[string]any) ([]changedDecl, error) {
 		if ml == "" || key == "" {
 			return nil, fmt.Errorf("diff changed entry missing manifestLine/key: %+v", c)
 		}
-		parts := strings.Split(key, "|")
-		if len(parts) != 6 || parts[0] != "v1" {
+		parts, ok := splitFrozenIdentityKey(key)
+		if !ok {
 			return nil, fmt.Errorf("malformed frozen identity key %q", key)
 		}
 		out = append(out, changedDecl{
@@ -1842,7 +1929,10 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 	}
 	defer os.RemoveAll(synthOut)
 	dart := filepath.Join(flutterRoot, "bin", "cache", "dart-sdk", "bin", "dart")
-	analyzer := filepath.Join(flutterRoot, "bin", "cache", "soroq", "soroq_kernel_analyze.dill")
+	analyzer, err := freehandPatchAnalyzer(flutterRoot)
+	if err != nil {
+		return "", err
+	}
 	pkgConfig := filepath.Join(projectDir, ".dart_tool", "package_config.json")
 	synthArgs := []string{analyzer, "--synthesize",
 		"--diff-json", plan.diffJSONPath,
@@ -1852,6 +1942,41 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 	}
 	if plan.capabilityMapPath != "" {
 		synthArgs = append(synthArgs, "--capability-map", plan.capabilityMapPath)
+	}
+	kernelModule := freehandKernelModuleEnabled()
+	kernelReceiptPath := ""
+	if kernelModule {
+		// Kernel-level module (freehand_kernel_module.go): built from the candidate kernel, linked against
+		// the base source kernel by canonical name, compiled to bytecode by the analyzer itself.
+		synthArgs = append(synthArgs, "--kernel-module", "--import-dill", filepath.Join(plan.relDir, "source_app.dill"),
+			"--aot-dill", filepath.Join(plan.relDir, "app.dill"))
+		if plan.interfaceValidation != "" {
+			synthArgs = append(synthArgs, "--interface-validation", plan.interfaceValidation)
+		}
+		// An obfuscated base: the analyzer compiles the module, so it receives the verified base map and
+		// a fresh release-side receipt here, exactly as dart2bytecode does on the source path.
+		if plan.obfuscation.isEnabled() {
+			if err := plan.obfuscation.validate(); err != nil {
+				return "", fmt.Errorf("the base's recorded obfuscation binding is unusable: %w", err)
+			}
+			mapPath, err := resolveBaseObfuscationMap(plan.relDir, plan.obfuscation)
+			if err != nil {
+				return "", err
+			}
+			rp, release, err := freehandPatchReceiptScratch(projectDir)
+			if err != nil {
+				return "", err
+			}
+			defer func() {
+				if cerr := release(); cerr != nil {
+					fmt.Fprintf(os.Stderr, "soroq: %v\n", cerr)
+				}
+			}()
+			kernelReceiptPath = rp
+			synthArgs = append(synthArgs, "--soroq-base-obfuscation-map", mapPath,
+				"--soroq-base-obfuscation-map-sha256", plan.obfuscation.MapSHA256,
+				"--soroq-translation-receipt", rp)
+		}
 	}
 	// Packages NEW in this patch must be carried by value, not imported: the installed base has no such
 	// library, and importing one compiles but crashes the VM at load.
@@ -1872,6 +1997,9 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 		return "", fmt.Errorf("freehand module synthesis failed: %w\n%s", synthErr, string(synthLog))
 	}
 	moduleSrc := filepath.Join(synthOut, "soroq_freehand_module.dart")
+	if kernelModule {
+		moduleSrc = filepath.Join(synthOut, freehandKernelModuleFile)
+	}
 	synthManifestSrc := filepath.Join(synthOut, "soroq_freehand_module_manifest.json")
 	synthManifestBytes, err := os.ReadFile(synthManifestSrc)
 	if err != nil {
@@ -1947,14 +2075,20 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 		return "", fmt.Errorf("synth manifest module_graph_digest %q is not lowercase 64-hex; this "+
 			"analyzer predates per-graph module namespaces — rebuild it", synthManifest.ModuleGraphDigest)
 	}
-	recomputed, err := recomputeModuleGraphDigest(moduleSrcSHA, synthOut, synthManifest.ModuleSourceTree)
-	if err != nil {
-		return "", err
-	}
-	if recomputed != graphDigest {
-		return "", fmt.Errorf("module_graph_digest %s does not match the digest recomputed from the "+
-			"emitted sources (%s); the manifest does not describe its own module tree",
-			short(graphDigest), short(recomputed))
+	if kernelModule {
+		if err := verifyFreehandKernelModule(synthOut, synthManifestBytes, graphDigest); err != nil {
+			return "", err
+		}
+	} else {
+		recomputed, err := recomputeModuleGraphDigest(moduleSrcSHA, synthOut, synthManifest.ModuleSourceTree)
+		if err != nil {
+			return "", err
+		}
+		if recomputed != graphDigest {
+			return "", fmt.Errorf("module_graph_digest %s does not match the digest recomputed from the "+
+				"emitted sources (%s); the manifest does not describe its own module tree",
+				short(graphDigest), short(recomputed))
+		}
 	}
 
 	// 2. Compile the module to bytecode via the R4g dart2bytecode path (flutter platform + compile
@@ -1975,7 +2109,9 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 	// immutable baseline directory, with each patch deleting the previous one first, so two patches
 	// against one base raced over a file inside a directory nothing is allowed to touch.
 	receiptPath := ""
-	if obfBinding.isEnabled() {
+	if kernelModule {
+		receiptPath = kernelReceiptPath
+	} else if obfBinding.isEnabled() {
 		var releaseReceiptScratch func() error
 		receiptPath, releaseReceiptScratch, err = freehandPatchReceiptScratch(projectDir)
 		if err != nil {
@@ -1987,7 +2123,9 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 			}
 		}()
 	}
-	if err := compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, plan.relDir, moduleSrc, graphDigest, moduleSrcSHA, bytecodePath, synthManifest.NeedsFlutterTarget, obfBinding, receiptPath, plan.interfaceValidation); err != nil {
+	if kernelModule {
+		// The analyzer already compiled the module (contract-checked, and translated for an obfuscated base).
+	} else if err := compileFreehandModuleBytecode(projectDir, flutterRoot, bundleDir, plan.relDir, moduleSrc, graphDigest, moduleSrcSHA, bytecodePath, synthManifest.NeedsFlutterTarget, obfBinding, receiptPath, plan.interfaceValidation); err != nil {
 		return "", fmt.Errorf("compile freehand module: %w", err)
 	}
 	bytecodeSHA, err := sha256OfPath(bytecodePath)
