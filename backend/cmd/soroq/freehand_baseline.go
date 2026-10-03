@@ -117,6 +117,12 @@ type FreehandBaselineMeta struct {
 	CodeFingerprintsSchema string `json:"code_fingerprints_schema,omitempty"`
 	CodeFingerprintsSHA256 string `json:"code_fingerprints_sha256,omitempty"`
 	CodeFingerprints       int    `json:"code_fingerprints,omitempty"`
+	// FIELD LAYOUT (freehand_field_layout.go): where every instance field of this base lives, so a patch can
+	// read a field whose getter the precompiler dropped. Required iff the engine declares
+	// soroq_field_layout_v1; omitted otherwise, so every older baseline.json stays byte-identical.
+	FieldLayoutSchema  string `json:"field_layout_schema,omitempty"`
+	FieldLayoutSHA256  string `json:"field_layout_sha256,omitempty"`
+	FieldLayoutEntries int    `json:"field_layout_entries,omitempty"`
 	// Retention is the load-bearing freehand-retention evidence; a base without it is refused at both
 	// release registration and patch time (see requireFreehandRetention).
 	Retention *FreehandRetentionEvidence `json:"retention"`
@@ -259,6 +265,7 @@ var freehandKnownIdentityCapabilities = map[string]bool{
 	freehandDependencyMapCapability:                      true,
 	freehandTaggedStackBoundaryCapability:                true,
 	freehandCodeFingerprintsCapability:                   true,
+	freehandFieldLayoutCapability:                        true,
 }
 
 // legacyDefaultRedirectKinds are the kinds that were demonstrably shipping before this tranche: they are
@@ -888,6 +895,10 @@ func verifyExistingBaseline(relDir string) (*FreehandBaselineMeta, error) {
 	if _, err := loadVerifiedBaselineCodeFingerprints(relDir, &m); err != nil {
 		return nil, err
 	}
+	// Field layout, in both directions (required iff the recorded engine capability says so).
+	if _, err := verifiedBaselineFieldLayoutPath(relDir, &m); err != nil {
+		return nil, err
+	}
 	return &m, nil
 }
 
@@ -1057,6 +1068,9 @@ func immutableInputsEqual(a, b *FreehandBaselineMeta) bool {
 		a.CodeFingerprintsSchema == b.CodeFingerprintsSchema &&
 		a.CodeFingerprintsSHA256 == b.CodeFingerprintsSHA256 &&
 		a.CodeFingerprints == b.CodeFingerprints &&
+		a.FieldLayoutSchema == b.FieldLayoutSchema &&
+		a.FieldLayoutSHA256 == b.FieldLayoutSHA256 &&
+		a.FieldLayoutEntries == b.FieldLayoutEntries &&
 		retentionEqual(a.Retention, b.Retention) &&
 		obfuscationBindingEqual(a.Obfuscation, b.Obfuscation)
 }
@@ -1263,6 +1277,14 @@ func persistFreehandBaselineWithDependencyMap(projectDir string, meta FreehandBa
 		meta.CodeFingerprintsSHA256 = freehandSHA256Bytes(depMap.CodeFingerprints)
 		meta.CodeFingerprints = len(fps)
 	}
+	// FIELD LAYOUT, same gen_snapshot run, same rule.
+	var fieldLayout []byte
+	if depMap != nil {
+		fieldLayout = depMap.FieldLayout
+	}
+	if err := bindFreehandFieldLayout(&meta, capabilities, fieldLayout); err != nil {
+		return "", err
+	}
 
 	releasesRoot := filepath.Join(projectDir, ".soroq", "releases")
 	relDir := filepath.Join(releasesRoot, meta.RuntimeID)
@@ -1353,6 +1375,11 @@ func persistFreehandBaselineWithDependencyMap(projectDir string, meta FreehandBa
 		}
 		if depMap.CodeFingerprints != nil {
 			if err := writeFileSync(filepath.Join(tmpDir, freehandCodeFingerprintsFile), depMap.CodeFingerprints, 0o600); err != nil {
+				return "", err
+			}
+		}
+		if depMap.FieldLayout != nil {
+			if err := writeFileSync(filepath.Join(tmpDir, freehandFieldLayoutFile), depMap.FieldLayout, 0o600); err != nil {
 				return "", err
 			}
 		}

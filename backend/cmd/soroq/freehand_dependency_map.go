@@ -214,6 +214,9 @@ type freehandDependencyMapCapture struct {
 	// CodeFingerprints is the canonical soroq_code_fingerprints.tsv from the same gen_snapshot run, or nil
 	// when the engine does not declare soroq_code_fingerprints_v1.
 	CodeFingerprints []byte
+	// FieldLayout is the canonical soroq_field_layout.tsv from the same gen_snapshot run, or nil when the
+	// engine does not declare soroq_field_layout_v1.
+	FieldLayout []byte
 }
 
 // toolchainDeclaresDependencyMap reads the resolved toolchain's own engine.json. An absent capability

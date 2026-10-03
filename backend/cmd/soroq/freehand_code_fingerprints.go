@@ -318,7 +318,7 @@ func freehandBuildCandidate(projectDir, toolchain, relDir string, passthrough []
 	}
 	fmt.Fprintln(os.Stderr, "soroq patch ios --engine (freehand): building the candidate to find changes that compile to the base's own machine code")
 	if _, err := buildIOSAppDill(projectDir, toolchain, pt); err != nil {
-		return nil, fmt.Errorf("candidate build for machine-code comparison failed: %w", err)
+		return nil, fmt.Errorf("%w: %v", errFreehandMachineCodeUnavailable, err)
 	}
 	_, fps, err := collectFreehandCodeFingerprints(fpPath, start)
 	return fps, err
@@ -339,6 +339,13 @@ func pruneFreehandUnchangedMachineCode(projectDir, relDir string, base *Freehand
 		build = freehandBuildCandidateFingerprints
 	}
 	candFPs, err := build(projectDir, opts.toolchain, relDir, opts.passthrough)
+	if errors.Is(err, errFreehandMachineCodeUnavailable) {
+		// Pruning only REMOVES redirects whose machine code is unchanged; without the comparison every
+		// changed declaration stays redirected, which is correct and only slower. Never refuse a patch
+		// over an optimization.
+		fmt.Fprintf(os.Stderr, "machine-code comparison unavailable, nothing pruned: %v\n", err)
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -430,3 +437,6 @@ func freehandSameMachineCode(changed []string, baseFPs, candFPs map[string]strin
 }
 
 var errFreehandIdenticalMachineCode = errors.New("every changed declaration compiles to exactly the machine code the base already ships; there is nothing to patch")
+
+// errFreehandMachineCodeUnavailable marks a failed candidate build for the machine-code comparison.
+var errFreehandMachineCodeUnavailable = errors.New("candidate build for machine-code comparison failed")

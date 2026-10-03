@@ -915,6 +915,14 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 	if fpDeclared && !depMapDeclared {
 		return fmt.Errorf("toolchain %s declares %s without %s; code fingerprints are only recorded alongside the dependency map", toolchain, freehandCodeFingerprintsCapability, freehandDependencyMapCapability)
 	}
+	// FIELD LAYOUT from the same gen_snapshot run (engines declaring soroq_field_layout_v1).
+	passthrough, flPath, flDeclared, err := withFreehandFieldLayout(projectDir, toolchain, passthrough)
+	if err != nil {
+		return err
+	}
+	if flDeclared && !depMapDeclared {
+		return fmt.Errorf("toolchain %s declares %s without %s; the field layout is only recorded alongside the dependency map", toolchain, freehandFieldLayoutCapability, freehandDependencyMapCapability)
+	}
 
 	// THE MAP COMES FROM THIS BUILD'S OWN gen_snapshot, not from a later re-run.
 	//
@@ -1033,6 +1041,11 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 		if fpDeclared {
 			if depMap.CodeFingerprints, _, err = collectFreehandCodeFingerprints(fpPath, buildStart); err != nil {
 				return fmt.Errorf("freehand build succeeded but its code fingerprints are unusable; no baseline persisted and no release registered: %w", err)
+			}
+		}
+		if flDeclared {
+			if depMap.FieldLayout, err = collectFreehandFieldLayout(flPath, buildStart); err != nil {
+				return fmt.Errorf("freehand build succeeded but its field layout is unusable; no baseline persisted and no release registered: %w", err)
 			}
 		}
 	}

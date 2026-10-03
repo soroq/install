@@ -55,7 +55,7 @@ func main() {
 	case "logout":
 		err = runLogout(os.Args[2:])
 	case "patch":
-		err = runPatch(os.Args[2:])
+		err = runPatch(takeAllowAssetDiffs(os.Args[2:]))
 	case "patches":
 		// `patches` IS THE READ SIDE, AND ITS HELP MUST SAY SO.
 		//
