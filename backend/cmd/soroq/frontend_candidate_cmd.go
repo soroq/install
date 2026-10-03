@@ -37,11 +37,15 @@ type candidateManifest struct {
 	Schema          string `json:"schema"`
 	Version         string `json:"soroq_frontend_version"`
 	FlutterRevision string `json:"flutter_revision"`
-	PatchsetSHA256  string `json:"patchset_sha256"`
-	AnalyzerSHA256  string `json:"analyzer_snapshot_sha256"`
-	FrontendSubdir  string `json:"frontend_subdir"`
-	Candidate       bool   `json:"candidate"`
-	Signed          bool   `json:"signed"`
+	// The release pairs a frontend with a toolchain only when both name the same Dart (and engine); a
+	// candidate must be able to say so, or it can never pass that check.
+	DartRevision   string `json:"dart_revision,omitempty"`
+	EngineRevision string `json:"engine_revision,omitempty"`
+	PatchsetSHA256 string `json:"patchset_sha256"`
+	AnalyzerSHA256 string `json:"analyzer_snapshot_sha256"`
+	FrontendSubdir string `json:"frontend_subdir"`
+	Candidate      bool   `json:"candidate"`
+	Signed         bool   `json:"signed"`
 	// Which toolchains this frontend was built to work with. The canonical zero-touch command uses it
 	// to derive --toolchain; without it, a machine with several installed toolchains cannot be paired
 	// safely and the command refuses rather than guessing.

@@ -290,6 +290,7 @@ func runFreehandAnalyzerDiff(flutterRoot, baselineSourceDill, candidateSourceDil
 	if capabilityMapPath != "" {
 		args = append(args, "--capability-map", capabilityMapPath)
 	}
+	args = withFieldReadFallback(args)
 	cmd := exec.Command(dart, args...)
 	out, err := cmd.CombinedOutput()
 	// exit 4 = blockers present (a valid, reportable outcome); other non-zero = real failure.
@@ -335,6 +336,10 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string, planOpts .
 	// here with the "create a new base release" message.
 	base, err := verifyExistingBaseline(relDir)
 	if err != nil {
+		return nil, fmt.Errorf("baseline verification failed (freehand patch refused): %w", err)
+	}
+	freehandFieldReadFallback = freehandBaseReadsDroppedFields(base)
+	if freehandFieldLayoutPath, err = verifiedBaselineFieldLayoutPath(relDir, base); err != nil {
 		return nil, fmt.Errorf("baseline verification failed (freehand patch refused): %w", err)
 	}
 	// Refuse to patch a base that was NOT built with verified freehand retention: without --soroq_manifest
@@ -1940,6 +1945,7 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 		"--package-config", pkgConfig,
 		"--out", synthOut,
 	}
+	synthArgs = withFieldReadFallback(synthArgs)
 	if plan.capabilityMapPath != "" {
 		synthArgs = append(synthArgs, "--capability-map", plan.capabilityMapPath)
 	}
@@ -1950,6 +1956,11 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 		// the base source kernel by canonical name, compiled to bytecode by the analyzer itself.
 		synthArgs = append(synthArgs, "--kernel-module", "--import-dill", filepath.Join(plan.relDir, "source_app.dill"),
 			"--aot-dill", filepath.Join(plan.relDir, "app.dill"))
+		// What the shipped binary actually contains (its snapshot profile): members the contract does not
+		// name but the binary kept are callable, so a patch can use framework code the app already ships.
+		if graph := filepath.Join(plan.relDir, freehandObjectGraphName); fileExists(graph) {
+			synthArgs = append(synthArgs, "--aot-graph", graph)
+		}
 		if plan.interfaceValidation != "" {
 			synthArgs = append(synthArgs, "--interface-validation", plan.interfaceValidation)
 		}
@@ -2660,4 +2671,43 @@ func recomputeModuleGraphDigest(mainSHA, synthDir string, tree []struct {
 		return "", fmt.Errorf("module source tree is not sorted by path; the digest would not be canonical")
 	}
 	return freehandSHA256Bytes([]byte(strings.Join(lines, "\n"))), nil
+}
+
+// freehandFieldReadFallback: the base's engine reads an instance field whose getter the precompiler
+// dropped (engine R11). Set from the verified baseline for the patch being planned.
+var freehandFieldReadFallback bool
+
+// freehandBaseReadsDroppedFields reports the capability from the base's recorded engine declaration;
+// SOROQ_ENGINE_FIELD_READ_FALLBACK=1/0 overrides it (host lab only).
+func freehandBaseReadsDroppedFields(base *FreehandBaselineMeta) bool {
+	switch strings.TrimSpace(os.Getenv("SOROQ_ENGINE_FIELD_READ_FALLBACK")) {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+	if base == nil || base.RedirectCapabilities == nil {
+		return false
+	}
+	for _, c := range base.RedirectCapabilities.IdentityCapabilities {
+		if c == freehandFieldLayoutCapability {
+			return true
+		}
+	}
+	return false
+}
+
+// freehandFieldLayoutPath is the verified base's soroq_field_layout.tsv (engine R11), or "".
+var freehandFieldLayoutPath string
+
+// withFieldReadFallback appends the analyzer flags when the base's engine can read dropped fields: the
+// base's field layout (R11), which also turns the fallback on, or the bare flag (host lab override).
+func withFieldReadFallback(args []string) []string {
+	if freehandFieldLayoutPath != "" {
+		return append(args, "--field-layout", freehandFieldLayoutPath)
+	}
+	if freehandFieldReadFallback {
+		return append(args, "--engine-field-read-fallback")
+	}
+	return args
 }

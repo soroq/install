@@ -80,6 +80,23 @@ func TestValidCandidateIsAccepted(t *testing.T) {
 	}
 }
 
+// A candidate that names its Dart and engine revisions is accepted: the release refuses a frontend/
+// toolchain pair whose Dart revisions disagree, so a candidate that could not carry dart_revision
+// could never be released with.
+func TestCandidateMayNameItsDartAndEngineRevisions(t *testing.T) {
+	dir := writeCandidate(t, func(m map[string]any) {
+		m["dart_revision"] = "d684a576a6aa954ae107a03b2b4e1d61c3bebe93"
+		m["engine_revision"] = "5a2a6a42cce67f965cf540fcecf616faca624aa1"
+	}, "... SoroqFreehandAnalysis ...")
+	m, err := verifyCandidateFrontend(dir)
+	if err != nil {
+		t.Fatalf("a candidate naming its revisions was refused: %v", err)
+	}
+	if m.DartRevision != "d684a576a6aa954ae107a03b2b4e1d61c3bebe93" {
+		t.Fatalf("dart_revision not decoded: %+v", m)
+	}
+}
+
 // THE DECISIVE REFUSAL. Source is irrelevant if the snapshot the tool executes lacks the target.
 func TestCandidateWithoutTheTargetInItsSnapshotIsRefused(t *testing.T) {
 	dir := writeCandidate(t, nil, "a snapshot with no soroq target at all")
