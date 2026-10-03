@@ -1000,8 +1000,29 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 
 	// Fail-build atomicity: buildIOSAppDill's result is finalized as a PURE TAIL — freehandFinalizeBuild
 	// is the only post-build path, so a failed build persists no baseline and calls no release delegate.
+	// A release always compiles from scratch. The base contract (the dynamic interface) is an input to the
+	// AOT compile that Flutter's build cache does not track, so a cached output could have been built
+	// under a different contract than the one this baseline records (measured with the v4 rebuild).
+	if err := os.RemoveAll(filepath.Join(projectDir, ".dart_tool", "flutter_build")); err != nil {
+		return fmt.Errorf("clear the Flutter build cache before the release build: %w", err)
+	}
 	buildStart := time.Now()
 	appDill, buildErr := buildIOSAppDill(projectDir, toolchain, passthrough)
+	// v4 (instance-closed) contract: the first build's AOT kernel names the classes the base can
+	// instantiate; the contract gains their public surface and the base is built again with it.
+	if buildErr == nil && instanceClosedContractRequested() {
+		if _, err := extendContractInstanceClosed(projectDir, flutterRoot, appDill); err != nil {
+			return fmt.Errorf("derive the instance-closed (v4) base contract: %w", err)
+		}
+		// The contract is a compiler INPUT that Flutter's build cache does not track: without this the
+		// second build was served from the first one's outputs (measured: a byte-identical App binary),
+		// and the base would have shipped the v3 surface under a v4 contract record.
+		if err := os.RemoveAll(filepath.Join(projectDir, ".dart_tool", "flutter_build")); err != nil {
+			return fmt.Errorf("clear the Flutter build cache before the v4 rebuild: %w", err)
+		}
+		buildStart = time.Now()
+		appDill, buildErr = buildIOSAppDill(projectDir, toolchain, passthrough)
+	}
 	// The dependency map is collected ONLY after a fully successful build (a failed build persists nothing
 	// anyway). Any problem with it fails the release before a baseline exists.
 	var depMap *freehandDependencyMapCapture

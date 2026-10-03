@@ -343,6 +343,17 @@ func pruneFreehandUnchangedMachineCode(projectDir, relDir string, base *Freehand
 		return nil, err
 	}
 	same := freehandSameMachineCode(rep.ChangedPatchable, baseFPs, candFPs)
+	// A declaration the analyzer FORCED into the patch (a referrer of changed private code, an accessor
+	// of module-owned storage, a constructor running a changed field initializer) is there because of
+	// what it LOADS, not how it compiles: identical machine code names the same field while that field's
+	// initial value changed. Pruning it would ship nothing.
+	for _, c := range rep.Changed {
+		if forced, _ := c["forced"].(bool); forced {
+			if ml, _ := c["manifestLine"].(string); ml != "" {
+				delete(same, ml)
+			}
+		}
+	}
 	if len(same) == 0 {
 		return nil, nil
 	}

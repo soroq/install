@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"soroq/backend/internal/domain"
 	"soroq/backend/internal/serving"
@@ -147,6 +148,13 @@ func publishFreehandEngineBundle(p freehandPublishParams, manifestBytes []byte, 
 	return patch, serving.EngineChannelURL(base, p.AppID, p.Channel), nil
 }
 
+// freehandControlPlaneClient bounds every hosted-publish request. http.DefaultClient has no timeout: a
+// single unanswered request (measured: one connection to the control plane that never responded) held
+// a publish -- and the paid device session waiting on it -- for over a quarter of an hour. A timeout
+// fails the publish cleanly; it is never retried blindly, because a retried registration could publish
+// twice.
+var freehandControlPlaneClient = &http.Client{Timeout: 2 * time.Minute}
+
 // postJSONOperator POSTs a JSON body with operator auth and decodes the created domain.Patch.
 func postJSONOperator(url string, creds operatorCredentials, body any) (domain.Patch, error) {
 	var zero domain.Patch
@@ -160,7 +168,7 @@ func postJSONOperator(url string, creds operatorCredentials, body any) (domain.P
 	}
 	req.Header.Set("Content-Type", "application/json")
 	applyCredentialsHeaders(req, creds)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := freehandControlPlaneClient.Do(req)
 	if err != nil {
 		return zero, err
 	}
@@ -187,7 +195,7 @@ func uploadEngineBundleOperator(url string, creds operatorCredentials, zipBytes 
 	}
 	req.Header.Set("Content-Type", "application/zip")
 	applyCredentialsHeaders(req, creds)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := freehandControlPlaneClient.Do(req)
 	if err != nil {
 		return err
 	}

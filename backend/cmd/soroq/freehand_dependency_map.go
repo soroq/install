@@ -834,9 +834,9 @@ func expandFreehandChangedSetOverDependencyMap(base *FreehandBaselineMeta, relDi
 		if !ok {
 			return nil, fmt.Errorf("dependency map caller %s did not resolve to a candidate declaration", added[i].Identity)
 		}
-		parts := strings.Split(r.Key, "|")
+		parts, pok := splitFrozenIdentityKey(r.Key)
 		lib, cls, _, serr := splitIdentity(added[i].Identity)
-		if serr != nil || len(parts) != 6 || parts[0] != "v1" || parts[1] != lib || parts[3] != cls || parts[2] != r.Kind || !freehandSemanticKinds[r.Kind] {
+		if serr != nil || !pok || parts[1] != lib || parts[3] != cls || parts[2] != r.Kind || !freehandSemanticKinds[r.Kind] {
 			return nil, fmt.Errorf("dependency map caller %s resolved to an inconsistent frozen key %q (kind %q)", added[i].Identity, r.Key, r.Kind)
 		}
 		if existingKeys[r.Key] {
@@ -861,19 +861,49 @@ func expandFreehandChangedSetOverDependencyMap(base *FreehandBaselineMeta, relDi
 			return nil, err
 		}
 	}
+	// A caller that absorbed (inlined) a FORCED declaration is forced too: its machine code names the
+	// same objects as the base's while what the inlined code must load changed (measured: main inlined
+	// bump/peek, was pruned as identical, and kept counting in the base's storage). Transitive.
+	forced := map[string]bool{}
+	for _, c := range rep.Changed {
+		if f, _ := c["forced"].(bool); f {
+			if ml, _ := c["manifestLine"].(string); ml != "" {
+				forced[ml] = true
+			}
+		}
+	}
+	for grew := true; grew; {
+		grew = false
+		for _, a := range added {
+			if forced[a.Identity] {
+				continue
+			}
+			for _, ab := range a.Absorbed {
+				if forced[ab.Callee] {
+					forced[a.Identity] = true
+					grew = true
+					break
+				}
+			}
+		}
+	}
 	for _, a := range added {
 		absorbed := make([]any, 0, len(a.Absorbed))
 		for _, ab := range a.Absorbed {
 			absorbed = append(absorbed, map[string]any{"why": ab.Why, "callee": ab.Callee})
 		}
-		rep.Changed = append(rep.Changed, map[string]any{
+		entry := map[string]any{
 			"key":                 a.Key,
 			"kind":                a.Kind,
 			"manifestLine":        a.Identity,
 			"patchable":           true,
 			"dependencyMapCaller": true,
 			"absorbed":            absorbed,
-		})
+		}
+		if forced[a.Identity] {
+			entry["forced"] = true
+		}
+		rep.Changed = append(rep.Changed, entry)
 	}
 	sort.SliceStable(rep.Changed, func(i, j int) bool {
 		ki, _ := rep.Changed[i]["key"].(string)

@@ -78,13 +78,92 @@ const freehandContractSchemaV2 = "soroq.freehand.base_contract.v2"
 // custom List, Stream, Codec ...) is refused at patch build time by the interface validation, by name.
 const freehandContractSchemaV3 = "soroq.freehand.base_contract.v3"
 
+// freehandContractSchemaV4 is v3 plus every INSTANCE-CLOSED scoped class: each public SDK/Flutter class
+// the base's own AOT build can instantiate (a live constructor), with its supertypes, whole for callable
+// and can-be-used-as-type, and extendable when abstract. Their code is in the snapshot anyway because
+// the base uses them; v4 only keeps their public surface reachable, so a patch can call any API of a
+// class the base has (a class it cannot instantiate is carried by the patch instead). Built in two
+// passes: the first build's AOT kernel says which classes those are. Opt-in: SOROQ_IOS_BASE_CONTRACT=v4.
+const freehandContractSchemaV4 = "soroq.freehand.base_contract.v4"
+
 // sdkExtendableSchema is what the analyzer's --interface-sdk-extendable-schema probe prints.
 const sdkExtendableSchema = "soroq.freehand.sdk_extendable.v1"
 
 // isScopedContractSchema reports whether a base contract is usage-scoped (v2 or v3): such a base carries a
 // contract YAML and a patch-side interface validation spec in its baseline.
 func isScopedContractSchema(schema string) bool {
-	return schema == freehandContractSchemaV2 || schema == freehandContractSchemaV3
+	return schema == freehandContractSchemaV2 || schema == freehandContractSchemaV3 || schema == freehandContractSchemaV4
+}
+
+// instanceClosedContractRequested reports whether this release builds a v4 (instance-closed) base.
+func instanceClosedContractRequested() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("SOROQ_IOS_BASE_CONTRACT")), "v4")
+}
+
+// extendContractInstanceClosed turns the contract the first build used into v4: the instance-closed
+// classes of that build's AOT kernel are added as class entries (and extendable when abstract), and the
+// contract is reinstalled for the second build.
+func extendContractInstanceClosed(projectDir, flutterRoot, appDill string) (FreehandBaseContract, error) {
+	absDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		return FreehandBaseContract{}, err
+	}
+	c, ok, err := loadBuiltFreehandBaseContract(absDir)
+	if err != nil {
+		return FreehandBaseContract{}, err
+	}
+	if !ok {
+		return FreehandBaseContract{}, errors.New("a v4 base extends the usage-scoped contract, and this build has none")
+	}
+	raw, err := os.ReadFile(scopedContractRecordPath(absDir))
+	if err != nil {
+		return FreehandBaseContract{}, err
+	}
+	var rec scopedContractRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return FreehandBaseContract{}, err
+	}
+	analyzer, err := freehandPatchAnalyzer(flutterRoot)
+	if err != nil {
+		return FreehandBaseContract{}, err
+	}
+	dart := filepath.Join(flutterRoot, "bin", "cache", "dart-sdk", "bin", "dart")
+	out, err := exec.Command(dart, analyzer, "--instance-closed", appDill, "--scoped-packages", strings.Join(c.ScopedPackages, ",")).Output()
+	if err != nil {
+		return FreehandBaseContract{}, fmt.Errorf("compute the instance-closed classes (the analyzer must support --instance-closed): %w", err)
+	}
+	var ic struct {
+		Schema  string `json:"schema"`
+		Classes []struct {
+			Library  string `json:"library"`
+			Class    string `json:"class"`
+			Abstract bool   `json:"abstract"`
+		} `json:"classes"`
+	}
+	if err := json.Unmarshal(out, &ic); err != nil || ic.Schema != "soroq.freehand.instance_closed.v1" {
+		return FreehandBaseContract{}, fmt.Errorf("unreadable instance-closed report: %v", err)
+	}
+	entries := append([]ContractEntry(nil), c.Entries...)
+	for _, k := range ic.Classes {
+		entries = append(entries, ContractEntry{Library: k.Library, Kind: "class", Name: k.Class})
+		if k.Abstract {
+			entries = append(entries, ContractEntry{Library: k.Library, Kind: "extendable", Name: k.Class})
+		}
+	}
+	c.Entries = sortedUniqueEntries(entries)
+	for _, e := range c.Entries {
+		if err := e.validate(); err != nil {
+			return FreehandBaseContract{}, err
+		}
+	}
+	c.Schema = freehandContractSchemaV4
+	c.Digest = freehandContractDigest(c)
+	c, err = installScopedFreehandBaseContract(absDir, c, rec.AnalyzerSHA, rec.UsageEntries)
+	if err != nil {
+		return FreehandBaseContract{}, err
+	}
+	fmt.Fprintf(os.Stderr, "soroq contract: %s (instance-closed) -- %d instance-closed classes added; rebuilding\n", c.Schema, len(ic.Classes))
+	return c, nil
 }
 
 // pureSDKContractLibraries are the SDK libraries a scoped contract lists whole for callable and
@@ -477,7 +556,10 @@ func renderScopedFreehandContractYAML(c FreehandBaseContract) string {
 	fmt.Fprintf(&b, "# schema: %s\n", c.Schema)
 	b.WriteString("# Usage-scoped: application and eligible Dart-only dependency libraries whole; SDK and\n")
 	b.WriteString("# Flutter declarations only where this base uses them (class granularity).\n")
-	if c.Schema == freehandContractSchemaV3 {
+	if c.Schema == freehandContractSchemaV4 {
+		b.WriteString("# v4: plus every class the base can instantiate (and its supertypes), whole; extendable when abstract.\n")
+	}
+	if c.Schema == freehandContractSchemaV3 || c.Schema == freehandContractSchemaV4 {
 		b.WriteString("# v3: pure SDK libraries are whole for callable / can-be-used-as-type; extendable lists only\n")
 		b.WriteString("# the SDK classes this base's own classes extend, plus exception and error types.\n")
 	}

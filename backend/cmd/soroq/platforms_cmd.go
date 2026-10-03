@@ -268,6 +268,18 @@ func releasePlatform(platform string, rest []string) error {
 // patchPlatform runs the patch lane for one platform, with the same iOS routing rule.
 func patchPlatform(platform string, rest []string) error {
 	rest = applyPlatformScopedOverrides(platform, rest)
+	// An iOS patch is built with the toolchain that built its BASE, read from the base's own baseline:
+	// the active frontend may be a newer engine (Campus 1.0.43 is an R9 base on a machine whose active
+	// toolchain is R10, and that pairing fails inside the kernel compiler).
+	if platform == "ios" && !hasFlag(rest, "toolchain") {
+		if tc, ok := deriveIOSPatchToolchainFromBase(releaseProjectDir(rest)); ok {
+			rest = append(rest, "--toolchain", tc)
+			// ... and with a frontend that declares that toolchain: the active one may be newer.
+			if bin, ok := installedFrontendDeclaring(tc); ok {
+				iosPatchBaseFrontend = soroqFrontendChoice{Bin: bin, Provenance: "the frontend that declares " + tc + ", the base's toolchain"}
+			}
+		}
+	}
 	rest, err := withDerivedFlags(platform, releaseProjectDir(rest), rest)
 	if err != nil {
 		return err
@@ -479,4 +491,107 @@ func releaseProjectDir(args []string) string {
 		return "."
 	}
 	return wd
+}
+
+// deriveIOSPatchToolchainFromBase finds the installed iOS toolchain whose engine built this project's
+// current base: the baseline under .soroq/releases/<runtime-id>/ records engine_revision, and each
+// toolchain's ios/engine.json declares soroq_engine_revision. Exactly one match is required; anything
+// else (no baseline yet, no match, two directories of one engine) returns false and the caller derives
+// as before.
+func deriveIOSPatchToolchainFromBase(projectDir string) (string, bool) {
+	soroqBytes, err := readProjectSoroqYAML(projectDir)
+	if err != nil {
+		return "", false
+	}
+	pubBytes, err := os.ReadFile(filepath.Join(projectDir, "pubspec.yaml"))
+	if err != nil {
+		return "", false
+	}
+	meta, err := buildSoroqBundledMetadata(soroqBytes, pubBytes)
+	if err != nil || strings.TrimSpace(meta.Soroq.RuntimeID) == "" {
+		return "", false
+	}
+	raw, err := os.ReadFile(filepath.Join(freehandReleaseDir(projectDir, strings.ToLower(meta.Soroq.RuntimeID)), "baseline.json"))
+	if err != nil {
+		return "", false
+	}
+	var base struct {
+		EngineRevision string `json:"engine_revision"`
+	}
+	if json.Unmarshal(raw, &base) != nil || strings.TrimSpace(base.EngineRevision) == "" {
+		return "", false
+	}
+	root, err := toolchainsRoot()
+	if err != nil {
+		return "", false
+	}
+	var matches []string
+	for _, name := range installedToolchains() {
+		if !strings.HasPrefix(name, "soroq-ios-") {
+			continue
+		}
+		engineRaw, err := os.ReadFile(filepath.Join(root, name, "ios", "engine.json"))
+		if err != nil {
+			continue
+		}
+		var eng struct {
+			Revision string `json:"soroq_engine_revision"`
+		}
+		if json.Unmarshal(engineRaw, &eng) == nil && eng.Revision == base.EngineRevision {
+			matches = append(matches, name)
+		}
+	}
+	if len(matches) != 1 {
+		return "", false
+	}
+	return matches[0], true
+}
+
+// installedFrontendDeclaring returns the flutter binary of the ONE installed frontend whose manifest lists
+// toolchain in compatible_toolchain_ids, or the frontend currently active when it is one of several.
+func installedFrontendDeclaring(toolchain string) (string, bool) {
+	root, err := frontendsRoot()
+	if err != nil {
+		return "", false
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return "", false
+	}
+	var bins []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(root, e.Name(), "manifest.json"))
+		if err != nil {
+			continue
+		}
+		var m struct {
+			CompatibleToolchainIDs []string `json:"compatible_toolchain_ids"`
+		}
+		if json.Unmarshal(raw, &m) != nil {
+			continue
+		}
+		for _, id := range m.CompatibleToolchainIDs {
+			if id == toolchain {
+				bin := filepath.Join(root, e.Name(), "flutter-sdk-src", "bin", "flutter")
+				if fileExists(bin) {
+					bins = append(bins, bin)
+				}
+				break
+			}
+		}
+	}
+	if len(bins) == 1 {
+		return bins[0], true
+	}
+	if active, err := resolveInstalledFrontendFlutterBin(); err == nil {
+		for _, b := range bins {
+			if b == active {
+				return b, true
+			}
+		}
+	}
+	return "", false
 }

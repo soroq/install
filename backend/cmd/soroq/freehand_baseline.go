@@ -133,6 +133,25 @@ type FreehandBaselineMeta struct {
 	// that was not obfuscated. Absence is read as "not obfuscated", never as permission: a patch
 	// against a base with no binding is compiled and bound exactly as it was before this existed.
 	Obfuscation *FreehandObfuscationBinding `json:"obfuscation,omitempty"`
+	// ColdStartOrdering is the cold-start ordering baked into this base's generated bootstrap, DERIVED at
+	// persist time from the bootstrap the base was compiled from. "activate-before-main" means a retained
+	// patch is live before developer main() runs (every object, static and initializer is patched code,
+	// as with a whole-program patch). Absent means the legacy ordering: developer main() runs first and
+	// the retained patch activates after the first rasterized frame, so objects created before that keep
+	// base code. A patch plan reads this to know which semantics the device will give it.
+	ColdStartOrdering string `json:"cold_start_ordering,omitempty"`
+}
+
+const freehandOrderingActivateBeforeMain = "activate-before-main"
+
+// deriveFreehandColdStartOrdering reads the ordering out of the generated bootstrap, never from the
+// caller: the bootstrap is what the binary runs.
+func deriveFreehandColdStartOrdering(projectDir string) string {
+	raw, err := os.ReadFile(filepath.Join(projectDir, freehandBootstrapRelPath))
+	if err == nil && strings.Contains(string(raw), "await soroqRunAppAfterRestoreActivation(") {
+		return freehandOrderingActivateBeforeMain
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1194,6 +1213,7 @@ func persistFreehandBaselineWithDependencyMap(projectDir string, meta FreehandBa
 		return "", fmt.Errorf("refusing to persist a baseline whose engine redirect capability cannot be resolved: %w", err)
 	}
 	meta.RedirectCapabilities = capabilities
+	meta.ColdStartOrdering = deriveFreehandColdStartOrdering(projectDir)
 
 	// THE DEPENDENCY MAP must agree with the capability that was just derived, in both directions: an
 	// engine that inlines patchable code with the flag must leave its record, and a record from an engine
