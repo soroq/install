@@ -22,10 +22,42 @@ import (
 // both platforms, naming the code points -- look them up in Icons (e.g. U+E145 is Icons.add) -- so the
 // change can ship with the next store release or use an icon the app already has.
 
+// allowAssetDiffs is `soroq patch --allow-asset-diffs` (Shorebird's flag of the same name): ship the
+// Dart change anyway, knowing an asset it needs (an icon glyph) is not in the store build.
+var allowAssetDiffs bool
+
+// takeAllowAssetDiffs removes --allow-asset-diffs from args (no delegate below `soroq patch` knows it)
+// and records it.
+func takeAllowAssetDiffs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "--allow-asset-diffs" || a == "-allow-asset-diffs" {
+			allowAssetDiffs = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
 func refuseMissingIconGlyphs(missing map[string][]rune) error {
 	if len(missing) == 0 {
 		return nil
 	}
+	if allowAssetDiffs {
+		fmt.Fprintf(os.Stderr, "warning: --allow-asset-diffs: the patch uses icon(s) the store build's font does not "+
+			"contain; wherever one is DRAWN it renders as a blank box until a store release ships the font:\n  - %s\n",
+			strings.Join(missingIconLines(missing), "\n  - "))
+		return nil
+	}
+	return fmt.Errorf("patch refused: it uses icon(s) the store build's font does not contain, and a patch "+
+		"cannot deliver a font, so they would render as blank boxes:\n  - %s\n"+
+		"Use an icon the app already uses, or ship this change in a new store release (its build will "+
+		"include the new icons). An icon that is only REFERENCED (a widget's default that this app never "+
+		"draws) is harmless: pass --allow-asset-diffs to ship anyway", strings.Join(missingIconLines(missing), "\n  - "))
+}
+
+func missingIconLines(missing map[string][]rune) []string {
 	paths := make([]string, 0, len(missing))
 	for p := range missing {
 		paths = append(paths, p)
@@ -35,10 +67,7 @@ func refuseMissingIconGlyphs(missing map[string][]rune) error {
 	for _, p := range paths {
 		lines = append(lines, fmt.Sprintf("%s: %s", p, fontglyphs.FormatCodepoints(missing[p], 12)))
 	}
-	return fmt.Errorf("patch refused: it uses icon(s) the store build's font does not contain, and a patch "+
-		"cannot deliver a font, so they would render as blank boxes:\n  - %s\n"+
-		"Use an icon the app already uses, or ship this change in a new store release (its build will "+
-		"include the new icons)", strings.Join(lines, "\n  - "))
+	return lines
 }
 
 // soroqBuildFailure is a failed build that keeps its output, so a caller can tell why it failed.
