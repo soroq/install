@@ -923,6 +923,14 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 	if flDeclared && !depMapDeclared {
 		return fmt.Errorf("toolchain %s declares %s without %s; the field layout is only recorded alongside the dependency map", toolchain, freehandFieldLayoutCapability, freehandDependencyMapCapability)
 	}
+	// CALL GRAPH from the same gen_snapshot run (engines declaring soroq_callgraph_v1).
+	passthrough, cgPath, cgDeclared, err := withFreehandCallGraph(projectDir, toolchain, passthrough)
+	if err != nil {
+		return err
+	}
+	if cgDeclared && !depMapDeclared {
+		return fmt.Errorf("toolchain %s declares %s without %s; the call graph is only recorded alongside the dependency map", toolchain, freehandCallGraphCapability, freehandDependencyMapCapability)
+	}
 
 	// THE MAP COMES FROM THIS BUILD'S OWN gen_snapshot, not from a later re-run.
 	//
@@ -1046,6 +1054,11 @@ func runReleaseIOSEngineBuildFreehand(head, passthrough []string, projectDir, to
 		if flDeclared {
 			if depMap.FieldLayout, err = collectFreehandFieldLayout(flPath, buildStart); err != nil {
 				return fmt.Errorf("freehand build succeeded but its field layout is unusable; no baseline persisted and no release registered: %w", err)
+			}
+		}
+		if cgDeclared {
+			if depMap.CallGraph, err = collectFreehandCallGraph(cgPath, buildStart); err != nil {
+				return fmt.Errorf("freehand build succeeded but its call graph is unusable; no baseline persisted and no release registered: %w", err)
 			}
 		}
 	}
