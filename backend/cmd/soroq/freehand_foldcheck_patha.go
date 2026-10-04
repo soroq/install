@@ -112,6 +112,9 @@ var freehandDependencyMapEngineRevisions = map[string]string{
 	// R11 = R10 + dart-r11-increment.patch (field layout, soroqLoadField, class-table lookup); the
 	// dependency map and the inlining rules are R10's, unchanged.
 	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r11_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	// R12 (call graph, entry swap) and R13 (dispatch fallback) leave the dependency map and inlining as R11's.
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r12_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r13_obfuscation": "3.44.9-private-state-r9-obfuscation",
 }
 
 // freehandBasePathA reports whether the base was built by an engine known to carry Path A. Both the

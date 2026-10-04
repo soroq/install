@@ -317,8 +317,15 @@ func freehandBuildCandidate(projectDir, toolchain, relDir string, passthrough []
 		return nil, nil
 	}
 	fmt.Fprintln(os.Stderr, "soroq patch ios --engine (freehand): building the candidate to find changes that compile to the base's own machine code")
-	if _, err := buildIOSAppDill(projectDir, toolchain, pt); err != nil {
+	candAOT, err := buildIOSAppDill(projectDir, toolchain, pt)
+	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errFreehandMachineCodeUnavailable, err)
+	}
+	// Engine R12 compares the candidate's type-flow facts with the base's: keep its AOT kernel.
+	if freehandR12.CallGraphPath != "" {
+		if err := stageFreehandCandidateAOTKernel(projectDir, candAOT); err != nil {
+			return nil, err
+		}
 	}
 	_, fps, err := collectFreehandCodeFingerprints(fpPath, start)
 	return fps, err

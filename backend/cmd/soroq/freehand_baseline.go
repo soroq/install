@@ -123,6 +123,12 @@ type FreehandBaselineMeta struct {
 	FieldLayoutSchema  string `json:"field_layout_schema,omitempty"`
 	FieldLayoutSHA256  string `json:"field_layout_sha256,omitempty"`
 	FieldLayoutEntries int    `json:"field_layout_entries,omitempty"`
+	// CALL GRAPH (freehand_r12.go): every call edge of the code THIS base ships, so a patch can find the
+	// framework code it invalidates. Required iff the engine declares soroq_callgraph_v1; omitted otherwise,
+	// so every older baseline.json stays byte-identical.
+	CallGraphSchema string `json:"callgraph_schema,omitempty"`
+	CallGraphSHA256 string `json:"callgraph_sha256,omitempty"`
+	CallGraphEdges  int    `json:"callgraph_edges,omitempty"`
 	// Retention is the load-bearing freehand-retention evidence; a base without it is refused at both
 	// release registration and patch time (see requireFreehandRetention).
 	Retention *FreehandRetentionEvidence `json:"retention"`
@@ -266,6 +272,9 @@ var freehandKnownIdentityCapabilities = map[string]bool{
 	freehandTaggedStackBoundaryCapability:                true,
 	freehandCodeFingerprintsCapability:                   true,
 	freehandFieldLayoutCapability:                        true,
+	freehandCallGraphCapability:                          true,
+	freehandEntrySwapCapability:                          true,
+	freehandDispatchFallbackCapability:                   true,
 }
 
 // legacyDefaultRedirectKinds are the kinds that were demonstrably shipping before this tranche: they are
@@ -899,6 +908,10 @@ func verifyExistingBaseline(relDir string) (*FreehandBaselineMeta, error) {
 	if _, err := verifiedBaselineFieldLayoutPath(relDir, &m); err != nil {
 		return nil, err
 	}
+	// Call graph, in both directions (required iff the recorded engine capability says so).
+	if _, err := verifiedBaselineCallGraphPath(relDir, &m); err != nil {
+		return nil, err
+	}
 	return &m, nil
 }
 
@@ -1071,6 +1084,9 @@ func immutableInputsEqual(a, b *FreehandBaselineMeta) bool {
 		a.FieldLayoutSchema == b.FieldLayoutSchema &&
 		a.FieldLayoutSHA256 == b.FieldLayoutSHA256 &&
 		a.FieldLayoutEntries == b.FieldLayoutEntries &&
+		a.CallGraphSchema == b.CallGraphSchema &&
+		a.CallGraphSHA256 == b.CallGraphSHA256 &&
+		a.CallGraphEdges == b.CallGraphEdges &&
 		retentionEqual(a.Retention, b.Retention) &&
 		obfuscationBindingEqual(a.Obfuscation, b.Obfuscation)
 }
@@ -1285,6 +1301,14 @@ func persistFreehandBaselineWithDependencyMap(projectDir string, meta FreehandBa
 	if err := bindFreehandFieldLayout(&meta, capabilities, fieldLayout); err != nil {
 		return "", err
 	}
+	// CALL GRAPH, same gen_snapshot run, same rule.
+	var callGraph []byte
+	if depMap != nil {
+		callGraph = depMap.CallGraph
+	}
+	if err := bindFreehandCallGraph(&meta, capabilities, callGraph); err != nil {
+		return "", err
+	}
 
 	releasesRoot := filepath.Join(projectDir, ".soroq", "releases")
 	relDir := filepath.Join(releasesRoot, meta.RuntimeID)
@@ -1380,6 +1404,11 @@ func persistFreehandBaselineWithDependencyMap(projectDir string, meta FreehandBa
 		}
 		if depMap.FieldLayout != nil {
 			if err := writeFileSync(filepath.Join(tmpDir, freehandFieldLayoutFile), depMap.FieldLayout, 0o600); err != nil {
+				return "", err
+			}
+		}
+		if depMap.CallGraph != nil {
+			if err := writeFileSync(filepath.Join(tmpDir, freehandCallGraphFile), depMap.CallGraph, 0o600); err != nil {
 				return "", err
 			}
 		}

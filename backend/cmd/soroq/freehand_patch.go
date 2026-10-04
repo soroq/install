@@ -342,6 +342,13 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string, planOpts .
 	if freehandFieldLayoutPath, err = verifiedBaselineFieldLayoutPath(relDir, base); err != nil {
 		return nil, fmt.Errorf("baseline verification failed (freehand patch refused): %w", err)
 	}
+	resetFreehandR12()
+	if freehandR12.CallGraphPath, err = verifiedBaselineCallGraphPath(relDir, base); err != nil {
+		return nil, fmt.Errorf("baseline verification failed (freehand patch refused): %w", err)
+	}
+	if caps, cerr := baseRedirectCapabilities(base); cerr == nil {
+		freehandR12.EntrySwap = caps.hasIdentityCapability(freehandEntrySwapCapability)
+	}
 	// Refuse to patch a base that was NOT built with verified freehand retention: without --soroq_manifest
 	// retention its identities are not resolvable on device, so every by-identity redirect would fail at
 	// runtime ("new base identity not found"). A plain/reused Flutter build carries no retention evidence.
@@ -480,6 +487,28 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string, planOpts .
 				return nil, errFreehandNoOp
 			}
 			return nil, fmt.Errorf("freehand patch refused — %w", perr)
+		}
+	}
+	// FRAMEWORK RIPPLE (engine R12, freehand_r12.go): app members whose framework callees compiled
+	// differently join the changed set AFTER pruning (their own machine code may well be identical).
+	if freehandR12.CallGraphPath != "" {
+		analyzer, aerr := freehandPatchAnalyzer(flutterRoot)
+		if aerr == nil {
+			var extra []string
+			if np := carriablePackageNames(&descriptor); np != "" {
+				extra = append(extra, "--new-packages", np)
+			}
+			if capMapPath != "" && fileExists(capMapPath) {
+				extra = append(extra, "--capability-map", capMapPath)
+			}
+			_, aerr = applyFreehandR12Plan(filepath.Join(flutterRoot, "bin", "cache", "dart-sdk", "bin", "dart"), analyzer, candPath,
+				filepath.Join(projectDir, ".dart_tool", "package_config.json"), relDir, rep, filepath.Join(diffOut, "freehand_diff.json"), extra...)
+		}
+		if aerr != nil {
+			os.Remove(candPath)
+			os.RemoveAll(diffOut)
+			os.Remove(capMapPath)
+			return nil, fmt.Errorf("freehand patch refused — %w", aerr)
 		}
 	}
 	// ICON GLYPHS (icon_glyph_guard.go): a store build with tree-shaken icon fonts can draw only the icons it
@@ -1249,6 +1278,7 @@ func parseAndValidateModuleManifest(manifestBytes []byte, diffChanged []map[stri
 	}
 	seenLine := make(map[string]bool, len(m.ReplacementABI))
 	seenStable := make(map[string]bool, len(m.ReplacementABI))
+	swapsSeen := 0
 	for _, e := range m.ReplacementABI {
 		if e.BaseIdentity == "" || e.StableIdentity == "" || e.ModuleMember == "" || e.Kind == "" {
 			return "", fmt.Errorf("replacement_abi entry missing required field: %+v", e)
@@ -1259,6 +1289,19 @@ func parseAndValidateModuleManifest(manifestBytes []byte, diffChanged []map[stri
 		// forced such identities to be dropped.
 		if err := m.resolveEntryLibrary(e.ModuleLibrary, e.BaseIdentity); err != nil {
 			return "", err
+		}
+		// ENGINE R12 SWAP: a framework function the plan named, pointed at the module's copy. It is not a
+		// changed declaration of the app, so it is checked against the plan's swap set instead.
+		if strings.HasPrefix(e.Kind, freehandSwapKindPrefix) {
+			if err := validateFreehandSwapEntry(freehandABIEntryView{BaseIdentity: e.BaseIdentity, Kind: e.Kind}); err != nil {
+				return "", err
+			}
+			if seenLine[e.BaseIdentity] {
+				return "", fmt.Errorf("duplicate replacement_abi base_identity %s", e.BaseIdentity)
+			}
+			seenLine[e.BaseIdentity] = true
+			swapsSeen++
+			continue
 		}
 		if !abiKinds[e.Kind] {
 			return "", fmt.Errorf("replacement_abi entry %s has unknown kind %q (the runtime accepts only "+
@@ -1323,6 +1366,10 @@ func parseAndValidateModuleManifest(manifestBytes []byte, diffChanged []map[stri
 				"(a missing constructor dot or accessor prefix matches nothing at runtime)",
 				e.BaseIdentity, baseVMName, d.keyKind, exp.vmName)
 		}
+	}
+	// Every swap the plan named is in the module (the module builder computes the same set).
+	if swapsSeen != len(freehandR12.Swaps) {
+		return "", fmt.Errorf("the module swaps %d framework function(s) but the R12 plan named %d", swapsSeen, len(freehandR12.Swaps))
 	}
 	// No missing: every changed decl must have exactly one entry (bijection completeness).
 	for _, d := range decls {
@@ -1946,6 +1993,7 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 		"--out", synthOut,
 	}
 	synthArgs = withFieldReadFallback(synthArgs)
+	synthArgs = withFreehandR12(synthArgs)
 	if plan.capabilityMapPath != "" {
 		synthArgs = append(synthArgs, "--capability-map", plan.capabilityMapPath)
 	}
