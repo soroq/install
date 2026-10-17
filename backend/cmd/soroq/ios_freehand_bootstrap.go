@@ -146,6 +146,12 @@ func freehandBootstrapSource(cfg freehandBootstrapConfig) string {
 		}
 		ordering = fmt.Sprintf(freehandBootstrapActivateFirstOrdering, firstFrameArg)
 	}
+	// Development only (SOROQ_BOOTSTRAP_DEBUG=1, on the release AND its patches, or the entrypoints
+	// differ): print why an update was not applied. A normal bootstrap is byte-identical without it.
+	if os.Getenv("SOROQ_BOOTSTRAP_DEBUG") == "1" {
+		ordering = strings.Replace(ordering, "if (st.error == null && st.isPatched",
+			"if (st.error != null) debugPrint('SOROQ_OTA status.error ${st.error}');\n      if (st.error == null && st.isPatched", 1)
+	}
 	return fmt.Sprintf(`// GENERATED — do not edit. Produced by `+"`soroq release/patch ios --engine`"+` (freehand).
 // Zero-touch entrypoint. It wraps the app's real main() so a fresh developer never edits lib/ and
 // never calls Soroq.configure(): configure the engine-lane controller, restore the last committed

@@ -793,6 +793,39 @@ func TestR8EngineRevisionsRecord(t *testing.T) {
 	}
 }
 
+// The reverse direction: every committed obfuscation-capable iOS canonical (R6 onward) is listed in one of
+// the two tables. A revision missing from both silently falls back to the coarse rule, which refuses
+// ordinary patches on every base that engine builds (R75b: "_HomePageState.build returns a value the
+// precompiler already propagated into 616 closures" on S1 and S3, while R75 bases passed).
+func TestEveryCanonicalEngineHasAPropagationRule(t *testing.T) {
+	root := filepath.Join("..", "..", "..", "tools", "soroq_toolchain_packer", "canonical")
+	dirs, err := filepath.Glob(filepath.Join(root, "private_state_r*_obfuscation", "ios_engine.v2.engine.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirs) == 0 {
+		t.Skip("tools/soroq_toolchain_packer/canonical is not in this tree")
+	}
+	for _, p := range dirs {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c struct {
+			Rev string `json:"soroq_engine_revision"`
+		}
+		if err := json.Unmarshal(raw, &c); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		_, pathA := freehandPathAEngineRevisions[c.Rev]
+		_, depMap := freehandDependencyMapEngineRevisions[c.Rev]
+		if !pathA && !depMap {
+			t.Errorf("%s declares %q, which neither freehandPathAEngineRevisions nor "+
+				"freehandDependencyMapEngineRevisions lists", filepath.Base(filepath.Dir(p)), c.Rev)
+		}
+	}
+}
+
 func TestPathAReplacedKeyNormalizes(t *testing.T) {
 	if a, b := pathAReplacedKey("package:a/a.dart", "::", "top"), pathAReplacedKey("package:a/a.dart", "", "top"); a != b {
 		t.Fatalf("top-level forms differ: %q vs %q", a, b)

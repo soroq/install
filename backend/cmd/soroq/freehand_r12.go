@@ -43,15 +43,40 @@ const (
 	freehandEntrySwapCapability = "soroq_entry_swap_v1"
 	// R13: dispatch-table calls on classes a patch defines are resolved by name (engine dispatch fallback).
 	freehandDispatchFallbackCapability = "soroq_dispatch_fallback_v1"
-	freehandR12PlanSchema              = "soroq.r12_plan.v1"
-	freehandSwapKindPrefix             = "swap:"
+	// R14: dart:_internal.soroqSentinel / soroqIsSentinel (module-side late fields keep late semantics).
+	freehandLateSentinelCapability = "soroq_late_sentinel_v1"
+	// R15: the bytecode loader resolves a library the precompiler dropped from the library list through the
+	// class table (a patch may name classes of libraries nothing named through the embedder API).
+	freehandLibraryLookupCapability = "soroq_library_lookup_v1"
+	// R16: the bytecode loader resolves a direct-call target the precompiler pruned from its class's
+	// function array through the compiled code it kept.
+	freehandCompiledFunctionLookupCapability = "soroq_compiled_function_lookup_v1"
+	// R17: the compiled-function index covers every function the program snapshot compiled (heap walk).
+	freehandCompiledFunctionLookupV2Capability = "soroq_compiled_function_lookup_v2"
+	// R18: bytecode calls compiled functions using the register calling convention (adapter stub).
+	freehandRegisterCallAdapterCapability = "soroq_register_call_adapter_v1"
+	// R19: the interpreter calls a patch's new FFI natives (and the FFI intrinsics AOT code inlines) on the
+	// AOT runtime: `soroq-ffi|...` / `soroq-ffi-op|...` externals.
+	freehandBytecodeFfiCapability = "soroq_bytecode_ffi_v1"
+	// R20: the interpreter runs the VM intrinsics AOT code inlines (`soroq-op|...`) and resolves a platform
+	// native whose function the precompiler pruned (`soroq-native|...`).
+	freehandIntrinsicOpsCapability = "soroq_intrinsic_ops_v1"
+	// R23: the dispatch fallback takes the arguments a table call passes in registers (the base call graph's
+	// selector lines carry the count).
+	freehandDispatchRegistersCapability = "soroq_dispatch_registers_v1"
+	freehandR12PlanSchema               = "soroq.r12_plan.v1"
+	freehandSwapKindPrefix              = "swap:"
 )
 
 var (
 	callGraphWrittenRe = regexp.MustCompile(`^# written=([0-9]+)$`)
-	callGraphKinds     = map[string]bool{"direct": true, "table": true, "ic": true, "closure": true, "inline": true}
-	// R13: `selector  <offset>|<argc or -1>|<unboxed 0/1>  <interface target>` (the dispatch fallback).
-	callGraphSelectorRe = regexp.MustCompile(`^[0-9]+\|-?[0-9]+\|[01]$`)
+	// R49: a capability line of the engine that wrote the graph.
+	callGraphCapabilityPrefix = "# soroq.capability "
+	callGraphKinds            = map[string]bool{"direct": true, "table": true, "ic": true, "closure": true, "inline": true}
+	// R13: `selector  <offset>|<argc or -1>|<unboxed 0/1>  <interface target>` (the dispatch fallback);
+	// R23 bases add `|<registers>` (leading arguments the call passes in registers).
+	// R23 adds `|<registers>`; R29 adds `|<param reps>:<return rep>|<registers uncapped>` to an unboxed selector.
+	callGraphSelectorRe = regexp.MustCompile(`^[0-9]+\|-?[0-9]+\|[01](\|[0-9]+(\|[tid]*:[tid]\|[0-9]+)?)?$`)
 )
 
 // parseFreehandCallGraph reads gen_snapshot's file or its canonical rendering: the schema line, edges
@@ -68,11 +93,23 @@ func parseFreehandCallGraph(raw []byte) ([]string, error) {
 	}
 	written, _ := strconv.Atoi(m[1])
 	body := lines[1 : len(lines)-1]
-	if written != len(body) {
-		return nil, fmt.Errorf("the call graph trailer says %d edges but %d were read", written, len(body))
+	// R49: `# soroq.capability <name>` lines declare what the engine that wrote the graph can do; kept (they
+	// sort first), never counted as edges.
+	edges := 0
+	for _, l := range body {
+		if !strings.HasPrefix(l, callGraphCapabilityPrefix) {
+			edges++
+		}
+	}
+	if written != edges {
+		return nil, fmt.Errorf("the call graph trailer says %d edges but %d were read", written, edges)
 	}
 	seen := make(map[string]bool, len(body))
 	for i, l := range body {
+		if strings.HasPrefix(l, callGraphCapabilityPrefix) {
+			seen[l] = true
+			continue
+		}
 		p := strings.Split(l, "\t")
 		if len(p) == 3 && p[0] == "selector" && callGraphSelectorRe.MatchString(p[1]) && strings.Count(p[2], "|") >= 2 {
 			seen[l] = true
@@ -95,10 +132,14 @@ func parseFreehandCallGraph(raw []byte) ([]string, error) {
 func renderFreehandCallGraph(edges []string) []byte {
 	var b bytes.Buffer
 	b.WriteString("# " + freehandCallGraphSchema + "\n")
+	n := 0
 	for _, e := range edges {
 		b.WriteString(e + "\n")
+		if !strings.HasPrefix(e, callGraphCapabilityPrefix) {
+			n++
+		}
 	}
-	fmt.Fprintf(&b, "# written=%d\n", len(edges))
+	fmt.Fprintf(&b, "# written=%d\n", n)
 	return b.Bytes()
 }
 
@@ -242,12 +283,16 @@ var freehandR12 struct {
 	Active        bool
 	Swaps         map[string]bool // base identities (manifest lines) the module swaps
 	EntrySwap     bool            // the base's engine declares soroq_entry_swap_v1
+	// Replan runs the plan again with the classes the synthesis found the module copies (its manifest's
+	// r12_copied_classes): the plan the module was built with, whose swaps the ABI check then holds it to.
+	Replan func(copied []string) error
 }
 
 func resetFreehandR12() {
 	freehandR12.CallGraphPath, freehandR12.CandidateAOT = "", ""
 	freehandR12.Active, freehandR12.EntrySwap = false, false
 	freehandR12.Swaps = nil
+	freehandR12.Replan = nil
 }
 
 // stageFreehandCandidateAOTKernel keeps the candidate build's AOT kernel (the build directory is reused by
@@ -307,6 +352,75 @@ func applyFreehandR12Plan(dart, analyzer, candSourceDill, packageConfig, relDir 
 		return nil, errors.New("the base records a call graph (engine R12) but the candidate was not built, so the framework " +
 			"code this patch invalidates cannot be determined")
 	}
+	plan, err := runFreehandR12Plan(dart, analyzer, candSourceDill, packageConfig, relDir, diffJSONPath, extraArgs...)
+	if err != nil {
+		return plan, err
+	}
+	have := make(map[string]bool, len(rep.Changed))
+	for _, c := range rep.Changed {
+		if ml, _ := c["manifestLine"].(string); ml != "" {
+			have[ml] = true
+		}
+	}
+	added := []string{}
+	for _, d := range plan.Redirect {
+		ml, _ := d["manifestLine"].(string)
+		if ml == "" {
+			return plan, errors.New("the R12 plan lists a redirect without a manifest line")
+		}
+		if have[ml] {
+			continue
+		}
+		have[ml] = true
+		rep.Changed = append(rep.Changed, d)
+		rep.ChangedPatchable = append(rep.ChangedPatchable, ml)
+		added = append(added, ml)
+	}
+	freehandR12.Active = true
+	freehandR12.Swaps = make(map[string]bool, len(plan.Swap))
+	for _, s := range plan.Swap {
+		freehandR12.Swaps[s] = true
+	}
+	freehandR12.Replan = func(copied []string) error {
+		again, err := runFreehandR12Plan(dart, analyzer, candSourceDill, packageConfig, relDir, diffJSONPath,
+			append(append([]string{}, extraArgs...), "--r12-copied", strings.Join(copied, ","))...)
+		if err != nil {
+			return err
+		}
+		// The diff the module was synthesized from is final: a redirect only the copies call for cannot be added.
+		for _, d := range again.Redirect {
+			if ml, _ := d["manifestLine"].(string); !have[ml] {
+				return fmt.Errorf("the classes the module copies call for redirecting %s, which the patch's diff does not", ml)
+			}
+		}
+		freehandR12.Swaps = make(map[string]bool, len(again.Swap))
+		for _, s := range again.Swap {
+			freehandR12.Swaps[s] = true
+		}
+		fmt.Fprintf(os.Stdout, "framework ripple (R12): the module copies %d class(es) base code reads the fields of; %d carried, "+
+			"%d swapped\n", len(copied), again.Carried, again.Swapped)
+		return nil
+	}
+	if len(added) > 0 {
+		sort.Strings(rep.ChangedPatchable)
+		if rep.Counts == nil {
+			rep.Counts = map[string]int{}
+		}
+		rep.Counts["changed"] = len(rep.Changed)
+		rep.Counts["changedPatchable"] = len(rep.ChangedPatchable)
+		rep.Counts["r12Redirected"] = len(added)
+		if err := rewriteFreehandDiffJSON(diffJSONPath, rep); err != nil {
+			return plan, fmt.Errorf("rewrite the diff after the R12 plan: %w", err)
+		}
+	}
+	fmt.Fprintf(os.Stdout, "framework ripple (R12): %d member(s) compiled differently; %d carried, %d swapped, %d app member(s) redirected\n",
+		plan.Seeds, plan.Carried, plan.Swapped, len(added))
+	return plan, nil
+}
+
+// runFreehandR12Plan runs the analyzer's R12 plan (--r12-plan) and checks what it says it cannot deliver.
+func runFreehandR12Plan(dart, analyzer, candSourceDill, packageConfig, relDir, diffJSONPath string,
+	extraArgs ...string) (*freehandR12Plan, error) {
 	out, err := os.CreateTemp("", "soroq-r12-plan-*.json")
 	if err != nil {
 		return nil, err
@@ -351,45 +465,6 @@ func applyFreehandR12Plan(dart, analyzer, candSourceDill, packageConfig, relDir 
 		return &plan, fmt.Errorf("the patch must replace %d framework function(s) the base reaches at run time, and the base's "+
 			"engine does not declare %s:\n  - %s", len(plan.Swap), freehandEntrySwapCapability, strings.Join(plan.Swap, "\n  - "))
 	}
-	have := make(map[string]bool, len(rep.Changed))
-	for _, c := range rep.Changed {
-		if ml, _ := c["manifestLine"].(string); ml != "" {
-			have[ml] = true
-		}
-	}
-	added := []string{}
-	for _, d := range plan.Redirect {
-		ml, _ := d["manifestLine"].(string)
-		if ml == "" {
-			return &plan, errors.New("the R12 plan lists a redirect without a manifest line")
-		}
-		if have[ml] {
-			continue
-		}
-		have[ml] = true
-		rep.Changed = append(rep.Changed, d)
-		rep.ChangedPatchable = append(rep.ChangedPatchable, ml)
-		added = append(added, ml)
-	}
-	freehandR12.Active = true
-	freehandR12.Swaps = make(map[string]bool, len(plan.Swap))
-	for _, s := range plan.Swap {
-		freehandR12.Swaps[s] = true
-	}
-	if len(added) > 0 {
-		sort.Strings(rep.ChangedPatchable)
-		if rep.Counts == nil {
-			rep.Counts = map[string]int{}
-		}
-		rep.Counts["changed"] = len(rep.Changed)
-		rep.Counts["changedPatchable"] = len(rep.ChangedPatchable)
-		rep.Counts["r12Redirected"] = len(added)
-		if err := rewriteFreehandDiffJSON(diffJSONPath, rep); err != nil {
-			return &plan, fmt.Errorf("rewrite the diff after the R12 plan: %w", err)
-		}
-	}
-	fmt.Fprintf(os.Stdout, "framework ripple (R12): %d member(s) compiled differently; %d carried, %d swapped, %d app member(s) redirected\n",
-		plan.Seeds, plan.Carried, plan.Swapped, len(added))
 	return &plan, nil
 }
 

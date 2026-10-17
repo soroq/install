@@ -19,6 +19,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,7 +55,13 @@ type FreehandSourceKernelRecipe struct {
 	DartDefines      []string `json:"dart_defines"`      // sorted
 	Experiments      []string `json:"experiments"`       // sorted
 	PackageConfigSHA string   `json:"package_config_sha256"`
+	// PluginRegistrant: the build compiled the generated Dart plugin registrant in as well (flutter_tools
+	// passes it as an extra --source), so the kernel does too. Absent in older recipes.
+	PluginRegistrant bool `json:"plugin_registrant,omitempty"`
 }
+
+// freehandPluginRegistrantRel is where flutter_tools writes the Dart plugin registrant it compiles in.
+const freehandPluginRegistrantRel = ".dart_tool/flutter_build/dart_plugin_registrant.dart"
 
 // toolchainRecipeInputsV2 is the EXPLICIT, closed set of immutable toolchain/compiler/build-mode inputs
 // the v2 recipe digest binds. It deliberately does NOT contain package_config: the dependency graph is a
@@ -72,6 +79,8 @@ type toolchainRecipeInputsV2 struct {
 	GenKernelSHA    string   `json:"gen_kernel_sha256"`
 	DartDefines     []string `json:"dart_defines"`
 	Experiments     []string `json:"experiments"`
+	// omitempty: a recipe without the registrant digests exactly as before.
+	PluginRegistrant bool `json:"plugin_registrant,omitempty"`
 }
 
 // recipeDigest binds the immutable recipe inputs. It dispatches on the recipe schema so existing v1
@@ -82,16 +91,17 @@ func (r FreehandSourceKernelRecipe) recipeDigest() (string, error) {
 	switch r.Schema {
 	case freehandRecipeSchemaV2:
 		v2 := toolchainRecipeInputsV2{
-			Schema:          r.Schema,
-			Entrypoint:      r.Entrypoint,
-			Target:          r.Target,
-			BuildMode:       r.BuildMode,
-			Flavor:          r.Flavor,
-			PlatformDillRel: r.PlatformDillRel,
-			PlatformDillSHA: r.PlatformDillSHA,
-			GenKernelSHA:    r.GenKernelSHA,
-			DartDefines:     r.DartDefines,
-			Experiments:     r.Experiments,
+			Schema:           r.Schema,
+			Entrypoint:       r.Entrypoint,
+			PluginRegistrant: r.PluginRegistrant,
+			Target:           r.Target,
+			BuildMode:        r.BuildMode,
+			Flavor:           r.Flavor,
+			PlatformDillRel:  r.PlatformDillRel,
+			PlatformDillSHA:  r.PlatformDillSHA,
+			GenKernelSHA:     r.GenKernelSHA,
+			DartDefines:      r.DartDefines,
+			Experiments:      r.Experiments,
 		}
 		b, err := json.Marshal(v2)
 		if err != nil {
@@ -167,9 +177,18 @@ func buildFreehandSourceKernelRecipe(projectDir, flutterRoot, flavor string) (Fr
 	if err != nil {
 		return FreehandSourceKernelRecipe{}, fmt.Errorf("hash package_config.json: %w", err)
 	}
+	// The kernel is compiled from what the app is BUILT from: the generated bootstrap (it wraps
+	// lib/main.dart and imports the OTA client) when the build used one. Then every library the shipped
+	// program contains has a source declaration -- the OTA client's own code included, which a patch's
+	// framework ripple (engine R12) may have to carry.
+	entrypoint := "lib/main.dart"
+	if fileExists(filepath.Join(projectDir, filepath.FromSlash(freehandBootstrapRelPath))) {
+		entrypoint = freehandBootstrapRelPath
+	}
 	return FreehandSourceKernelRecipe{
 		Schema:           freehandRecipeSchemaV2,
-		Entrypoint:       "lib/main.dart",
+		Entrypoint:       entrypoint,
+		PluginRegistrant: fileExists(filepath.Join(projectDir, filepath.FromSlash(freehandPluginRegistrantRel))),
 		Target:           "flutter",
 		BuildMode:        "profile",
 		Flavor:           flavor,
@@ -211,6 +230,19 @@ func generateFreehandSourceKernel(projectDir, flutterRoot string, recipe Freehan
 	}
 	for _, e := range recipe.Experiments {
 		args = append(args, "--enable-experiment="+e)
+	}
+	if recipe.PluginRegistrant {
+		reg := filepath.Join(projectDir, filepath.FromSlash(freehandPluginRegistrantRel))
+		if !fileExists(reg) {
+			return "", fmt.Errorf("the recipe compiles the Dart plugin registrant, which is missing: %s", reg)
+		}
+		abs, err := filepath.Abs(reg)
+		if err != nil {
+			return "", err
+		}
+		u := (&url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}).String()
+		args = append(args, "--source", u, "--source", "package:flutter/src/dart_plugin_registrant.dart",
+			"-Dflutter.dart_plugin_registrant="+u)
 	}
 	args = append(args, entrypoint)
 	cmd := exec.Command(aot, args...)

@@ -106,8 +106,8 @@ var freehandPathAEngineRevisions = map[string]string{
 // analyzeValuePropagationPathA); instance-call results keep the Path A ban. TestR8EngineRevisionsRecord
 // pins each entry to its committed dart.patch.
 var freehandDependencyMapEngineRevisions = map[string]string{
-	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r8_obfuscation": "3.44.9-private-state-r8-obfuscation",
-	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r9_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r8_obfuscation":  "3.44.9-private-state-r8-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r9_obfuscation":  "3.44.9-private-state-r9-obfuscation",
 	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r10_obfuscation": "3.44.9-private-state-r9-obfuscation",
 	// R11 = R10 + dart-r11-increment.patch (field layout, soroqLoadField, class-table lookup); the
 	// dependency map and the inlining rules are R10's, unchanged.
@@ -115,6 +115,77 @@ var freehandDependencyMapEngineRevisions = map[string]string{
 	// R12 (call graph, entry swap) and R13 (dispatch fallback) leave the dependency map and inlining as R11's.
 	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r12_obfuscation": "3.44.9-private-state-r9-obfuscation",
 	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r13_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r14_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r15_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r16_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r17_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r18_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r19_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r20_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r21_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r22_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r23_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r24_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r25_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r26_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r27_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r28_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r29_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r30_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r31_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r32_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r33_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r34_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r35_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r36_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r37_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r38_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r39_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r40_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r41_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r42_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r43_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r44_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r45_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r46_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r47_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r48_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r49_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r50_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r51_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r52_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r53_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r54_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r55_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r56_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r57_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r58_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r59_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r60_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r61_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r62_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r63_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r64_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r65_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r66_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r67_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r68_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r69_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r70_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r71_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r72_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r73_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r74_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r75_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	// R75b = R75 plus engine iterations 7-10 (ops revisions 9-10, scoped dispatch fallback, FFI revision 4);
+	// the dependency map, inlining rules and dart2bytecode translation are R75's.
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r75b_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	// R75c = R75b plus engine iterations 11-12 (ops revisions 11-12: soroqAllocate of a laid-out class the base
+	// never allocate-finalized; alias class ids for classes type-flow analysis made abstract).
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r75c_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	// R75d = R75c plus engine iteration 13 (the interpreter resolves a call site's dyn:* selector through a
+	// runtime call, its frames visible to the GC).
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r75d_obfuscation": "3.44.9-private-state-r9-obfuscation",
 }
 
 // freehandBasePathA reports whether the base was built by an engine known to carry Path A. Both the
