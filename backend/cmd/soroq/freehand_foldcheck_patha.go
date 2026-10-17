@@ -186,6 +186,10 @@ var freehandDependencyMapEngineRevisions = map[string]string{
 	// R75d = R75c plus engine iteration 13 (the interpreter resolves a call site's dyn:* selector through a
 	// runtime call, its frames visible to the GC).
 	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r75d_obfuscation": "3.44.9-private-state-r9-obfuscation",
+	// R76 (engine iteration 14, ops revision 13): the patch implements members an aliased class lost
+	// (soroqRegisterAliasOverrides), and aliased instances hold a slot the base unboxed tagged
+	// (soroqRegisterAliasTaggedSlots).
+	"soroq.ios_engine.6b182d2c_5a2a6a42.private_state.r76_obfuscation": "3.44.9-private-state-r9-obfuscation",
 }
 
 // freehandBasePathA reports whether the base was built by an engine known to carry Path A. Both the
