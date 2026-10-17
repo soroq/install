@@ -407,6 +407,24 @@ func computeFreehandPatchPlan(projectDir, flutterRoot, flavor string, planOpts .
 	if err := assertRecipeReproducible(projectDir, flutterRoot, recipe, flavor); err != nil {
 		return nil, fmt.Errorf("candidate source-kernel recipe is not reproducible against this baseline: %w", err)
 	}
+	// The recipe compiles the generated zero-touch bootstrap. Regenerate it from the project's inputs now,
+	// exactly as the candidate build below will: the copy on disk is whatever the LAST release or patch of
+	// this project wrote, so compiling it as found (R75d device lane: a later release built without
+	// SOROQ_BOOTSTRAP_DEBUG) diffed a bootstrap the patch never changed and refused "the OTA client is not
+	// patchable". Generation is idempotent, so an unchanged project rewrites the same bytes.
+	if filepath.ToSlash(recipe.Entrypoint) == freehandBootstrapRelPath {
+		pinnedKeyHex, err := ensureProjectManifestSigningKey(projectDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve iOS manifest-signing key: %w", err)
+		}
+		var passthrough []string
+		if len(planOpts) > 0 {
+			passthrough = planOpts[0].passthrough
+		}
+		if _, err := prepareFreehandZeroTouch(projectDir, pinnedKeyHex, stripObfuscationArgs(passthrough)); err != nil {
+			return nil, fmt.Errorf("generate zero-touch freehand runtime wiring: %w", err)
+		}
+	}
 	candKernel, err := os.CreateTemp("", "soroq-cand-source-*.dill")
 	if err != nil {
 		return nil, err
@@ -665,6 +683,11 @@ func assertRecipeReproducible(projectDir, flutterRoot string, want FreehandSourc
 	// dependency change leaves the v2 digest invariant and is allowed here (the dependency delta is
 	// gated separately by the dependency descriptor).
 	got.Schema = want.Schema
+	// What the base's kernel was compiled FROM (its entrypoint, the plugin registrant beside it) is the
+	// base's build shape, not a toolchain input: the candidate is compiled the same way (the recipe), whatever
+	// generated files the current tree happens to hold before this build regenerates them.
+	got.Entrypoint = want.Entrypoint
+	got.PluginRegistrant = want.PluginRegistrant
 	wd, err := want.recipeDigest()
 	if err != nil {
 		return err
@@ -683,7 +706,9 @@ func assertRecipeReproducible(projectDir, flutterRoot string, want FreehandSourc
 					return want.Schema
 				}(), freehandRecipeSchemaV2, wd[:12], gd[:12])
 		}
-		return fmt.Errorf("immutable toolchain recipe digest changed vs base (Flutter/Dart/frontend/platform/build-mode/defines/experiments differ — these cannot change in a patch): base=%s current=%s", wd[:12], gd[:12])
+		wj, _ := json.Marshal(want)
+		gj, _ := json.Marshal(got)
+		return fmt.Errorf("immutable toolchain recipe digest changed vs base (Flutter/Dart/frontend/platform/build-mode/defines/experiments differ — these cannot change in a patch): base=%s current=%s\n  base recipe:    %s\n  current recipe: %s", wd[:12], gd[:12], wj, gj)
 	}
 	return nil
 }
@@ -951,6 +976,9 @@ type freehandModuleManifest struct {
 	ModuleFormat   string   `json:"module_format,omitempty"`
 	VehicleClasses []string `json:"vehicle_classes,omitempty"`
 	MovedClasses   []string `json:"moved_classes,omitempty"`
+	// R12CopiedClasses are the base classes (`lib|Class`) the module defines copies of while base code reads
+	// their fields: the R12 plan the module was built with accounts for them (the CLI re-plans with them).
+	R12CopiedClasses []string `json:"r12_copied_classes,omitempty"`
 	// DependencyDescriptorDigest is the dependency delta this module was synthesized under. Because the
 	// manifest's SHA is bound into the artifact id, this makes the dependency descriptor part of the
 	// artifact's identity: swapping in a different descriptor changes the artifact.
@@ -2042,6 +2070,7 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 	if np := carriablePackageNames(plan.DependencyDescriptor); np != "" {
 		synthArgs = append(synthArgs, "--new-packages", np)
 	}
+	keepSynthInputs(dart, synthArgs)
 	synth := exec.Command(dart, synthArgs...)
 	// Surface the synthesizer's diagnostics even on SUCCESS: what it decided to carry (and what it did
 	// not) is the single most useful signal when a module later fails to compile, and discarding it on
@@ -2073,9 +2102,20 @@ func generateAndPersistFreehandModule(projectDir, flutterRoot, toolchain string,
 			SHA256 string `json:"sha256"`
 		} `json:"module_source_tree"`
 		CarriedLibraries []freehandCarriedLibrary `json:"carried_libraries"`
+		R12CopiedClasses []string                 `json:"r12_copied_classes"`
 	}
 	if err := json.Unmarshal(synthManifestBytes, &synthManifest); err != nil {
 		return "", err
+	}
+	// ENGINE R12 COPIES: the synthesis planned again with the base classes the module defines copies of (base
+	// code reads their fields); the swap check holds the module to that same plan, run here independently.
+	if len(synthManifest.R12CopiedClasses) > 0 {
+		if !freehandR12.Active || freehandR12.Replan == nil {
+			return "", errors.New("the module copies base classes the R12 plan must account for, and no R12 plan ran")
+		}
+		if err := freehandR12.Replan(synthManifest.R12CopiedClasses); err != nil {
+			return "", fmt.Errorf("freehand patch refused — the R12 plan with the classes the module copies: %w", err)
+		}
 	}
 	// Bind the validated dependency descriptor into the durable ABI manifest. This is done HERE rather
 	// than inside the analyzer deliberately: the binding must not depend on which analyzer snapshot is
@@ -2758,4 +2798,40 @@ func withFieldReadFallback(args []string) []string {
 		return append(args, "--engine-field-read-fallback")
 	}
 	return args
+}
+
+// keepSynthInputs (development only, SOROQ_FREEHAND_SYNTH_KEEP=<dir>): copies the synthesizer's temporary
+// inputs into dir and writes the command line (args.txt, one per line, inputs pointing at the copies), so
+// the module synthesis can be rerun on its own against a changed analyzer.
+func keepSynthInputs(dart string, args []string) {
+	dir := os.Getenv("SOROQ_FREEHAND_SYNTH_KEEP")
+	if dir == "" {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "soroq: keep synth inputs: %v\n", err)
+		return
+	}
+	out := append([]string{dart}, args...)
+	tmp := os.TempDir()
+	for i := 1; i < len(out); i++ {
+		prev := out[i-1]
+		if prev != "--diff-json" && prev != "--dill" && prev != "--capability-map" {
+			continue
+		}
+		if !strings.HasPrefix(out[i], tmp) {
+			continue
+		}
+		dst := filepath.Join(dir, strings.TrimPrefix(prev, "--")+"-"+filepath.Base(out[i]))
+		b, err := os.ReadFile(out[i])
+		if err == nil {
+			err = os.WriteFile(dst, b, 0o644)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "soroq: keep synth inputs: %v\n", err)
+			return
+		}
+		out[i] = dst
+	}
+	_ = os.WriteFile(filepath.Join(dir, "args.txt"), []byte(strings.Join(out, "\n")+"\n"), 0o644)
 }

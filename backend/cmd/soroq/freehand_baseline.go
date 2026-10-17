@@ -275,6 +275,14 @@ var freehandKnownIdentityCapabilities = map[string]bool{
 	freehandCallGraphCapability:                          true,
 	freehandEntrySwapCapability:                          true,
 	freehandDispatchFallbackCapability:                   true,
+	freehandLateSentinelCapability:                       true,
+	freehandLibraryLookupCapability:                      true,
+	freehandCompiledFunctionLookupCapability:             true,
+	freehandCompiledFunctionLookupV2Capability:           true,
+	freehandRegisterCallAdapterCapability:                true,
+	freehandBytecodeFfiCapability:                        true,
+	freehandIntrinsicOpsCapability:                       true,
+	freehandDispatchRegistersCapability:                  true,
 }
 
 // legacyDefaultRedirectKinds are the kinds that were demonstrably shipping before this tranche: they are

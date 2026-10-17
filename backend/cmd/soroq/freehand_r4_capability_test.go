@@ -28,13 +28,21 @@ func TestR4IntroducesNoNewCapability(t *testing.T) {
 	// soroq_callgraph_v1 and soroq_entry_swap_v1 (the compiled call graph; swapping a base function's entry). r4
 	// still adds none, which is what this asserts -- the set is the three r3 names plus those, and
 	// nothing else.
-	if len(freehandKnownIdentityCapabilities) != 11 || !freehandKnownIdentityCapabilities[freehandDependencyMapCapability] ||
+	if len(freehandKnownIdentityCapabilities) != 19 || !freehandKnownIdentityCapabilities[freehandDependencyMapCapability] ||
 		!freehandKnownIdentityCapabilities[freehandTaggedStackBoundaryCapability] ||
 		!freehandKnownIdentityCapabilities[freehandFieldLayoutCapability] ||
 		!freehandKnownIdentityCapabilities[freehandCallGraphCapability] ||
 		!freehandKnownIdentityCapabilities[freehandEntrySwapCapability] ||
-		!freehandKnownIdentityCapabilities[freehandDispatchFallbackCapability] {
-		t.Fatalf("the closed set has %d entries, want the 3 r3 names plus the r6, r8, two r9, the r11, the two r12 and the r13 ones: %v",
+		!freehandKnownIdentityCapabilities[freehandDispatchFallbackCapability] ||
+		!freehandKnownIdentityCapabilities[freehandLateSentinelCapability] ||
+		!freehandKnownIdentityCapabilities[freehandLibraryLookupCapability] ||
+		!freehandKnownIdentityCapabilities[freehandCompiledFunctionLookupCapability] ||
+		!freehandKnownIdentityCapabilities[freehandCompiledFunctionLookupV2Capability] ||
+		!freehandKnownIdentityCapabilities[freehandRegisterCallAdapterCapability] ||
+		!freehandKnownIdentityCapabilities[freehandBytecodeFfiCapability] ||
+		!freehandKnownIdentityCapabilities[freehandIntrinsicOpsCapability] ||
+		!freehandKnownIdentityCapabilities[freehandDispatchRegistersCapability] {
+		t.Fatalf("the closed set has %d entries, want the 3 r3 names plus the r6, r8, two r9, the r11, the two r12, the r13 to r23 ones: %v",
 			len(freehandKnownIdentityCapabilities), freehandKnownIdentityCapabilities)
 	}
 	if !freehandKnownIdentityCapabilities[freehandObfuscatedIdentityTranslationCapability] {
@@ -136,13 +144,21 @@ func TestR5KeepsTheR4CapabilityContract(t *testing.T) {
 	// soroq_tagged_stack_boundary_v1, to eight only in R11, by soroq_field_layout_v1, and to ten only in R12, by soroq_callgraph_v1 and
 	// soroq_entry_swap_v1 -- each a
 	// behaviour that can be pointed at.
-	if len(freehandKnownIdentityCapabilities) != 11 || !freehandKnownIdentityCapabilities[freehandDependencyMapCapability] ||
+	if len(freehandKnownIdentityCapabilities) != 19 || !freehandKnownIdentityCapabilities[freehandDependencyMapCapability] ||
 		!freehandKnownIdentityCapabilities[freehandTaggedStackBoundaryCapability] ||
 		!freehandKnownIdentityCapabilities[freehandFieldLayoutCapability] ||
 		!freehandKnownIdentityCapabilities[freehandCallGraphCapability] ||
 		!freehandKnownIdentityCapabilities[freehandEntrySwapCapability] ||
-		!freehandKnownIdentityCapabilities[freehandDispatchFallbackCapability] {
-		t.Fatalf("the closed capability set is %v, want the 3 r3 names plus the r6, r8, two r9, the r11, the two r12 and the r13 ones", freehandKnownIdentityCapabilities)
+		!freehandKnownIdentityCapabilities[freehandDispatchFallbackCapability] ||
+		!freehandKnownIdentityCapabilities[freehandLateSentinelCapability] ||
+		!freehandKnownIdentityCapabilities[freehandLibraryLookupCapability] ||
+		!freehandKnownIdentityCapabilities[freehandCompiledFunctionLookupCapability] ||
+		!freehandKnownIdentityCapabilities[freehandCompiledFunctionLookupV2Capability] ||
+		!freehandKnownIdentityCapabilities[freehandRegisterCallAdapterCapability] ||
+		!freehandKnownIdentityCapabilities[freehandBytecodeFfiCapability] ||
+		!freehandKnownIdentityCapabilities[freehandIntrinsicOpsCapability] ||
+		!freehandKnownIdentityCapabilities[freehandDispatchRegistersCapability] {
+		t.Fatalf("the closed capability set is %v, want the 3 r3 names plus the r6, r8, two r9, the r11, the two r12, the r13 to r23 ones", freehandKnownIdentityCapabilities)
 	}
 	if !freehandKnownIdentityCapabilities[freehandObfuscatedIdentityTranslationCapability] {
 		t.Fatalf("the closed set lost the r6 capability %q", freehandObfuscatedIdentityTranslationCapability)
